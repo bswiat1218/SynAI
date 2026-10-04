@@ -1,0 +1,41 @@
+[project]
+name = "synai"
+dynamic = ["version"]
+description = "Keyboard-first Ollama coding assistant with approved workspace tools and an optional Neovim editor"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "SynAI contributors"}]
+requires-python = ">=3.12"
+dependencies = ["textual>=1.0,<9", "httpx>=0.27,<1"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
+
+[project.scripts]
+synai = "synai.cli:main"
+
+[project.optional-dependencies]
+release = ["build>=1.2,<2", "twine>=6,<7"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = {attr = "synai.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["synai", "synai.*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"synai.tui" = ["*.tcss"]
+"synai.editor" = ["*.lua", "*.Dockerfile"]

@@ -1,0 +1,9 @@
+Return every file needed to fulfill the task as text in this format:
+File: relative/path/to/filename.ext
+```language
+file contents
+```
+
+Repeat this format for additional files. Use forward-slash relative paths, include a filename for every file, and do not add explanations or text outside the file blocks. Do not use absolute paths or parent directory references. Do not omit functionality or replace it with pseudocode.
+
+TASK:

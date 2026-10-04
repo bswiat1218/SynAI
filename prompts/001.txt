@@ -1,0 +1,1 @@
+Read a string from standard input and perform run-length encoding. Consecutive identical characters should be represented as the character followed by its count. For example, aaabbc becomes a3b2c1. Preserve all characters, including spaces.
