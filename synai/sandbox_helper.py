@@ -1,6 +1,7 @@
 """Trusted subprocess helper for container and explicitly authorized host tools."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -111,13 +112,20 @@ def run_command(args: dict[str, Any], timeout: float, limit: int) -> dict[str, A
             process.wait()
             process.stdout.close()
             process.stderr.close()
-    return {
+    result = {
         "ok": process.returncode == 0 and not timed_out and not truncated,
         "stdout": chunks["stdout"].decode("utf-8", errors="replace"),
         "stderr": chunks["stderr"].decode("utf-8", errors="replace"),
         "exit_code": process.returncode, "duration": time.monotonic() - started,
         "timed_out": timed_out, "truncated": truncated,
+        "terminated_by_output_limit": truncated and not timed_out,
     }
+    if (
+        command.startswith("env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null")
+        and "git --no-pager --literal-pathspecs" in command
+    ):
+        result["stdout_base64"] = base64.b64encode(chunks["stdout"]).decode("ascii")
+    return result
 
 
 def re_unsafe(command: str) -> bool:

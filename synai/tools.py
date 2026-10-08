@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,15 @@ CHECKPOINT_ARGUMENTS: dict[str, dict[str, dict[str, Any]]] = {
         },
     },
 }
+
+
+def _consume_worker_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        _logger.exception("Checkpoint preflight worker failed after its caller stopped waiting")
 CHECKPOINT_DESCRIPTIONS = {
     "git_checkpoint": "Create an explicitly approved private workspace snapshot; this does not create a Git commit.",
     "restore_checkpoint": "Explicitly restore captured file contents after conflict preflight; this does not reset Git.",
@@ -333,11 +343,21 @@ class Tools:
             try:
                 assert session is not None
                 checkpoint_manager = CheckpointManager(self.sandbox.settings)
-                prepared = checkpoint_manager.prepare_restore(
+                if cancellation is not None and cancellation.is_set():
+                    return _restore_result(
+                        False, "CANCELLED", [], "Restore was cancelled before preflight.",
+                    )
+                if dispatch_guard is not None and not await dispatch_guard():
+                    return _restore_result(
+                        False, "CANCELLED", [], "Restore was cancelled before preflight.",
+                    )
+                prepared = await self._restore_preflight(
+                    checkpoint_manager,
                     session,
                     self._repository_index(session),
                     arguments["checkpoint_id"],
                     arguments["paths"],
+                    cancellation=cancellation,
                 )
             except (OSError, ValueError) as exc:
                 return {
@@ -355,6 +375,14 @@ class Tools:
                     str(prepared.get("error", ""))[:512],
                 )
                 return prepared
+            if cancellation is not None and cancellation.is_set():
+                return _restore_result(
+                    False, "CANCELLED", [], "Restore was cancelled after preflight.",
+                )
+            if dispatch_guard is not None and not await dispatch_guard():
+                return _restore_result(
+                    False, "CANCELLED", [], "Restore was cancelled after preflight.",
+                )
             prepared_restore = prepared
         digest: str | None = None
         description = json.dumps(arguments, ensure_ascii=True, indent=2)
@@ -408,6 +436,19 @@ class Tools:
                     description = f"HOST EXECUTION // NOT ISOLATED\nWorkspace: {self.sandbox.workspace}\n\n{description}"
                 if approval_observer is not None:
                     await approval_observer(name, description, None)
+                if name == "restore_checkpoint":
+                    if cancellation is not None and cancellation.is_set():
+                        return _restore_result(
+                            False, "CANCELLED", [], "Restore was cancelled before approval.",
+                        )
+                    if dispatch_guard is not None and not await dispatch_guard():
+                        return _restore_result(
+                            False, "CANCELLED", [], "Restore was cancelled before approval.",
+                        )
+                    if cancellation is not None and cancellation.is_set():
+                        return _restore_result(
+                            False, "CANCELLED", [], "Restore was cancelled before approval.",
+                        )
                 approved = await self.approve(name, description)
                 if approval_observer is not None:
                     await approval_observer(name, description, approved)
@@ -500,6 +541,7 @@ class Tools:
                     session,
                     dispatch_guard,
                     event_observer,
+                    cancellation,
                 )
                 return result
             if name in {"write_file", "patch_file", "delete_file"} and mutation_observer is not None:
@@ -543,7 +585,48 @@ class Tools:
         session: Session,
         dispatch_guard: DispatchGuard | None,
         event_observer: ToolEventObserver | None,
+        cancellation: threading.Event | None,
     ) -> dict[str, Any]:
+        if cancellation is not None and cancellation.is_set():
+            return _restore_result(
+                False, "CANCELLED", [], "Restore was cancelled before post-approval validation.",
+            )
+        if dispatch_guard is not None and not await dispatch_guard():
+            return _restore_result(
+                False, "CANCELLED", [], "Restore was cancelled before post-approval validation.",
+            )
+        try:
+            repository = self._repository_index(session)
+            refreshed = await self._restore_preflight(
+                manager,
+                session,
+                repository,
+                prepared.checkpoint_id,
+                [item.path for item in prepared.files],
+                prepared=prepared,
+                cancellation=cancellation,
+            )
+        except (OSError, ValueError) as exc:
+            return _restore_result(
+                False, "CHECKPOINT_SCOPE_VIOLATION", [], str(exc)[:512],
+            )
+        if isinstance(refreshed, dict):
+            await self._observe_event(
+                event_observer,
+                "restoration_conflict" if refreshed.get("error_code") == "CHECKPOINT_CONFLICT"
+                else "restoration_interrupted",
+                str(refreshed.get("error", ""))[:512],
+            )
+            return refreshed
+        prepared = refreshed
+        if cancellation is not None and cancellation.is_set():
+            return _restore_result(
+                False, "CANCELLED", [], "Restore was cancelled after post-approval validation.",
+            )
+        if dispatch_guard is not None and not await dispatch_guard():
+            return _restore_result(
+                False, "CANCELLED", [], "Restore was cancelled after post-approval validation.",
+            )
         records: list[dict[str, Any]] = []
         for item in prepared.files:
             if dispatch_guard is not None and not await dispatch_guard():
@@ -616,6 +699,87 @@ class Tools:
             event_observer, "restoration_completed", prepared.checkpoint_id,
         )
         return _restore_result(True, None, records, prepared.limitation)
+
+    async def _restore_preflight(
+        self,
+        manager: CheckpointManager,
+        session: Session,
+        repository: RepositoryIndex,
+        checkpoint_id: str,
+        paths: list[str],
+        *,
+        prepared: PreparedRestore | None = None,
+        cancellation: threading.Event | None = None,
+    ) -> PreparedRestore | dict[str, Any]:
+        worker_cancellation = cancellation or threading.Event()
+        deadline = time.monotonic() + min(10.0, max(0.1, self.sandbox.settings.command_timeout))
+        if prepared is None:
+            worker = asyncio.create_task(asyncio.to_thread(
+                manager.prepare_restore,
+                session,
+                repository,
+                checkpoint_id,
+                paths,
+                cancellation=worker_cancellation,
+                deadline=deadline,
+            ))
+        else:
+            worker = asyncio.create_task(asyncio.to_thread(
+                manager.revalidate_restore,
+                session,
+                repository,
+                prepared,
+                cancellation=worker_cancellation,
+                deadline=deadline,
+            ))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(worker),
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except asyncio.CancelledError:
+            worker_cancellation.set()
+            worker.add_done_callback(_consume_worker_result)
+            raise
+        except TimeoutError:
+            worker_cancellation.set()
+            worker.add_done_callback(_consume_worker_result)
+            return {
+                "ok": False,
+                "success": False,
+                "operation": "restore_checkpoint",
+                "error_code": "RESTORE_TIMEOUT",
+                "error": "Checkpoint restoration preflight exceeded its time limit.",
+                "records": [],
+                "result_count": 0,
+                "truncated": False,
+                "limitations": [],
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "success": False,
+                "operation": "restore_checkpoint",
+                "error_code": "CHECKPOINT_PREFLIGHT_FAILED",
+                "error": str(exc)[:512],
+                "records": [],
+                "result_count": 0,
+                "truncated": False,
+                "limitations": [],
+            }
+        if worker_cancellation.is_set():
+            return {
+                "ok": False,
+                "success": False,
+                "operation": "restore_checkpoint",
+                "error_code": "CANCELLED",
+                "error": "Checkpoint restoration preflight was cancelled.",
+                "records": [],
+                "result_count": 0,
+                "truncated": False,
+                "limitations": [],
+            }
+        return result
 
     @staticmethod
     async def _observe_event(

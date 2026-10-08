@@ -480,7 +480,14 @@ the existing terminal approval. Commands are application-owned, bounded,
 noninteractive templates. Revisions are resolved from validated hexadecimal
 commit IDs, paths are workspace-relative, and Git metadata/repository roots
 outside the selected workspace are reported as unsupported rather than
-expanding workspace authority. Git is not required for task-specific change
+expanding workspace authority. The selected host workspace and the backend's
+execution-visible workspace are separate validated identities; sandbox Git
+paths are interpreted under the fixed `/workspace` mount and exposed only as
+workspace-relative paths. Git results identify complete, partial, failed,
+timed-out, cancelled, and unavailable inspection outcomes; incomplete status
+is never authoritative evidence of a clean repository. Machine-readable Git
+output retains filename bytes through a bounded lossless transport. Git is not
+required for task-specific change
 tracking. Normal `Agent.turn` schemas remain unchanged; the Phase 9 schemas
 are enabled explicitly.
 
@@ -502,14 +509,20 @@ checkpoint owner, workspace/backend identity, integrity, selected paths, and
 all current file hashes before the first write. It restores the captured
 workspace state, including pre-existing dirty content, using the existing
 approved mutation backend; it does not run Git reset, checkout, clean, or
-stash. Checkpoint creation does not launch Git commands; repository identity
-is recorded only when supplied by a separately approved inspection. The
+stash. Checkpoints are workspace/backend-bound snapshots independent of Git.
+Optional repository identity is integrity-protected provenance, not restoration
+authority or a precondition: restoration changes captured workspace files rather
+than Git state and therefore does not require a live repository identity check.
+The public checkpoint tool does not launch Git commands; when no identity is
+supplied it explicitly reports that the checkpoint is Git-independent. The
 snapshot is bounded to 64 paths, 1 MiB per file, 16 MiB total, 128
 retained checkpoint records, and a 10-second capture duration; snapshot
 content shares the private 64 MiB/1,024-object store. Restore preflight is
-all-files-first, but multiple backend mutations are not atomic and their
-per-file outcomes are reported. A changed file causes a conflict instead of
-being overwritten. The current text mutation backend cannot restore binary or
+all-files-first and runs off the application event loop. Every selected target
+and checkpoint is revalidated after approval; an external change causes a
+conflict instead of being overwritten or reported unchanged. Multiple backend
+mutations are not atomic and their per-file outcomes are reported. The current
+text mutation backend cannot restore binary or
 non-UTF-8 snapshots; such requests are rejected explicitly. Retention cleanup
 is explicit, and interrupted/uncertain mutations are never replayed
 automatically.

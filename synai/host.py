@@ -39,6 +39,10 @@ class HostExecution:
         self.workspace: Path | None = None
         self.session_id: str | None = None
 
+    @property
+    def execution_workspace(self) -> Path | None:
+        return self.workspace
+
     def activate(self, session: Session) -> None:
         self.revoke()
         if os.geteuid() == 0:

@@ -27,6 +27,10 @@ class Sandbox:
         self.owned = False
         self.healthy = False
 
+    @property
+    def execution_workspace(self) -> Path | None:
+        return Path("/workspace") if self.workspace is not None else None
+
     def matches(self, session: Session) -> bool:
         return (
             (session.environment is None or session.environment.execution_mode == "sandbox")

@@ -27,6 +27,7 @@ _MAX_PATHS = 64
 _MAX_TOTAL_BYTES = 16 * 1024 * 1024
 _MAX_METADATA_BYTES = 128 * 1024
 _MAX_CAPTURE_SECONDS = 10.0
+_MAX_RESTORE_PREFLIGHT_SECONDS = 10.0
 _MAX_CHECKPOINTS = 128
 
 
@@ -172,7 +173,11 @@ class CheckpointRecord:
             raise ValueError("Invalid checkpoint completeness")
         expected = hashlib.sha256(_canonical(self.payload())).hexdigest()
         if self.integrity_sha256 != expected:
-            raise ValueError("Checkpoint metadata integrity failure")
+            legacy_payload = self.payload()
+            legacy_payload.pop("repository_identity")
+            legacy_expected = hashlib.sha256(_canonical(legacy_payload)).hexdigest()
+            if self.repository_identity is not None or self.integrity_sha256 != legacy_expected:
+                raise ValueError("Checkpoint metadata integrity failure")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -185,9 +190,16 @@ class CheckpointRecord:
             "backend_identity", "repository_identity", "created_at", "files",
             "total_size_bytes", "complete", "integrity_sha256",
         }
-        if not isinstance(value, dict) or set(value) != keys or not isinstance(value["files"], list):
+        if (
+            not isinstance(value, dict)
+            or frozenset(value) not in {
+                frozenset(keys), frozenset(keys - {"repository_identity"}),
+            }
+            or not isinstance(value["files"], list)
+        ):
             raise ValueError("Invalid checkpoint metadata fields")
         data = dict(value)
+        data.setdefault("repository_identity", None)
         data["files"] = [CheckpointFile.from_dict(item) for item in data["files"]]
         result = cls(**data)
         result.validate()
@@ -209,6 +221,10 @@ class PreparedRestore:
     checkpoint_id: str
     files: tuple[RestoreFile, ...]
     limitation: str
+    owner_id: str
+    workspace_identity: str
+    backend_identity: str
+    integrity_sha256: str
 
 
 class CheckpointManager:
@@ -346,6 +362,9 @@ class CheckpointManager:
         repository: RepositoryIndex,
         checkpoint_id: str,
         paths: list[str],
+        *,
+        cancellation: threading.Event | None = None,
+        deadline: float | None = None,
     ) -> PreparedRestore | dict[str, Any]:
         if (
             not isinstance(session, Session) or not isinstance(repository, RepositoryIndex)
@@ -361,6 +380,26 @@ class CheckpointManager:
         root = self._validated_workspace(session, repository)
         self._ensure_private_storage_outside(root)
         self._initialize_private_storage()
+        started = time.monotonic()
+        if deadline is None:
+            deadline = started + _MAX_RESTORE_PREFLIGHT_SECONDS
+
+        def interrupted() -> dict[str, Any] | None:
+            if cancellation is not None and cancellation.is_set():
+                return _failure(
+                    "CANCELLED", "Checkpoint restoration preflight was cancelled.",
+                    operation="restore_checkpoint",
+                )
+            if time.monotonic() >= deadline:
+                return _failure(
+                    "RESTORE_TIMEOUT", "Checkpoint restoration preflight exceeded its time limit.",
+                    operation="restore_checkpoint",
+                )
+            return None
+
+        cancelled = interrupted()
+        if cancelled is not None:
+            return cancelled
         try:
             record = self.load(checkpoint_id)
         except FileNotFoundError:
@@ -393,6 +432,9 @@ class CheckpointManager:
         prepared: list[RestoreFile] = []
         conflicts: list[dict[str, Any]] = []
         for path in paths:
+            cancelled = interrupted()
+            if cancelled is not None:
+                return cancelled
             item = entries[path]
             if not item.complete:
                 return _failure(
@@ -403,6 +445,9 @@ class CheckpointManager:
                 )
             try:
                 current_first = repository.read_file_bytes(path, max_bytes=1_048_576)
+                cancelled = interrupted()
+                if cancelled is not None:
+                    return cancelled
                 current_second = repository.read_file_bytes(path, max_bytes=1_048_576)
                 if current_first != current_second:
                     raise OSError("File changed during restore preflight")
@@ -420,6 +465,9 @@ class CheckpointManager:
                     continue
                 assert self.snapshots is not None
                 original = self.snapshots.load(item.snapshot_ref) if item.snapshot_ref else None
+                cancelled = interrupted()
+                if cancelled is not None:
+                    return cancelled
                 if original is not None and hashlib.sha256(original).hexdigest() != item.sha256:
                     raise OSError("Snapshot hash does not match checkpoint metadata")
                 original_text = original.decode("utf-8") if original is not None else None
@@ -451,11 +499,56 @@ class CheckpointManager:
                 records=conflicts,
                 operation="restore_checkpoint",
             )
+        cancelled = interrupted()
+        if cancelled is not None:
+            return cancelled
         return PreparedRestore(
             checkpoint_id,
             tuple(prepared),
             "Multi-file restore is preflighted as a batch but is not atomic; per-file outcomes are reported.",
+            record.owner_id,
+            record.workspace_identity,
+            record.backend_identity,
+            record.integrity_sha256,
         )
+
+    def revalidate_restore(
+        self,
+        session: Session,
+        repository: RepositoryIndex,
+        prepared: PreparedRestore,
+        *,
+        cancellation: threading.Event | None = None,
+        deadline: float | None = None,
+    ) -> PreparedRestore | dict[str, Any]:
+        root = self._validated_workspace(session, repository)
+        if (
+            prepared.owner_id != session.session_id
+            or prepared.workspace_identity != str(root)
+            or prepared.backend_identity != self.settings.execution_mode
+        ):
+            return _failure(
+                "CHECKPOINT_SCOPE_VIOLATION",
+                "Workspace or execution backend identity changed after approval.",
+                operation="restore_checkpoint",
+            )
+        refreshed = self.prepare_restore(
+            session,
+            repository,
+            prepared.checkpoint_id,
+            [item.path for item in prepared.files],
+            cancellation=cancellation,
+            deadline=deadline,
+        )
+        if isinstance(refreshed, dict):
+            return refreshed
+        if refreshed.integrity_sha256 != prepared.integrity_sha256:
+            return _failure(
+                "CHECKPOINT_INTEGRITY_FAILURE",
+                "Checkpoint metadata changed after approval.",
+                operation="restore_checkpoint",
+            )
+        return refreshed
 
     def mark_restored(
         self,

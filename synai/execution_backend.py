@@ -11,6 +11,7 @@ from synai.storage import ConversationStorage
 class ExecutionBackend(Protocol):
     settings: Settings
     workspace: Path | None
+    execution_workspace: Path | None
 
     def matches(self, session: Session) -> bool: ...
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
 import subprocess
 import tempfile
 import unittest
@@ -10,19 +12,33 @@ from unittest.mock import AsyncMock
 
 from synai.config import Settings
 from synai.models import Session
+from synai.storage import ConversationStorage
 from synai.tools import Tools, schemas
 
 
 class GitBackend:
-    def __init__(self, workspace: Path, *, timeout: float = 5) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        timeout: float = 5,
+        history_dir: Path | None = None,
+    ) -> None:
         self.workspace = workspace.resolve()
         self.settings = Settings(
             execution_mode="host",
-            history_dir=workspace.parent / "synai-private",
+            history_dir=history_dir or workspace.parent / "synai-private",
             command_timeout=timeout,
         )
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.missing_git = False
+        self.output_transform = None
+
+    @property
+    def execution_workspace(self) -> Path:
+        if self.settings.execution_mode == "sandbox":
+            return getattr(self, "mapped_workspace", Path("/workspace"))
+        return self.workspace
 
     def matches(self, session: Session) -> bool:
         return Path(session.workspace) == self.workspace
@@ -50,26 +66,52 @@ class GitBackend:
                 cwd=self.workspace,
                 check=False,
                 capture_output=True,
-                text=True,
                 timeout=self.settings.command_timeout,
             )
         except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, bytes) else b""
+            stderr = exc.stderr if isinstance(exc.stderr, bytes) else b""
             return {
                 "ok": False,
-                "stdout": str(exc.stdout or ""),
-                "stderr": str(exc.stderr or ""),
+                "stdout": stdout.decode("utf-8", errors="replace"),
+                "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+                "stderr": stderr.decode("utf-8", errors="replace"),
+                "stderr_base64": base64.b64encode(stderr).decode("ascii"),
                 "exit_code": -9,
                 "truncated": False,
                 "timed_out": True,
             }
-        return {
+        stdout = result.stdout
+        stderr = result.stderr
+        output = {
             "ok": result.returncode == 0,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": stdout.decode("utf-8", errors="replace"),
+            "stdout_base64": base64.b64encode(stdout).decode("ascii"),
+            "stderr": stderr.decode("utf-8", errors="replace"),
+            "stderr_base64": base64.b64encode(stderr).decode("ascii"),
             "exit_code": result.returncode,
             "truncated": False,
             "timed_out": False,
         }
+        if self.settings.execution_mode == "sandbox" and "rev-parse" in str(arguments["command"]):
+            reported = Path(output["stdout"].strip())
+            try:
+                relative = reported.relative_to(self.workspace)
+                output["stdout"] = (Path("/workspace") / relative).as_posix() + "\n"
+            except ValueError:
+                output["stdout"] = (Path("/outside") / reported.name).as_posix() + "\n"
+            raw = output["stdout"].encode()
+            output["stdout_base64"] = base64.b64encode(raw).decode("ascii")
+        if self.output_transform is not None:
+            output = self.output_transform(str(arguments["command"]), output)
+        return output
+
+
+class SandboxMappedGitBackend(GitBackend):
+    def __init__(self, workspace: Path, history_dir: Path) -> None:
+        super().__init__(workspace, history_dir=history_dir)
+        self.settings = replace(self.settings, execution_mode="sandbox")
+        self.mapped_workspace = Path("/workspace")
 
 
 def git(root: Path, *args: str) -> str:
@@ -105,6 +147,13 @@ class GitToolTests(unittest.IsolatedAsyncioTestCase):
         git(self.workspace, "add", "client.py")
         git(self.workspace, "commit", "-qm", "initial")
         return git(self.workspace, "rev-parse", "HEAD")
+
+    def create_sandbox_workspace(self) -> tuple[Path, Path, str]:
+        history = Path(self.temp.name) / "managed-history"
+        storage = ConversationStorage(history)
+        session_id = "e" * 32
+        storage.create(session_id, workspace=True)
+        return storage.workspace(session_id), history, session_id
 
     async def call(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
         return await self.tools.call(name, arguments, session=self.session)
@@ -279,6 +328,288 @@ class GitToolTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["error_code"], "GIT_UNAVAILABLE")
+
+    async def test_sandbox_workspace_mapping_uses_container_root_and_relative_paths(self) -> None:
+        workspace, history, session_id = self.create_sandbox_workspace()
+        self.workspace = workspace
+        self.backend.workspace = workspace
+        self.initialize_repo()
+        (workspace / "client.py").write_text("changed\n")
+        backend = SandboxMappedGitBackend(workspace, history)
+        session = replace(self.session, workspace=str(workspace), session_id=session_id)
+        result = await Tools(backend, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=session,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["repository_identity"]["root"], ".")
+        self.assertEqual(result["workspace_identity"], str(self.workspace))
+        self.assertIn("client.py", {item["source_path"] for item in result["records"]})
+        self.assertTrue(all("/workspace" not in item["source_path"] for item in result["records"]))
+        commands = [str(arguments["command"]) for _, arguments in backend.calls]
+        status_commands = [command for command in commands if "status --porcelain" in command]
+        self.assertEqual(len(status_commands), 1)
+        self.assertIn("-C .", status_commands[0])
+
+    async def test_sandbox_mapping_supports_selected_nested_repository_and_rejects_parent(self) -> None:
+        base, history, session_id = self.create_sandbox_workspace()
+        self.workspace = base
+        self.backend.workspace = base
+        git(history, "init", "-q")
+        self.initialize_repo()
+        backend = SandboxMappedGitBackend(base, history)
+        session = replace(self.session, workspace=str(base), session_id=session_id)
+        result = await Tools(backend, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=session,
+        )
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["repository_identity"]["root"], ".")
+
+        outside = SandboxMappedGitBackend(base, history)
+        outside_session = replace(self.session, workspace=str(base), session_id=session_id)
+
+        def report_outside(command: str, output: dict[str, object]) -> dict[str, object]:
+            if "rev-parse --show-toplevel" in command:
+                output["stdout"] = "/outside/repository\n"
+                output["stdout_base64"] = base64.b64encode(b"/outside/repository\n").decode("ascii")
+            return output
+
+        outside.output_transform = report_outside
+        rejected = await Tools(outside, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=outside_session,
+        )
+        self.assertFalse(rejected["success"])
+        self.assertEqual(rejected["error_code"], "UNSAFE_PATH")
+
+    async def test_sandbox_backend_mapping_is_checked_before_and_after_discovery(self) -> None:
+        workspace, history, session_id = self.create_sandbox_workspace()
+        self.workspace = workspace
+        self.backend.workspace = workspace
+        self.initialize_repo()
+        backend = SandboxMappedGitBackend(workspace, history)
+        session = replace(self.session, workspace=str(workspace), session_id=session_id)
+        backend.mapped_workspace = Path("/wrong")
+        wrong = await Tools(backend, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=session,
+        )
+        self.assertEqual(wrong["error_code"], "WORKSPACE_CHANGED")
+        self.assertEqual(backend.calls, [])
+
+        backend.mapped_workspace = Path("/workspace")
+
+        def change_mapping(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                backend.mapped_workspace = Path("/changed")
+            return result
+
+        backend.output_transform = change_mapping
+        changed = await Tools(backend, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=session,
+        )
+        self.assertEqual(changed["error_code"], "WORKSPACE_CHANGED")
+        self.assertFalse(changed["success"])
+
+    async def test_sandbox_non_git_and_missing_git_are_reported(self) -> None:
+        workspace, history, session_id = self.create_sandbox_workspace()
+        backend = SandboxMappedGitBackend(workspace, history)
+        session = replace(self.session, workspace=str(workspace), session_id=session_id)
+        not_git = await Tools(backend, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=session,
+        )
+        self.assertFalse(not_git["success"])
+        self.assertEqual(not_git["error_code"], "NOT_GIT_REPOSITORY")
+        self.assertEqual(not_git["outcome"], "UNAVAILABLE")
+
+        backend.missing_git = True
+        unavailable = await Tools(backend, AsyncMock(return_value=True)).call(
+            "git_status", {}, session=session,
+        )
+        self.assertEqual(unavailable["error_code"], "GIT_UNAVAILABLE")
+
+    async def test_git_reported_traversal_and_symlink_escape_are_rejected(self) -> None:
+        self.initialize_repo()
+        outside = Path(self.temp.name) / "outside.py"
+        outside.write_text("outside\n")
+        (self.workspace / "escape.py").symlink_to(outside)
+
+        status = await self.call("git_status", {})
+        self.assertFalse(status["success"])
+        self.assertEqual(status["error_code"], "UNSAFE_PATH")
+
+        def traversal(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                raw = b"? ../outside.py\0"
+                result["stdout"] = raw.decode()
+                result["stdout_base64"] = base64.b64encode(raw).decode("ascii")
+            return result
+
+        self.backend.output_transform = traversal
+        self.workspace.joinpath("escape.py").unlink()
+        status = await self.call("git_status", {})
+        self.assertFalse(status["success"])
+        self.assertEqual(status["error_code"], "UNSAFE_PATH")
+
+    async def test_status_preserves_lossless_unusual_filename_bytes(self) -> None:
+        self.initialize_repo()
+        names = [
+            "with spaces.py",
+            'quote"name.py',
+            "unicode-\u2603.py",
+            "with\ttab.py",
+            "with\nnewline.py",
+            "-leading-dash.py",
+            os.fsdecode(b"invalid-\xff-name.py"),
+        ]
+        for name in names:
+            (self.workspace / name).write_text("new\n")
+
+        result = await self.call("git_status", {})
+
+        self.assertTrue(result["success"], result)
+        paths = {item["source_path"] for item in result["records"]}
+        self.assertEqual(paths, set(names))
+        self.assertIn("\udcff", next(path for path in paths if "invalid-" in path))
+
+    async def test_incomplete_git_status_is_never_authoritative(self) -> None:
+        self.initialize_repo()
+
+        def partial(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                raw = b"? complete.py\0? unfinished"
+                result.update({
+                    "ok": False,
+                    "stdout": raw.decode(),
+                    "stdout_base64": base64.b64encode(raw).decode("ascii"),
+                    "exit_code": -9,
+                    "truncated": True,
+                    "terminated_by_output_limit": True,
+                })
+            return result
+
+        self.backend.output_transform = partial
+        result = await self.call("git_status", {})
+
+        self.assertEqual(result["outcome"], "PARTIAL")
+        self.assertFalse(result["success"])
+        self.assertFalse(result["complete"])
+        self.assertFalse(result["authoritative"])
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["exit_code"], -9)
+        self.assertEqual([item["source_path"] for item in result["records"]], ["complete.py"])
+
+    async def test_successful_but_truncated_status_is_partial_and_non_authoritative(self) -> None:
+        self.initialize_repo()
+
+        def truncated_after_success(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                raw = b"? first.py\0"
+                result.update({
+                    "stdout": raw.decode(),
+                    "stdout_base64": base64.b64encode(raw).decode("ascii"),
+                    "truncated": True,
+                    "exit_code": 0,
+                    "ok": True,
+                })
+            return result
+
+        self.backend.output_transform = truncated_after_success
+        result = await self.call("git_status", {})
+
+        self.assertEqual(result["outcome"], "PARTIAL")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["process_completed"])
+        self.assertFalse(result["authoritative"])
+
+    async def test_cancelled_missing_exit_and_malformed_git_outputs_are_not_authoritative(self) -> None:
+        self.initialize_repo()
+
+        def cancelled(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                result.update({"ok": False, "cancelled": True})
+            return result
+
+        self.backend.output_transform = cancelled
+        result = await self.call("git_status", {})
+        self.assertEqual(result["outcome"], "CANCELLED")
+        self.assertTrue(result["cancelled"])
+
+        def missing_exit(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                result.pop("exit_code", None)
+            return result
+
+        self.backend.output_transform = missing_exit
+        result = await self.call("git_status", {})
+        self.assertEqual(result["outcome"], "FAILED")
+        self.assertEqual(result["error_code"], "GIT_OPERATION_FAILED")
+        self.assertIsNone(result["exit_code"])
+
+        def malformed(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                raw = b"not-a-status-record\0"
+                result["stdout"] = raw.decode()
+                result["stdout_base64"] = base64.b64encode(raw).decode("ascii")
+            return result
+
+        self.backend.output_transform = malformed
+        result = await self.call("git_status", {})
+        self.assertEqual(result["outcome"], "PARTIAL")
+        self.assertFalse(result["authoritative"])
+
+    async def test_large_git_diff_patch_is_reported_partial(self) -> None:
+        self.initialize_repo()
+        path = self.workspace / "large.txt"
+        path.write_text("before\n", encoding="utf-8")
+        git(self.workspace, "add", "large.txt")
+        git(self.workspace, "commit", "-qm", "add large file")
+        path.write_text("".join(f"line {number}\n" for number in range(12_000)), encoding="utf-8")
+
+        result = await self.call("git_diff", {
+            "mode": "unstaged",
+            "revision": "",
+            "paths": ["large.txt"],
+            "include_patch": True,
+        })
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "PARTIAL")
+        self.assertTrue(result["truncated"])
+        self.assertFalse(result["authoritative"])
+        self.assertEqual(len(result["records"][0]["patch"]), 64 * 1024)
+
+    async def test_nonzero_truncated_git_command_is_failed_not_successful(self) -> None:
+        self.initialize_repo()
+
+        def failed(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                result.update({
+                    "ok": False, "exit_code": 1, "truncated": True,
+                    "terminated_by_output_limit": False,
+                })
+            return result
+
+        self.backend.output_transform = failed
+        result = await self.call("git_status", {})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["outcome"], "FAILED")
+        self.assertEqual(result["error_code"], "GIT_OPERATION_FAILED")
+
+    async def test_lossy_git_text_without_byte_representation_is_incomplete(self) -> None:
+        self.initialize_repo()
+
+        def lossy(command: str, result: dict[str, object]) -> dict[str, object]:
+            if "status --porcelain" in command:
+                result["stdout"] = "? damaged-\ufffd.py\0"
+                result.pop("stdout_base64", None)
+            return result
+
+        self.backend.output_transform = lossy
+        result = await self.call("git_status", {})
+
+        self.assertEqual(result["outcome"], "PARTIAL")
+        self.assertFalse(result["authoritative"])
+        self.assertEqual(result["records"], [])
 
     async def test_checkpoint_does_not_run_unapproved_git_commands(self) -> None:
         self.initialize_repo()
