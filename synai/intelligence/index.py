@@ -310,6 +310,53 @@ class RepositoryIndex:
         """Read a bounded file already admitted by this index, without accepting host paths."""
         return self.read_sources((path,), cancellation)[path]
 
+    def read_file_bytes(
+        self,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+        cancellation: threading.Event | None = None,
+    ) -> bytes | None:
+        """Read one bounded regular file using the index's no-follow, identity-checked reader."""
+        maximum = self.limits.max_file_bytes if max_bytes is None else max_bytes
+        if (
+            not isinstance(path, str) or not path or "\\" in path or "\x00" in path
+            or Path(path).is_absolute() or ".." in Path(path).parts
+            or type(maximum) is not int or not 1 <= maximum <= self.limits.max_file_bytes
+        ):
+            raise ValueError("Source snapshot path or byte limit is invalid")
+        if cancellation and cancellation.is_set():
+            raise InterruptedError("Source snapshot capture cancelled")
+        components = Path(path).parts
+        parent = "." if len(components) == 1 else str(Path(*components[:-1]))
+        try:
+            directory_fd = _open_workspace_directory(self.root, parent)
+        except FileNotFoundError:
+            return None
+        try:
+            try:
+                expected_info = os.stat(
+                    components[-1], dir_fd=directory_fd, follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(expected_info.st_mode):
+                raise OSError("Source snapshot target is not a regular file")
+            if expected_info.st_size > maximum:
+                raise OSError("Source snapshot target exceeds the configured byte limit")
+        finally:
+            os.close(directory_fd)
+        data = _read_workspace_file(
+            self.root, path, maximum, expected_info=expected_info,
+        )
+        if data is None:
+            raise OSError("Source snapshot target is not a safe regular file")
+        if len(data) > maximum:
+            raise OSError("Source snapshot target exceeds the configured byte limit")
+        if cancellation and cancellation.is_set():
+            raise InterruptedError("Source snapshot capture cancelled")
+        return data
+
     def read_sources(
         self,
         paths: tuple[str, ...],

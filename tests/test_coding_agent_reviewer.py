@@ -7,6 +7,7 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 from synai.coding_agent import (
@@ -32,6 +33,8 @@ from synai.coding_agent.context import (
     ContextKind,
     ContextPackage,
 )
+from synai.coding_agent.changes import TaskChangeTracker
+from synai.coding_agent.reviewer import ReviewEngine
 from synai.config import ConversationEnvironment, Settings
 from synai.intelligence import RepositoryIndex
 from synai.models import ChatEvent, ModelInfo, Session
@@ -362,6 +365,40 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
         ))
         payload = json.loads(self.provider.calls[-1][1][1].content)
         self.assertIn("cannot claim a complete before/after diff", payload["diff_limitation"])
+
+    async def test_reviewer_receives_verified_task_specific_assertion_diff(self) -> None:
+        task = self.make_task(include_test_change=True)
+        tracker = TaskChangeTracker(
+            task, self.repository, self.settings, str(self.root),
+        )
+        replacement = (
+            "import unittest\n\n"
+            "class RequestTests(unittest.TestCase):\n"
+            "    def test_request(self):\n"
+            "        self.assertTrue(True)\n"
+        )
+        tracker.before_mutation(
+            "test-integrity-execution",
+            "tests/test_client.py",
+            "modify",
+            repair_attempt_id=None,
+            tool_name="write_file",
+            arguments={"path": "tests/test_client.py", "content": replacement},
+        )
+        self.test_path.write_text(replacement, encoding="utf-8")
+        tracker.after_mutation("test-integrity-execution", {"ok": True})
+
+        evidence, limitations = ReviewEngine(self.runtime)._task_change_evidence(
+            SimpleNamespace(task=task, repository=self.repository),
+            ("tests/test_client.py",),
+        )
+
+        self.assertEqual(limitations, ())
+        task_diff = next(item for item in evidence if item["kind"] == "task_diff")
+        self.assertTrue(task_diff["complete"])
+        self.assertIn("-        self.assertTrue(request(1))", task_diff["diff"])
+        self.assertIn("+        self.assertTrue(True)", task_diff["diff"])
+        self.assertEqual(self.provider.calls, [])
 
     async def test_stale_verified_source_blocks_without_calling_model(self) -> None:
         task = await self.verified_task()

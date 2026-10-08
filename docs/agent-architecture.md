@@ -470,3 +470,46 @@ Runtime, verification, repair, and review event callbacks are observational;
 ordinary callback exceptions are logged without reversing persisted task
 state. Cancellation remains authoritative, while approval and checkpoint
 failures remain task/control failures.
+
+## Git inspection, task changes, and safe checkpoints (Phase 9)
+
+Git inspection is an optional evidence layer routed through the existing
+`Tools` dispatcher and execution backend. Coding Agent Tasks may inspect
+`git_status`, `git_diff`, `git_log`, and `git_show`; each operation requires
+the existing terminal approval. Commands are application-owned, bounded,
+noninteractive templates. Revisions are resolved from validated hexadecimal
+commit IDs, paths are workspace-relative, and Git metadata/repository roots
+outside the selected workspace are reported as unsupported rather than
+expanding workspace authority. Git is not required for task-specific change
+tracking. Normal `Agent.turn` schemas remain unchanged; the Phase 9 schemas
+are enabled explicitly.
+
+Immediately before an approved Phase 5 or Phase 7 mutation is dispatched, the
+runtime captures the first preimage for that task/path through the existing
+no-follow, identity-checked `RepositoryIndex.read_file_bytes` reader. A
+bounded private content-addressed snapshot stores source bytes; task state
+stores only hashes, references, execution/repair attribution, outcome,
+uncertainty, and bounded diff evidence. Later mutations retain the initial
+task baseline and record their own before/after state. Failed, no-op,
+interrupted, or externally discontinuous operations are not represented as
+confirmed successful changes. Phase 6 source fingerprints remain the
+authoritative freshness gate. Phase 8 review receives actual task-specific
+before/after evidence when available and explicit limitations otherwise.
+
+`git_checkpoint` creates an explicitly approved private snapshot and never
+creates a Git commit or changes the index. `restore_checkpoint` validates the
+checkpoint owner, workspace/backend identity, integrity, selected paths, and
+all current file hashes before the first write. It restores the captured
+workspace state, including pre-existing dirty content, using the existing
+approved mutation backend; it does not run Git reset, checkout, clean, or
+stash. Checkpoint creation does not launch Git commands; repository identity
+is recorded only when supplied by a separately approved inspection. The
+snapshot is bounded to 64 paths, 1 MiB per file, 16 MiB total, 128
+retained checkpoint records, and a 10-second capture duration; snapshot
+content shares the private 64 MiB/1,024-object store. Restore preflight is
+all-files-first, but multiple backend mutations are not atomic and their
+per-file outcomes are reported. A changed file causes a conflict instead of
+being overwritten. The current text mutation backend cannot restore binary or
+non-UTF-8 snapshots; such requests are rejected explicitly. Retention cleanup
+is explicit, and interrupted/uncertain mutations are never replayed
+automatically.

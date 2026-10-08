@@ -10,6 +10,8 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import uuid4
 
+from synai.coding_agent.changes import ChangeBaseline, MutationEvidence
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -1261,6 +1263,8 @@ class AgentTask:
     repair_attempts: list[RepairAttempt] = field(default_factory=list)
     repair_outcome: RepairOutcome | None = None
     review_record: ReviewRecord | None = None
+    change_baselines: list[ChangeBaseline] = field(default_factory=list)
+    change_evidence: list[MutationEvidence] = field(default_factory=list)
     terminal_summary: str | None = None
     approval_resume_state: AgentStatus | None = None
 
@@ -1419,9 +1423,25 @@ class AgentTask:
             (self.executions, "executions"),
             (self.verification_results, "verification results"),
             (self.repair_attempts, "repair attempts"),
+            (self.change_baselines, "change baselines"),
+            (self.change_evidence, "change evidence"),
         ):
             if not isinstance(items, list) or len(items) > 512:
                 raise ValueError(f"Invalid agent {label}")
+        for item in self.change_baselines:
+            if not isinstance(item, ChangeBaseline):
+                raise ValueError("Invalid agent change baseline")
+            item.validate()
+            if item.task_id != self.task_id:
+                raise ValueError("Change baseline references a different task")
+        for item in self.change_evidence:
+            if not isinstance(item, MutationEvidence):
+                raise ValueError("Invalid agent change evidence")
+            item.validate()
+            if item.task_id != self.task_id:
+                raise ValueError("Mutation evidence references a different task")
+            if item.execution_id not in {record.execution_id for record in self.executions}:
+                raise ValueError("Mutation evidence references an unknown execution")
         if self.verification_plan is not None:
             if not isinstance(self.verification_plan, VerificationPlan):
                 raise ValueError("Invalid agent verification plan")
@@ -1520,6 +1540,8 @@ class AgentTask:
             "repair_attempts": [item.to_dict() for item in self.repair_attempts],
             "repair_outcome": self.repair_outcome.value if self.repair_outcome else None,
             "review_record": self.review_record.to_dict() if self.review_record else None,
+            "change_baselines": [item.to_dict() for item in self.change_baselines],
+            "change_evidence": [item.to_dict() for item in self.change_evidence],
             "terminal_summary": self.terminal_summary,
             "approval_resume_state": (
                 self.approval_resume_state.value if self.approval_resume_state is not None else None
@@ -1538,9 +1560,10 @@ class AgentTask:
         }
         repair_keys = extended_keys | {"repair_outcome"}
         review_keys = repair_keys | {"review_record"}
+        change_keys = review_keys | {"change_baselines", "change_evidence"}
         if not isinstance(value, dict) or set(value) not in {
             frozenset(legacy_keys), frozenset(extended_keys), frozenset(repair_keys),
-            frozenset(review_keys),
+            frozenset(review_keys), frozenset(change_keys),
         }:
             raise ValueError("Invalid agent task fields")
         data = value
@@ -1576,6 +1599,14 @@ class AgentTask:
                     ReviewRecord.from_dict(data["review_record"])
                     if data.get("review_record") is not None else None
                 ),
+                change_baselines=[
+                    ChangeBaseline.from_dict(item)
+                    for item in data.get("change_baselines", [])
+                ],
+                change_evidence=[
+                    MutationEvidence.from_dict(item)
+                    for item in data.get("change_evidence", [])
+                ],
                 terminal_summary=data["terminal_summary"],
                 approval_resume_state=(
                     AgentStatus(data["approval_resume_state"])

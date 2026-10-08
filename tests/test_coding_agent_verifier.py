@@ -1051,6 +1051,13 @@ class VerifierFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempt.triggering_check_id, initial.results[0].check_id)
         self.assertEqual(attempt.mutated_paths, ("app/client.py",))
         self.assertTrue(attempt.execution_ids)
+        repair_evidence = [
+            item for item in task.change_evidence
+            if item.repair_attempt_id == attempt.attempt
+        ]
+        self.assertEqual(len(repair_evidence), 1)
+        self.assertEqual(repair_evidence[0].path, "app/client.py")
+        self.assertEqual(repair_evidence[0].outcome, "succeeded")
         self.assertIsNotNone(attempt.next_verification_run_id)
         self.assertEqual(
             [item.status for item in task.verification_results],

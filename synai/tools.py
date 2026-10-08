@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import difflib
 import json
+import logging
+import re
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from synai.execution_backend import ExecutionBackend, validate_workspace
+from synai.coding_agent.git import (
+    GIT_ARGUMENTS,
+    GIT_DESCRIPTIONS,
+    GitInspector,
+    validate_git_arguments,
+)
+from synai.coding_agent.checkpoints import CheckpointManager, PreparedRestore
 from synai.intelligence import IndexLimits, RepositoryIndex
 from synai.models import Session
 from synai.sandbox import SandboxError
@@ -17,6 +26,50 @@ from synai.sandbox import SandboxError
 Approval = Callable[[str, str], Awaitable[bool]]
 ApprovalObserver = Callable[[str, str, bool | None], Awaitable[None]]
 DispatchGuard = Callable[[], Awaitable[bool]]
+MutationObserver = Callable[
+    [str, str, dict[str, Any], dict[str, Any] | None],
+    Awaitable[dict[str, Any] | None],
+]
+ToolEventObserver = Callable[[str, str | None], Awaitable[None]]
+_logger = logging.getLogger(__name__)
+CHECKPOINT_ARGUMENTS: dict[str, dict[str, dict[str, Any]]] = {
+    "git_checkpoint": {
+        "task_id": {
+            "type": "string",
+            "description": "Optional active Agent Task identifier; empty when not task-owned",
+            "maxLength": 128,
+        },
+        "paths": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 512},
+            "description": "Workspace-relative files to snapshot",
+            "minItems": 1,
+            "maxItems": 64,
+        },
+        "require_complete": {
+            "type": "boolean",
+            "description": "Reject creation unless every requested file is captured",
+        },
+    },
+    "restore_checkpoint": {
+        "checkpoint_id": {
+            "type": "string",
+            "description": "Checkpoint identifier returned by git_checkpoint",
+            "pattern": "^[a-f0-9]{32}$",
+        },
+        "paths": {
+            "type": "array",
+            "items": {"type": "string", "maxLength": 512},
+            "description": "Explicit subset of checkpoint files to restore",
+            "minItems": 1,
+            "maxItems": 64,
+        },
+    },
+}
+CHECKPOINT_DESCRIPTIONS = {
+    "git_checkpoint": "Create an explicitly approved private workspace snapshot; this does not create a Git commit.",
+    "restore_checkpoint": "Explicitly restore captured file contents after conflict preflight; this does not reset Git.",
+}
 PROPERTIES: dict[str, dict[str, str]] = {
     "list_files": {"path": "Directory relative to /workspace; use . for root"},
     "read_file": {"path": "Workspace-relative file path"},
@@ -64,7 +117,12 @@ INTELLIGENCE_ARGUMENTS: dict[str, tuple[str, dict[str, dict[str, Any]]]] = {
 INTELLIGENCE_TOOLS = frozenset(INTELLIGENCE_ARGUMENTS)
 
 
-def schemas(mode: str = "sandbox") -> list[dict[str, Any]]:
+def schemas(
+    mode: str = "sandbox",
+    *,
+    include_git: bool = False,
+    include_checkpoints: bool = False,
+) -> list[dict[str, Any]]:
     ordinary = [
         {"type": "function", "function": {
             "name": name, "description": DESCRIPTIONS[name].replace(
@@ -92,7 +150,103 @@ def schemas(mode: str = "sandbox") -> list[dict[str, Any]]:
         }}
         for name, (description, properties) in INTELLIGENCE_ARGUMENTS.items()
     ]
-    return ordinary + intelligence
+    git = [
+        {"type": "function", "function": {
+            "name": name,
+            "description": GIT_DESCRIPTIONS[name],
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": list(properties),
+                "additionalProperties": False,
+            },
+        }}
+        for name, properties in GIT_ARGUMENTS.items()
+    ]
+    checkpoints = [
+        {"type": "function", "function": {
+            "name": name,
+            "description": CHECKPOINT_DESCRIPTIONS[name],
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": list(properties),
+                "additionalProperties": False,
+            },
+        }}
+        for name, properties in CHECKPOINT_ARGUMENTS.items()
+    ]
+    return ordinary + intelligence + (
+        git if include_git else []
+    ) + (checkpoints if include_checkpoints else [])
+
+
+def validate_checkpoint_arguments(name: str, arguments: dict[str, Any]) -> bool:
+    properties = CHECKPOINT_ARGUMENTS[name]
+    if set(arguments) != set(properties):
+        return False
+    paths = arguments.get("paths")
+    if (
+        not isinstance(paths, list) or not 1 <= len(paths) <= 64
+        or any(
+            not isinstance(path, str) or not path or len(path) > 512
+            or Path(path).is_absolute() or "\\" in path or "\x00" in path
+            or Path(path).as_posix() != path
+            or any(part in {"", ".", ".."} for part in Path(path).parts)
+            or any(ord(character) < 32 or ord(character) == 127 for character in path)
+            for path in paths
+        )
+        or len(set(paths)) != len(paths)
+    ):
+        return False
+    if name == "git_checkpoint":
+        task_id = arguments.get("task_id")
+        return (
+            isinstance(task_id, str) and len(task_id) <= 128
+            and type(arguments.get("require_complete")) is bool
+        )
+    checkpoint_id = arguments.get("checkpoint_id")
+    return isinstance(checkpoint_id, str) and re.fullmatch(r"[a-f0-9]{32}", checkpoint_id) is not None
+
+
+def _restore_result(
+    success: bool,
+    error_code: str | None,
+    records: list[dict[str, Any]],
+    limitation: str,
+) -> dict[str, Any]:
+    return {
+        "ok": success,
+        "success": success,
+        "operation": "restore_checkpoint",
+        "error_code": error_code,
+        "records": records,
+        "result_count": len(records),
+        "truncated": False,
+        "limitations": [limitation],
+    }
+
+
+def _tool_failure(
+    operation: str,
+    error_code: str,
+    error: str,
+    *,
+    workspace: Path | None,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "success": False,
+        "operation": operation,
+        "repository": None,
+        "workspace": str(workspace) if workspace is not None else None,
+        "records": [],
+        "result_count": 0,
+        "truncated": False,
+        "limitations": [],
+        "error_code": error_code,
+        "error": error[:512],
+    }
 
 
 class Tools:
@@ -108,12 +262,33 @@ class Tools:
         session: Session | None = None,
         approval_observer: ApprovalObserver | None = None,
         dispatch_guard: DispatchGuard | None = None,
+        mutation_observer: MutationObserver | None = None,
+        event_observer: ToolEventObserver | None = None,
+        expected_preimage: tuple[bool, str | None] | None = None,
+        cancellation: threading.Event | None = None,
     ) -> dict[str, Any]:
-        if name not in PROPERTIES and name not in INTELLIGENCE_ARGUMENTS:
+        if (
+            name not in PROPERTIES and name not in INTELLIGENCE_ARGUMENTS
+            and name not in GIT_ARGUMENTS and name not in CHECKPOINT_ARGUMENTS
+        ):
             return {"ok": False, "error": "Unknown tool or invalid arguments"}
         if not isinstance(arguments, dict):
             return {"ok": False, "error": "Unknown tool or invalid arguments"}
-        if name in INTELLIGENCE_ARGUMENTS:
+        if name in GIT_ARGUMENTS:
+            if not validate_git_arguments(name, arguments):
+                return {
+                    "ok": False,
+                    "error": f"{name} requires its exact bounded schema; revisions must be commit hashes and paths workspace-relative",
+                    "error_code": "INVALID_ARGUMENTS",
+                }
+        elif name in CHECKPOINT_ARGUMENTS:
+            if not validate_checkpoint_arguments(name, arguments):
+                return {
+                    "ok": False,
+                    "error_code": "INVALID_ARGUMENTS",
+                    "error": f"{name} requires its exact bounded workspace-relative schema",
+                }
+        elif name in INTELLIGENCE_ARGUMENTS:
             properties = INTELLIGENCE_ARGUMENTS[name][1]
             if set(arguments) != set(properties) or any(
                 not isinstance(value, str)
@@ -132,10 +307,55 @@ class Tools:
                 return {"ok": False, "error": f"{name} requires exactly these string arguments: {', '.join(sorted(expected))}"}
         if len(json.dumps(arguments).encode()) > self.sandbox.settings.output_bytes * 2:
             return {"ok": False, "error": "Tool arguments exceed configured limit"}
+        if name in GIT_ARGUMENTS and (
+            session is None or not self.sandbox.matches(session)
+        ):
+            return {
+                "ok": False,
+                "error": "Git inspection requires the matching active conversation workspace",
+                "error_code": "WORKSPACE_CHANGED",
+            }
+        if name in CHECKPOINT_ARGUMENTS and (
+            session is None or not self.sandbox.matches(session)
+        ):
+            return {
+                "ok": False,
+                "error": "Checkpoint operations require the matching active conversation workspace",
+                "error_code": "CHECKPOINT_SCOPE_VIOLATION",
+            }
         if name in INTELLIGENCE_TOOLS:
             if session is None or not self.sandbox.matches(session):
                 return {"ok": False, "error": "Repository intelligence requires the matching active conversation workspace"}
             return await self._intelligence(name, arguments)
+        prepared_restore: PreparedRestore | None = None
+        checkpoint_manager: CheckpointManager | None = None
+        if name == "restore_checkpoint":
+            try:
+                assert session is not None
+                checkpoint_manager = CheckpointManager(self.sandbox.settings)
+                prepared = checkpoint_manager.prepare_restore(
+                    session,
+                    self._repository_index(session),
+                    arguments["checkpoint_id"],
+                    arguments["paths"],
+                )
+            except (OSError, ValueError) as exc:
+                return {
+                    "ok": False,
+                    "success": False,
+                    "operation": name,
+                    "error_code": "CHECKPOINT_SCOPE_VIOLATION",
+                    "error": str(exc)[:512],
+                }
+            if isinstance(prepared, dict):
+                await self._observe_event(
+                    event_observer,
+                    "restoration_conflict" if prepared.get("error_code") == "CHECKPOINT_CONFLICT"
+                    else "restoration_interrupted",
+                    str(prepared.get("error", ""))[:512],
+                )
+                return prepared
+            prepared_restore = prepared
         digest: str | None = None
         description = json.dumps(arguments, ensure_ascii=True, indent=2)
         try:
@@ -144,6 +364,15 @@ class Tools:
                 if not preview.get("ok"):
                     return preview
                 digest = preview["sha256"]
+                if expected_preimage is not None and (
+                    (digest is not None) != expected_preimage[0]
+                    or digest != expected_preimage[1]
+                ):
+                    return {
+                        "ok": False,
+                        "error_code": "CHECKPOINT_CONFLICT",
+                        "error": "File changed after checkpoint restoration preflight",
+                    }
                 old = preview["content"] or ""
                 if name == "patch_file":
                     if not arguments["old"] or old.count(arguments["old"]) != 1:
@@ -157,6 +386,24 @@ class Tools:
                 ))
                 description = f"Target: {arguments['path']!r}\n\n{diff}"[:64000]
             if name not in {"read_file", "list_files"}:
+                if name in GIT_ARGUMENTS:
+                    await self._observe_event(event_observer, "git_operation_started", name)
+                    description = (
+                        f"{GIT_DESCRIPTIONS[name]}\n\n"
+                        f"Workspace: {self.sandbox.workspace}\n"
+                        f"Validated request: {json.dumps(arguments, ensure_ascii=True)}"
+                    )
+                elif name in CHECKPOINT_ARGUMENTS:
+                    description = (
+                        f"{CHECKPOINT_DESCRIPTIONS[name]}\n\n"
+                        f"Workspace: {self.sandbox.workspace}\n"
+                        f"Validated request: {json.dumps(arguments, ensure_ascii=True)}"
+                    )
+                    event_kind = (
+                        "checkpoint_requested" if name == "git_checkpoint"
+                        else "restoration_approval_required"
+                    )
+                    await self._observe_event(event_observer, event_kind, name)
                 if self.sandbox.settings.execution_mode == "host":
                     description = f"HOST EXECUTION // NOT ISOLATED\nWorkspace: {self.sandbox.workspace}\n\n{description}"
                 if approval_observer is not None:
@@ -165,14 +412,268 @@ class Tools:
                 if approval_observer is not None:
                     await approval_observer(name, description, approved)
                 if not approved:
+                    if name in GIT_ARGUMENTS:
+                        return _tool_failure(
+                            name, "APPROVAL_DENIED", "User denied Git inspection",
+                            workspace=self.sandbox.workspace,
+                        )
+                    if name == "git_checkpoint":
+                        await self._observe_event(
+                            event_observer, "checkpoint_rejected", "approval denied",
+                        )
+                        return _tool_failure(
+                            name, "CHECKPOINT_APPROVAL_DENIED",
+                            "User denied checkpoint creation",
+                            workspace=self.sandbox.workspace,
+                        )
+                    if name == "restore_checkpoint":
+                        return {
+                            "ok": False,
+                            "success": False,
+                            "denied": True,
+                            "error_code": "RESTORE_APPROVAL_DENIED",
+                            "error": "User denied checkpoint restoration",
+                        }
                     return {"ok": False, "denied": True, "error": "User denied this action"}
                 if dispatch_guard is not None and not await dispatch_guard():
+                    if name in GIT_ARGUMENTS:
+                        return _tool_failure(
+                            name, "CANCELLED", "Git inspection cancelled before dispatch",
+                            workspace=self.sandbox.workspace,
+                        )
+                    if name == "git_checkpoint":
+                        await self._observe_event(
+                            event_observer, "checkpoint_rejected", "cancelled before dispatch",
+                        )
+                        return _tool_failure(
+                            name, "CANCELLED", "Checkpoint creation cancelled before dispatch",
+                            workspace=self.sandbox.workspace,
+                        )
+                    if name == "restore_checkpoint":
+                        await self._observe_event(
+                            event_observer, "restoration_interrupted", "cancelled before dispatch",
+                        )
+                        return _restore_result(
+                            False, "CANCELLED", [], prepared_restore.limitation
+                            if prepared_restore else "Restore preflight was not retained.",
+                        )
                     return {"ok": False, "denied": True, "error": "Action cancelled before dispatch"}
+            if name in GIT_ARGUMENTS:
+                result = await GitInspector(self.sandbox).inspect(name, arguments, session)
+                await self._observe_event(
+                    event_observer,
+                    "git_operation_completed",
+                    f"{name}: {'succeeded' if result.get('success') else 'failed'}",
+                )
+                return result
+            if name in CHECKPOINT_ARGUMENTS:
+                assert session is not None
+                checkpoint_manager = checkpoint_manager or CheckpointManager(self.sandbox.settings)
+                if name == "git_checkpoint":
+                    try:
+                        result = await asyncio.to_thread(
+                            checkpoint_manager.create,
+                            session,
+                            self._repository_index(session),
+                            arguments["paths"],
+                            task_id=arguments["task_id"] or None,
+                            require_complete=arguments["require_complete"],
+                            cancellation=cancellation,
+                        )
+                    except (OSError, ValueError, InterruptedError) as exc:
+                        result = _tool_failure(
+                            name,
+                            "CHECKPOINT_SCOPE_VIOLATION",
+                            str(exc),
+                            workspace=self.sandbox.workspace,
+                        )
+                    await self._observe_event(
+                        event_observer,
+                        "checkpoint_created" if result.get("ok") else "checkpoint_rejected",
+                        str(result.get("checkpoint_id") or result.get("error") or "")[:512],
+                    )
+                    return result
+                assert prepared_restore is not None
+                result = await self._restore_checkpoint(
+                    checkpoint_manager,
+                    prepared_restore,
+                    session,
+                    dispatch_guard,
+                    event_observer,
+                )
+                return result
+            if name in {"write_file", "patch_file", "delete_file"} and mutation_observer is not None:
+                try:
+                    await mutation_observer("before", name, arguments, None)
+                except (OSError, ValueError) as exc:
+                    return {
+                        "ok": False,
+                        "error_code": "CHANGE_BASELINE_UNAVAILABLE",
+                        "error": str(exc)[:512],
+                    }
+                return await self._execute_mutation(
+                    name, arguments, digest, mutation_observer,
+                )
             return await self.sandbox.execute(name, arguments, digest)
         except TimeoutError:
             return {"ok": False, "error": f"{self.sandbox.settings.execution_mode.title()} tool timed out"}
         except (SandboxError, OSError) as exc:
             return {"ok": False, "error": f"{self.sandbox.settings.execution_mode.title()} tool failed: {exc}"}
+
+    def _repository_index(self, session: Session) -> RepositoryIndex:
+        workspace = self.sandbox.workspace
+        if workspace is None or not self.sandbox.matches(session):
+            raise ValueError("Checkpoint workspace/backend identity changed")
+        root = validate_workspace(
+            workspace,
+            self.sandbox.settings,
+            sandbox=self.sandbox.settings.execution_mode == "sandbox",
+        )
+        limits = IndexLimits(max_output_bytes=min(524_288, self.sandbox.settings.output_bytes))
+        index = self._indexes.get(root)
+        if index is None or index.limits != limits:
+            index = RepositoryIndex(root, limits)
+            self._indexes = {root: index}
+        return index
+
+    async def _restore_checkpoint(
+        self,
+        manager: CheckpointManager,
+        prepared: PreparedRestore,
+        session: Session,
+        dispatch_guard: DispatchGuard | None,
+        event_observer: ToolEventObserver | None,
+    ) -> dict[str, Any]:
+        records: list[dict[str, Any]] = []
+        for item in prepared.files:
+            if dispatch_guard is not None and not await dispatch_guard():
+                outcome = "interrupted"
+                records.append({"path": item.path, "outcome": outcome})
+                await self._observe_event(event_observer, "restoration_interrupted", item.path)
+                return _restore_result(
+                    False, "CANCELLED" if not records[:-1] else "RESTORE_PARTIAL_FAILURE",
+                    records, prepared.limitation,
+                )
+            if (
+                item.expected_exists == item.original_exists
+                and item.expected_sha256 == item.restore_sha256
+            ):
+                records.append({"path": item.path, "outcome": "unchanged"})
+                continue
+            if item.original_exists:
+                assert item.original_content is not None
+                name = "write_file"
+                arguments: dict[str, Any] = {
+                    "path": item.path,
+                    "content": item.original_content,
+                }
+            else:
+                name = "delete_file"
+                arguments = {"path": item.path}
+            result = await self.call(
+                name,
+                arguments,
+                session=session,
+                dispatch_guard=dispatch_guard,
+                expected_preimage=(item.expected_exists, item.expected_sha256),
+            )
+            if result.get("ok") is True:
+                try:
+                    await asyncio.to_thread(
+                        manager.mark_restored,
+                        prepared.checkpoint_id,
+                        item.path,
+                    )
+                except (OSError, ValueError) as exc:
+                    records.append({
+                        "path": item.path,
+                        "outcome": "uncertain",
+                        "error": str(exc)[:256],
+                    })
+                    return _restore_result(
+                        False, "RESTORE_PARTIAL_FAILURE", records, prepared.limitation,
+                    )
+                records.append({"path": item.path, "outcome": "restored"})
+            else:
+                outcome = "denied" if result.get("denied") is True else "failed"
+                records.append({
+                    "path": item.path,
+                    "outcome": outcome,
+                    "error_code": result.get("error_code"),
+                })
+                code = (
+                    "RESTORE_APPROVAL_DENIED" if outcome == "denied"
+                    else "CHECKPOINT_CONFLICT" if result.get("error_code") == "CHECKPOINT_CONFLICT"
+                    else "RESTORE_PARTIAL_FAILURE"
+                )
+                await self._observe_event(
+                    event_observer,
+                    "restoration_conflict" if code == "CHECKPOINT_CONFLICT" else "restoration_interrupted",
+                    item.path,
+                )
+                return _restore_result(False, code, records, prepared.limitation)
+        await self._observe_event(
+            event_observer, "restoration_completed", prepared.checkpoint_id,
+        )
+        return _restore_result(True, None, records, prepared.limitation)
+
+    @staticmethod
+    async def _observe_event(
+        callback: ToolEventObserver | None,
+        kind: str,
+        message: str | None,
+    ) -> None:
+        if callback is not None:
+            try:
+                await callback(kind, message[:512] if message else None)
+            except Exception as exc:
+                _logger.warning(
+                    "Tool observer delivery failed for event %s: %s",
+                    kind, str(exc)[:512],
+                )
+
+    async def _execute_mutation(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        digest: str | None,
+        observer: MutationObserver,
+    ) -> dict[str, Any]:
+        try:
+            try:
+                result = await self.sandbox.execute(name, arguments, digest)
+            except TimeoutError:
+                result = {
+                    "ok": False,
+                    "error_code": "TIMEOUT",
+                    "error": f"{self.sandbox.settings.execution_mode.title()} tool timed out",
+                }
+            except (SandboxError, OSError) as exc:
+                result = {
+                    "ok": False,
+                    "error_code": "TOOL_ERROR",
+                    "error": f"{self.sandbox.settings.execution_mode.title()} tool failed: {exc}",
+                }
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(observer("after", name, arguments, None))
+            except (OSError, ValueError):
+                pass
+            raise
+        try:
+            evidence = await observer("after", name, arguments, result)
+        except (OSError, ValueError) as exc:
+            result = dict(result)
+            result.update({
+                "mutation_changed": False,
+                "change_attribution_complete": False,
+                "attribution_error": str(exc)[:512],
+            })
+        else:
+            if evidence is not None:
+                result = dict(result)
+                result.update(evidence)
+        return result
 
     async def _intelligence(self, name: str, arguments: dict[str, str]) -> dict[str, Any]:
         workspace = self.sandbox.workspace

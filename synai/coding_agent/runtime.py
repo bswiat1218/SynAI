@@ -19,6 +19,8 @@ from synai.coding_agent.context import (
     ContextPackage,
     ContextRequest,
 )
+from synai.coding_agent.changes import BaselineCaptureError, TaskChangeTracker
+from synai.coding_agent.checkpoints import CheckpointManager
 from synai.coding_agent.planner import (
     Planner,
     PlanningRequest,
@@ -32,6 +34,7 @@ from synai.coding_agent.verifier import (
     VerificationRequest,
     VerificationRunResult,
 )
+from synai.coding_agent.git import GIT_TOOLS
 from synai.coding_agent.state import (
     AgentCheckpoint,
     AgentErrorType,
@@ -94,6 +97,7 @@ class RuntimeErrorCode(StrEnum):
     REPLAN_REQUIRED = "replan_required"
     REPAIR_MUTATION_NOT_PERFORMED = "repair_mutation_not_performed"
     REPAIR_RESOURCE_LIMIT = "repair_resource_limit"
+    CHANGE_BASELINE_UNAVAILABLE = "change_baseline_unavailable"
 
 
 @dataclass(frozen=True)
@@ -158,7 +162,7 @@ CheckpointHook = Callable[[AgentCheckpoint], Awaitable[None]]
 EventSink = Callable[[RuntimeEvent], Awaitable[None]]
 _logger = logging.getLogger(__name__)
 
-_READ_TOOLS = frozenset({"read_file", "list_files", *INTELLIGENCE_TOOLS})
+_READ_TOOLS = frozenset({"read_file", "list_files", *INTELLIGENCE_TOOLS, *GIT_TOOLS})
 _MUTATING_OPERATIONS = frozenset({
     PlanOperation.CREATE, PlanOperation.MODIFY,
     PlanOperation.DELETE, PlanOperation.DOCUMENT,
@@ -202,6 +206,7 @@ class CodingAgentRuntime:
         self.context_engine = context_engine or ContextEngine()
         self.limits = limits or RuntimeLimits()
         self.history = history
+        self._change_trackers: dict[str, TaskChangeTracker] = {}
 
     async def run_verification(
         self,
@@ -733,6 +738,7 @@ class CodingAgentRuntime:
         tool_schemas = [
             schema for schema in schemas(
                 session.environment.execution_mode if session.environment else "sandbox",
+                include_git=True,
             )
             if schema["function"]["name"] in allowed
         ]
@@ -944,12 +950,29 @@ class CodingAgentRuntime:
                         task, execution, checkpoint, event_sink,
                         step.step_id,
                     )
+                mutation_observer = (
+                    self._mutation_observer(
+                        task,
+                        execution,
+                        session,
+                        repository,
+                        checkpoint,
+                        event_sink,
+                        repair_mode=repair_mode,
+                    )
+                    if operation is not None else None
+                )
                 invocation = asyncio.create_task(self.tools.call(
                     name,
                     arguments,
                     session=session,
                     approval_observer=approval_observer,
                     dispatch_guard=self._dispatch_guard(cancellation),
+                    mutation_observer=mutation_observer,
+                    event_observer=self._tool_event_observer(
+                        task, step.step_id, event_sink,
+                    ),
+                    cancellation=cancellation,
                 ))
                 try:
                     result = await self._await_cancellable(invocation, cancellation)
@@ -1009,6 +1032,16 @@ class CodingAgentRuntime:
                         result,
                         repair_max_tool_result_characters if repair_mode else None,
                     )[:1024]
+                    if (
+                        isinstance(result, dict)
+                        and result.get("error_code") == "CHANGE_BASELINE_UNAVAILABLE"
+                    ):
+                        raise _RuntimeStop(
+                            RuntimeErrorCode.CHANGE_BASELINE_UNAVAILABLE,
+                            str(result.get("error", "Safe mutation baseline capture failed"))[:2048],
+                            step.step_id,
+                            name,
+                        )
                 await self._checkpoint(task, checkpoint)
                 await self._emit(
                     task,
@@ -1154,6 +1187,137 @@ class CodingAgentRuntime:
 
         return observe
 
+    def _mutation_observer(
+        self,
+        task: AgentTask,
+        execution: AgentExecution,
+        session: Session,
+        repository: RepositoryIndex,
+        checkpoint: CheckpointHook | None,
+        event_sink: EventSink | None,
+        *,
+        repair_mode: bool,
+    ):
+        async def observe(
+            phase: str,
+            tool_name: str,
+            arguments: dict[str, Any],
+            result: dict[str, Any] | None,
+        ) -> dict[str, Any] | None:
+            if tool_name not in _MUTATION_TOOLS:
+                raise ValueError("Change capture received a non-mutation tool")
+            root = self._validate_runtime_workspace(session, repository)
+            tracker = self._change_trackers.get(task.task_id)
+            if tracker is None:
+                tracker = TaskChangeTracker(
+                    task,
+                    repository,
+                    self.tools.sandbox.settings,
+                    str(root),
+                )
+                self._change_trackers[task.task_id] = tracker
+            path = arguments.get("path")
+            if not isinstance(path, str):
+                raise ValueError("Mutation target path is unavailable")
+            repair_attempt_id = (
+                task.repair_attempts[-1].attempt
+                if repair_mode and task.repair_attempts else None
+            )
+            if phase == "before":
+                operation = {
+                    PlanOperation.CREATE: "create",
+                    PlanOperation.MODIFY: "modify",
+                    PlanOperation.DELETE: "delete",
+                    PlanOperation.DOCUMENT: "modify",
+                }.get(execution.operation)
+                if operation is None:
+                    raise ValueError("Mutation plan operation is unavailable")
+                try:
+                    await asyncio.to_thread(
+                        tracker.before_mutation,
+                        execution.execution_id,
+                        path,
+                        operation,
+                        repair_attempt_id=repair_attempt_id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                    )
+                except BaselineCaptureError:
+                    raise
+                except (OSError, ValueError, InterruptedError) as exc:
+                    raise BaselineCaptureError(
+                        f"CHANGE_BASELINE_UNAVAILABLE: {path}: {str(exc)[:256]}",
+                    ) from exc
+                await self._checkpoint(task, checkpoint)
+                await self._emit(
+                    task,
+                    "task_baseline_captured",
+                    event_sink,
+                    step_id=execution.step_id,
+                    tool_name=tool_name,
+                    message=f"Captured the initial task baseline for {path}.",
+                )
+                return None
+            if phase != "after":
+                raise ValueError("Unknown mutation evidence phase")
+            evidence = await asyncio.to_thread(
+                tracker.after_mutation,
+                execution.execution_id,
+                result,
+            )
+            record = evidence["change_evidence"]
+            if (
+                record["outcome"] in {"succeeded", "no_op", "failed"}
+                and record["after_exists"] is not None
+            ):
+                try:
+                    await asyncio.to_thread(
+                        CheckpointManager(self.tools.sandbox.settings).update_task_postimage,
+                        task.task_id,
+                        str(root),
+                        path,
+                        record["after_exists"],
+                        record["after_hash"],
+                    )
+                except (OSError, ValueError) as exc:
+                    limitation = f"Checkpoint expected-state update failed: {str(exc)[:256]}"
+                    mutation_record = task.change_evidence[-1]
+                    mutation_record.limitations = tuple(
+                        dict.fromkeys((*mutation_record.limitations, limitation))
+                    )[:8]
+                    record = mutation_record.to_dict()
+                    evidence["change_evidence"] = record
+                    evidence["change_attribution_complete"] = False
+                    await self._emit(
+                        task,
+                        "change_attribution_incomplete",
+                        event_sink,
+                        step_id=execution.step_id,
+                        tool_name=tool_name,
+                        message=limitation,
+                    )
+            await self._checkpoint(task, checkpoint)
+            await self._emit(
+                task,
+                "mutation_evidence_recorded",
+                event_sink,
+                step_id=execution.step_id,
+                tool_name=tool_name,
+                message=f"Recorded {record['outcome']} evidence for {path}.",
+            )
+            if record["uncertain"] or not evidence["change_attribution_complete"]:
+                await self._emit(
+                    task,
+                    "change_attribution_incomplete",
+                    event_sink,
+                    step_id=execution.step_id,
+                    tool_name=tool_name,
+                    message=f"Change attribution is incomplete for {path}.",
+                )
+            return evidence
+
+        return observe
+
     @staticmethod
     def _dispatch_guard(cancellation: threading.Event | None) -> Callable[[], Awaitable[bool]]:
         async def can_dispatch() -> bool:
@@ -1220,6 +1384,23 @@ class CodingAgentRuntime:
                 await callback(checkpoint)
 
         return save
+
+    def _tool_event_observer(
+        self,
+        task: AgentTask,
+        step_id: str,
+        callback: EventSink | None,
+    ) -> Callable[[str, str | None], Awaitable[None]]:
+        async def observe(kind: str, message: str | None) -> None:
+            await self._emit(
+                task,
+                kind,
+                callback,
+                step_id=step_id,
+                message=message,
+            )
+
+        return observe
 
     async def _emit(
         self,
@@ -1455,6 +1636,31 @@ class CodingAgentRuntime:
             )
         if name in _READ_TOOLS:
             path = arguments.get("path")
+            paths = arguments.get("paths", [])
+            if not isinstance(paths, list) or any(
+                not isinstance(candidate, str) or not _safe_relative(candidate)
+                for candidate in paths
+            ):
+                raise _RuntimeStop(
+                    RuntimeErrorCode.PLAN_SCOPE_VIOLATION,
+                    "Git paths must be safe and workspace-relative",
+                    step.step_id,
+                    name,
+                )
+            if name == "git_show" and path == "":
+                path = None
+            for candidate in paths:
+                try:
+                    _validate_plan_path(
+                        root, candidate, allow_missing=True, allow_directory=True,
+                    )
+                except ValueError as exc:
+                    raise _RuntimeStop(
+                        RuntimeErrorCode.PLAN_SCOPE_VIOLATION,
+                        str(exc)[:1024],
+                        step.step_id,
+                        name,
+                    ) from exc
             if path is not None:
                 if not isinstance(path, str) or not (
                     _safe_relative(path) or name == "list_files" and path == "."

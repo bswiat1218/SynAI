@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+from synai.coding_agent.checkpoints import CheckpointManager
+from synai.config import Settings
+from synai.intelligence import IndexLimits, RepositoryIndex
+from synai.models import Session
+from synai.tools import Tools, schemas
+
+
+class CheckpointBackend:
+    def __init__(self, workspace: Path, history_dir: Path) -> None:
+        self.workspace = workspace.resolve()
+        self.settings = Settings(
+            execution_mode="host",
+            history_dir=history_dir,
+            output_bytes=1_048_576,
+        )
+
+    def matches(self, session: Session) -> bool:
+        return Path(session.workspace) == self.workspace
+
+    async def execute(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        expected_sha256: str | None = None,
+    ) -> dict[str, object]:
+        target = self.workspace / str(arguments.get("path", ""))
+        if name == "preview":
+            content = target.read_text(encoding="utf-8") if target.exists() else None
+            digest = hashlib.sha256(content.encode()).hexdigest() if content is not None else None
+            return {"ok": True, "content": content, "sha256": digest}
+        current = target.read_text(encoding="utf-8") if target.exists() else None
+        digest = hashlib.sha256(current.encode()).hexdigest() if current is not None else None
+        if digest != expected_sha256:
+            return {"ok": False, "error_code": "WORKSPACE_CHANGED"}
+        if name == "write_file":
+            target.write_text(str(arguments["content"]), encoding="utf-8")
+        elif name == "delete_file":
+            target.unlink()
+        else:
+            return {"ok": False, "error": "Unsupported test operation"}
+        return {"ok": True, "path": arguments["path"]}
+
+
+class CheckpointToolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        base = Path(self.temp.name)
+        self.workspace = base / "workspace"
+        self.workspace.mkdir()
+        self.history = base / "private-history"
+        self.backend = CheckpointBackend(self.workspace, self.history)
+        self.session = Session(
+            "test", "http://localhost:11434", str(self.workspace),
+            session_id="b" * 32,
+        )
+        self.approve = AsyncMock(return_value=True)
+        self.tools = Tools(self.backend, self.approve)
+        self.index = RepositoryIndex(self.workspace, IndexLimits())
+
+    async def checkpoint(self, path: str = "client.py") -> str:
+        result = await self.tools.call(
+            "git_checkpoint",
+            {
+                "task_id": "task-1",
+                "paths": [path],
+                "require_complete": True,
+            },
+            session=self.session,
+        )
+        self.assertTrue(result["success"], result)
+        return str(result["checkpoint_id"])
+
+    async def test_chat_schemas_unchanged_unless_phase_nine_tools_requested(self) -> None:
+        default_names = {tool["function"]["name"] for tool in schemas()}
+        self.assertNotIn("git_status", default_names)
+        self.assertNotIn("git_checkpoint", default_names)
+        phase_nine_names = {
+            tool["function"]["name"]
+            for tool in schemas(include_git=True, include_checkpoints=True)
+        }
+        self.assertIn("git_status", phase_nine_names)
+        self.assertIn("git_checkpoint", phase_nine_names)
+        self.assertIn("restore_checkpoint", phase_nine_names)
+
+    async def test_approved_restore_preserves_dirty_baseline(self) -> None:
+        (self.workspace / "client.py").write_text("user = 'dirty'\n", encoding="utf-8")
+        checkpoint_id = await self.checkpoint()
+        (self.workspace / "client.py").write_text("agent = 'change'\n", encoding="utf-8")
+        manager = CheckpointManager(self.backend.settings)
+        manager.update_task_postimage(
+            "task-1", str(self.workspace), "client.py", True,
+            hashlib.sha256(b"agent = 'change'\n").hexdigest(),
+        )
+
+        result = await self.tools.call(
+            "restore_checkpoint",
+            {"checkpoint_id": checkpoint_id, "paths": ["client.py"]},
+            session=self.session,
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["records"], [{"path": "client.py", "outcome": "restored"}])
+        self.assertEqual((self.workspace / "client.py").read_text(), "user = 'dirty'\n")
+        self.assertEqual(self.approve.await_count, 3)
+
+    async def test_external_edit_blocks_restore_without_overwriting(self) -> None:
+        (self.workspace / "client.py").write_text("baseline\n", encoding="utf-8")
+        checkpoint_id = await self.checkpoint()
+        (self.workspace / "client.py").write_text("agent\n", encoding="utf-8")
+        manager = CheckpointManager(self.backend.settings)
+        manager.update_task_postimage(
+            "task-1", str(self.workspace), "client.py", True,
+            hashlib.sha256(b"agent\n").hexdigest(),
+        )
+        (self.workspace / "client.py").write_text("external edit\n", encoding="utf-8")
+        approvals_before = self.approve.await_count
+
+        result = await self.tools.call(
+            "restore_checkpoint",
+            {"checkpoint_id": checkpoint_id, "paths": ["client.py"]},
+            session=self.session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "CHECKPOINT_CONFLICT")
+        self.assertEqual((self.workspace / "client.py").read_text(), "external edit\n")
+        self.assertEqual(self.approve.await_count, approvals_before)
+
+    async def test_restore_preflights_every_file_before_mutating_any(self) -> None:
+        (self.workspace / "a.py").write_text("a baseline\n", encoding="utf-8")
+        (self.workspace / "b.py").write_text("b baseline\n", encoding="utf-8")
+        checkpoint = await self.tools.call(
+            "git_checkpoint",
+            {"task_id": "task-1", "paths": ["a.py", "b.py"], "require_complete": True},
+            session=self.session,
+        )
+        self.assertTrue(checkpoint["success"], checkpoint)
+        (self.workspace / "a.py").write_text("a agent state\n", encoding="utf-8")
+        (self.workspace / "b.py").write_text("b agent state\n", encoding="utf-8")
+        manager = CheckpointManager(self.backend.settings)
+        for path, content in (("a.py", b"a agent state\n"), ("b.py", b"b agent state\n")):
+            manager.update_task_postimage(
+                "task-1", str(self.workspace), path, True,
+                hashlib.sha256(content).hexdigest(),
+            )
+        (self.workspace / "b.py").write_text("b external state\n", encoding="utf-8")
+        approvals_before = self.approve.await_count
+
+        result = await self.tools.call(
+            "restore_checkpoint",
+            {
+                "checkpoint_id": checkpoint["checkpoint_id"],
+                "paths": ["a.py", "b.py"],
+            },
+            session=self.session,
+        )
+
+        self.assertEqual(result["error_code"], "CHECKPOINT_CONFLICT")
+        self.assertEqual((self.workspace / "a.py").read_text(), "a agent state\n")
+        self.assertEqual((self.workspace / "b.py").read_text(), "b external state\n")
+        self.assertEqual(self.approve.await_count, approvals_before)
+
+    async def test_approval_denial_never_restores_a_checkpoint(self) -> None:
+        (self.workspace / "client.py").write_text("baseline\n", encoding="utf-8")
+        checkpoint_id = await self.checkpoint()
+        denied = AsyncMock(return_value=False)
+        tools = Tools(self.backend, denied)
+
+        result = await tools.call(
+            "restore_checkpoint",
+            {"checkpoint_id": checkpoint_id, "paths": ["client.py"]},
+            session=self.session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "RESTORE_APPROVAL_DENIED")
+        self.assertEqual((self.workspace / "client.py").read_text(), "baseline\n")
+        self.assertEqual(denied.await_count, 1)
+
+    async def test_checkpoint_capture_cancellation_creates_no_record(self) -> None:
+        (self.workspace / "client.py").write_text("baseline\n", encoding="utf-8")
+        cancellation = threading.Event()
+        cancellation.set()
+
+        result = await self.tools.call(
+            "git_checkpoint",
+            {"task_id": "", "paths": ["client.py"], "require_complete": True},
+            session=self.session,
+            cancellation=cancellation,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "CANCELLED")
+        self.assertFalse((self.history / "checkpoints").exists())
+
+    async def test_checkpoint_cleanup_removes_expired_metadata_and_private_contents(self) -> None:
+        (self.workspace / "client.py").write_text("baseline\n", encoding="utf-8")
+        checkpoint_id = await self.checkpoint()
+        manager = CheckpointManager(self.backend.settings)
+        metadata = manager.directory / f"{checkpoint_id}.json"
+        metadata.touch()
+        os.utime(metadata, (1, 1))
+
+        removed = manager.cleanup(older_than_seconds=1)
+
+        self.assertEqual(removed, 1)
+        self.assertFalse(metadata.exists())
+        self.assertEqual(list((self.history / "checkpoint-snapshots").iterdir()), [])
+
+    async def test_tampered_checkpoint_integrity_blocks_restoration(self) -> None:
+        (self.workspace / "client.py").write_text("baseline\n", encoding="utf-8")
+        checkpoint_id = await self.checkpoint()
+        metadata = self.history / "checkpoints" / f"{checkpoint_id}.json"
+        metadata.write_text("{}", encoding="utf-8")
+
+        result = await self.tools.call(
+            "restore_checkpoint",
+            {"checkpoint_id": checkpoint_id, "paths": ["client.py"]},
+            session=self.session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "CHECKPOINT_INTEGRITY_FAILURE")
+        self.assertEqual(result["operation"], "restore_checkpoint")
+        self.assertEqual((self.workspace / "client.py").read_text(), "baseline\n")
+
+    async def test_symlink_replacement_blocks_restoration(self) -> None:
+        target = self.workspace / "client.py"
+        outside = Path(self.temp.name) / "outside.py"
+        target.write_text("baseline\n", encoding="utf-8")
+        outside.write_text("external\n", encoding="utf-8")
+        checkpoint_id = await self.checkpoint()
+        target.unlink()
+        target.symlink_to(outside)
+
+        result = await self.tools.call(
+            "restore_checkpoint",
+            {"checkpoint_id": checkpoint_id, "paths": ["client.py"]},
+            session=self.session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertIn(result["error_code"], {
+            "CHECKPOINT_CONFLICT", "CHECKPOINT_INTEGRITY_FAILURE",
+        })
+        self.assertEqual(outside.read_text(), "external\n")
+
+    async def test_checkpoint_storage_inside_workspace_is_rejected_without_creation(self) -> None:
+        (self.workspace / "client.py").write_text("baseline\n", encoding="utf-8")
+        settings = Settings(
+            execution_mode="host",
+            history_dir=self.workspace / ".synai-private",
+        )
+        backend = CheckpointBackend(self.workspace, self.workspace / ".synai-private")
+        backend.settings = settings
+        tools = Tools(backend, AsyncMock(return_value=True))
+
+        result = await tools.call(
+            "git_checkpoint",
+            {"task_id": "", "paths": ["client.py"], "require_complete": True},
+            session=self.session,
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_code"], "CHECKPOINT_SCOPE_VIOLATION")
+        self.assertFalse((self.workspace / ".synai-private").exists())
+
+    async def test_checkpoint_rejects_escape_and_reports_incomplete_capture(self) -> None:
+        escape = await self.tools.call(
+            "git_checkpoint",
+            {"task_id": "", "paths": ["../outside"], "require_complete": True},
+            session=self.session,
+        )
+        self.assertEqual(escape["error_code"], "INVALID_ARGUMENTS")
+
+        missing = await self.tools.call(
+            "git_checkpoint",
+            {"task_id": "", "paths": ["missing.py"], "require_complete": True},
+            session=self.session,
+        )
+        self.assertTrue(missing["success"], missing)
+        self.assertTrue(missing["complete"])
+
+        (self.workspace / "large.py").write_bytes(b"x" * (1_048_577))
+        result = await self.tools.call(
+            "git_checkpoint",
+            {"task_id": "", "paths": ["large.py"], "require_complete": True},
+            session=self.session,
+        )
+        self.assertEqual(result["error_code"], "CHECKPOINT_INCOMPLETE")
+        self.assertFalse(result["success"])

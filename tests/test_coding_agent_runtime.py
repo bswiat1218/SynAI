@@ -27,6 +27,7 @@ from synai.coding_agent import (
     StepStatus,
     VerificationIntent,
 )
+from synai.coding_agent.checkpoints import CheckpointManager
 from synai.config import ConversationEnvironment, Settings
 from synai.history import History
 from synai.intelligence import RepositoryIndex
@@ -260,6 +261,7 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         ])
         runtime = self.make_runtime(provider)
         task = AgentTask(TASK)
+        original_client = (self.root / "app" / "client.py").read_text(encoding="utf-8")
         saved: list[dict[str, Any]] = []
         events = []
 
@@ -268,6 +270,17 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
 
         async def emit(event: Any) -> None:
             events.append(event)
+
+        explicit_checkpoint = await runtime.tools.call(
+            "git_checkpoint",
+            {
+                "task_id": task.task_id,
+                "paths": ["app/client.py"],
+                "require_complete": True,
+            },
+            session=self.session,
+        )
+        self.assertTrue(explicit_checkpoint["success"], explicit_checkpoint)
 
         result = await runtime.run_task(
             task, TASK, self.session, self.repository, model=MODEL,
@@ -281,9 +294,22 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([step.step_id for step in task.plan.steps if step.status == StepStatus.COMPLETED], [
             "step-1", "step-2",
         ])
-        self.assertEqual(self.approvals, ["patch_file", "patch_file"])
+        self.assertEqual(self.approvals, ["git_checkpoint", "patch_file", "patch_file"])
         self.assertEqual(len([item for item in task.executions if item.status == ExecutionStatus.SUCCEEDED]), 2)
         self.assertTrue(all(item.approval_state.value == "approved" for item in task.executions))
+        self.assertEqual(
+            {item.path for item in task.change_baselines},
+            {"app/client.py", "tests/test_client.py"},
+        )
+        self.assertEqual(len(task.change_evidence), 2)
+        self.assertTrue(all(item.outcome == "succeeded" for item in task.change_evidence))
+        self.assertTrue(all(item.repair_attempt_id is None for item in task.change_evidence))
+        checkpoint_manager = CheckpointManager(self.settings)
+        checkpoint_record = checkpoint_manager.load(explicit_checkpoint["checkpoint_id"])
+        self.assertEqual(
+            checkpoint_record.files[0].expected_sha256,
+            hashlib.sha256((self.root / "app" / "client.py").read_bytes()).hexdigest(),
+        )
         self.assertIn("range(3)", (self.root / "app" / "client.py").read_text())
         self.assertIn("retry case", (self.root / "tests" / "test_client.py").read_text())
         self.assertEqual([name for name, _, _ in self.backend.calls].count("terminal"), 0)
@@ -291,6 +317,22 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].kind, "ready_for_verification")
         self.assertTrue(any(event.kind == "waiting_for_tool_approval" for event in events))
         self.assertTrue(task.plan.verification_intent == [VerificationIntent.TARGETED_TESTS])
+
+        restored = await runtime.tools.call(
+            "restore_checkpoint",
+            {
+                "checkpoint_id": explicit_checkpoint["checkpoint_id"],
+                "paths": ["app/client.py"],
+            },
+            session=self.session,
+        )
+        self.assertTrue(restored["success"], restored)
+        self.assertEqual((self.root / "app" / "client.py").read_text(), original_client)
+        self.assertIn("retry case", (self.root / "tests" / "test_client.py").read_text())
+        self.assertEqual(
+            self.approvals,
+            ["git_checkpoint", "patch_file", "patch_file", "restore_checkpoint", "write_file"],
+        )
 
     async def test_observer_failure_does_not_fail_implementation_step(self) -> None:
         provider = FakeProvider(execution=[

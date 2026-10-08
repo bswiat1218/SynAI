@@ -12,6 +12,7 @@ from synai.coding_agent.context import (
     parse_task,
     render_context,
 )
+from synai.coding_agent.changes import ChangeBaseline, MutationEvidence, SnapshotStore
 from synai.coding_agent.state import (
     AgentCheckpoint,
     AgentErrorType,
@@ -62,6 +63,9 @@ __all__ = [
     "ContextLimits",
     "ContextPackage",
     "ContextRequest",
+    "ChangeBaseline",
+    "MutationEvidence",
+    "SnapshotStore",
     "AgentCheckpoint",
     "AgentErrorType",
     "AgentExecution",
