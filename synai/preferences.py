@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
 
+from synai.coding_agent.policies import AutonomyPolicyConfig
 from synai.config import Settings
 from synai.storage import ConversationStorage, checked_path, write_private_json
 
@@ -19,12 +20,16 @@ class Preferences:
     request_timeout: float = 1200
     theme: str = DEFAULT_THEME
     schema_version: int = 1
+    autonomy_policy: AutonomyPolicyConfig = field(default_factory=AutonomyPolicyConfig)
 
     def validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
             raise ValueError("Unsupported application settings version")
         if not isinstance(self.theme, str) or not self.theme or not self.theme.strip() == self.theme:
             raise ValueError("Theme must be a nonempty name")
+        if not isinstance(self.autonomy_policy, AutonomyPolicyConfig):
+            raise ValueError("Autonomy policy settings must be typed trusted configuration")
+        self.autonomy_policy.validate()
         Settings(ollama_url=self.ollama_url, request_timeout=self.request_timeout).validate()
 
 
@@ -45,8 +50,14 @@ class PreferencesStore:
             value = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(value, dict):
                 raise ValueError("Application settings must be an object")
-            if set(value) != {"schema_version", "ollama_url", "request_timeout", "theme"}:
+            legacy_keys = {"schema_version", "ollama_url", "request_timeout", "theme"}
+            current_keys = legacy_keys | {"autonomy_policy"}
+            if frozenset(value) not in {frozenset(legacy_keys), frozenset(current_keys)}:
                 raise ValueError("Invalid application settings fields")
+            if "autonomy_policy" in value:
+                value["autonomy_policy"] = AutonomyPolicyConfig.from_dict(
+                    value["autonomy_policy"],
+                )
             result = Preferences(**value)
             result.validate()
             return result

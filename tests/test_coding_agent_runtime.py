@@ -370,6 +370,7 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.state, AgentStatus.VERIFYING)
         self.assertEqual(task.plan.steps[0].status, StepStatus.COMPLETED)
+        self.assertEqual(task.policy_context.mode, AutonomyMode.AGENT)
 
     async def test_supervised_plan_denial_executes_no_tool_or_step(self) -> None:
         provider = FakeProvider()
@@ -505,6 +506,35 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         result = await runtime.run_task(
             AgentTask(TASK), TASK, self.session, self.repository,
             model=MODEL, plan=plan,
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.code, RuntimeErrorCode.UNDECLARED_MUTATION_TARGET)
+        self.assertEqual(config.read_text(), "enabled = False\n")
+        self.assertEqual(self.approvals, [])
+        self.assertEqual([name for name, _, _ in self.backend.calls], [])
+
+    async def test_autonomous_mode_does_not_expand_plan_mutation_scope(self) -> None:
+        config = self.root / "app" / "config.py"
+        config.write_text("enabled = False\n", encoding="utf-8")
+        provider = FakeProvider(execution=[
+            ([{"function": {
+                "name": "write_file",
+                "arguments": {"path": "app/config.py", "content": "enabled = True\n"},
+            }}], "Trying an adjacent workspace file."),
+        ])
+        runtime = self.make_runtime(provider)
+        plan = typed_plan([
+            AgentStep(
+                "step-1", "Modify the client", purpose="Change retry behavior",
+                paths=["app/client.py"], operations=[PlanOperation.MODIFY],
+                expected_outcome="Retry behavior changes",
+                verification_criteria=["Focused retry behavior can be checked"],
+            ),
+        ])
+        result = await runtime.run_task(
+            AgentTask(TASK), TASK, self.session, self.repository,
+            model=MODEL, plan=plan, autonomy=AutonomyMode.AUTONOMOUS,
         )
 
         self.assertFalse(result.ok)

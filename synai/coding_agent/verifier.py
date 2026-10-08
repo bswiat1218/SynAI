@@ -13,6 +13,7 @@ import threading
 import time
 import tomllib
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -33,6 +34,13 @@ from synai.coding_agent.state import (
     VerificationPlan,
     VerificationResult,
     VerificationStatus,
+)
+from synai.coding_agent.policies import (
+    AutonomyMode,
+    OperationCategory,
+    PolicyAuditRecord,
+    PolicyDecisionType,
+    workspace_fingerprint,
 )
 
 from synai.execution_backend import validate_workspace
@@ -691,6 +699,72 @@ class VerificationEngine:
     ) -> object:
         command_started: float | None = None
         started = time.monotonic()
+        backend = self.tools.sandbox
+        task_policy = request.task.policy_context
+        mode = task_policy.mode if task_policy is not None else AutonomyMode.SUPERVISED
+        policy_fingerprint = (
+            task_policy.policy_fingerprint
+            if task_policy is not None else self.tools.policy.fingerprint
+        )
+        workspace = str(request.repository.root)
+        policy_request = self.tools.policy.create_request(
+            "terminal",
+            {"command": shlex.join(check.argv), "cwd": check.cwd},
+            mode=mode,
+            task_id=request.task.task_id,
+            step_id=check.check_id,
+            backend_identity=backend.settings.execution_mode,
+            workspace=workspace,
+            policy_fingerprint=policy_fingerprint,
+            category=OperationCategory.VERIFICATION_EXECUTION,
+            workspace_valid=(
+                backend.matches(request.session)
+                and backend.workspace is not None
+                and str(backend.workspace.resolve()) == workspace
+                and (
+                    task_policy is None
+                    or task_policy.backend_identity == backend.settings.execution_mode
+                    and task_policy.workspace_identity == workspace_fingerprint(workspace)
+                )
+            ),
+            task_active=request.task.status == AgentStatus.VERIFYING,
+        )
+        decision = self.tools.policy.evaluate(
+            policy_request,
+            cancelled=bool(request.cancellation and request.cancellation.is_set()),
+        )
+        audit = PolicyAuditRecord(
+            task_id=request.task.task_id,
+            step_id=check.check_id,
+            execution_id=None,
+            tool_name="terminal",
+            category=decision.category,
+            mode=decision.mode,
+            decision=decision.decision,
+            reason=decision.reason,
+            policy_fingerprint=decision.policy_fingerprint,
+            approval_required=decision.decision == PolicyDecisionType.REQUIRE_APPROVAL,
+            approval_outcome=(
+                "pending"
+                if decision.decision == PolicyDecisionType.REQUIRE_APPROVAL
+                else "never_dispatched"
+            ),
+            backend_identity=backend.settings.execution_mode,
+            workspace_identity=workspace_fingerprint(workspace),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        audit.validate()
+        request.task.policy_audit.append(audit)
+        del request.task.policy_audit[:-512]
+
+        def set_audit_outcome(value: str) -> None:
+            for index in range(len(request.task.policy_audit) - 1, -1, -1):
+                item = request.task.policy_audit[index]
+                if item is audit:
+                    request.task.policy_audit[index] = replace(
+                        item, approval_outcome=value,
+                    )
+                    return
 
         async def approval_observer(
             name: str, description: str, decision: bool | None,
@@ -709,6 +783,7 @@ class VerificationEngine:
                 )
             else:
                 result.approval_state = ApprovalStatus.APPROVED if decision else ApprovalStatus.DENIED
+                set_audit_outcome("approved" if decision else "denied")
                 if decision:
                     command_started = time.monotonic()
                 if request.task.status == AgentStatus.WAITING_FOR_APPROVAL:
@@ -716,12 +791,20 @@ class VerificationEngine:
                     await self._checkpoint(request.task)
 
         async def dispatch_guard() -> bool:
-            return not (request.cancellation and request.cancellation.is_set())
+            if request.cancellation and request.cancellation.is_set():
+                return False
+            return (
+                request.task.status == AgentStatus.VERIFYING
+                and backend.matches(request.session)
+                and backend.workspace is not None
+                and str(backend.workspace.resolve()) == workspace
+            )
 
         tool_task = asyncio.create_task(self.tools.call(
             "terminal",
             {"command": shlex.join(check.argv), "cwd": check.cwd},
             session=request.session,
+            policy_request=policy_request,
             approval_observer=approval_observer,
             dispatch_guard=dispatch_guard,
         ))
@@ -740,7 +823,17 @@ class VerificationEngine:
                     await asyncio.gather(tool_task, return_exceptions=True)
                     raise TimeoutError
                 await asyncio.wait({tool_task}, timeout=min(0.05, max(0.01, remaining)))
-            return await tool_task
+            tool_result = await tool_task
+            if isinstance(tool_result, dict):
+                if tool_result.get("error_code") == "POLICY_DENIED":
+                    result.approval_state = ApprovalStatus.NOT_REQUIRED
+                    set_audit_outcome("policy_denied")
+                elif tool_result.get("error_code") == "CANCELLED":
+                    result.approval_state = ApprovalStatus.NOT_REQUIRED
+                    set_audit_outcome("cancelled")
+                elif result.approval_state == ApprovalStatus.NOT_REQUIRED:
+                    set_audit_outcome("not_required")
+            return tool_result
         except BaseException:
             if not tool_task.done():
                 tool_task.cancel()

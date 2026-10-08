@@ -16,6 +16,7 @@ from synai.config import Settings
 from synai.history import HistoryError
 from synai.models import Activity, GenerationSource, Message
 from synai.preferences import DEFAULT_THEME, Preferences, PreferencesStore, resolve_connection
+from synai.coding_agent.policies import AutonomyPolicyConfig
 from synai.tui.application import ApprovalScreen, CodingApp
 from synai.tui.directory_picker import DirectoryPicker
 from synai.tui.menu import ConnectionMenu
@@ -37,6 +38,15 @@ class GlobalUiTests(unittest.IsolatedAsyncioTestCase):
             mock = patch(target, menus.MenuProvider)
             mock.start()
             self.addCleanup(mock.stop)
+
+    def test_saved_autonomy_policy_is_wired_to_authoritative_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            policy = AutonomyPolicyConfig(denied_tools=("terminal",))
+            app = CodingApp(
+                replace(Settings(), history_dir=Path(directory)),
+                preferences=Preferences(autonomy_policy=policy),
+            )
+            self.assertEqual(app.agent.tools.policy.configuration, policy)
 
     async def test_connection_confirmation_save_cancel_failure_and_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

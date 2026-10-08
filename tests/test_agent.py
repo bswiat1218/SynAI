@@ -128,17 +128,26 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         sandbox.execute.assert_not_awaited()
 
     async def test_write_preview_and_diff_then_expected_hash(self) -> None:
-        sandbox = Sandbox(Settings())
-        sandbox.execute = AsyncMock(side_effect=[
-            {"ok": True, "content": "old\n", "sha256": "oldhash"}, {"ok": True},
-        ])
-        approval = AsyncMock(return_value=True)
-        tools = Tools(sandbox, approval)
-        result = await tools.call("write_file", {"path": "main.txt", "content": "new\n"})
-        self.assertTrue(result["ok"])
-        self.assertIn("-old", approval.call_args.args[1])
-        self.assertIn("+new", approval.call_args.args[1])
-        self.assertEqual(sandbox.execute.call_args.args[2], "oldhash")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            sandbox = Sandbox(replace(
+                Settings(), history_dir=root / "history",
+            ))
+            sandbox.workspace = workspace
+            sandbox.execute = AsyncMock(side_effect=[
+                {"ok": True, "content": "old\n", "sha256": "oldhash"}, {"ok": True},
+            ])
+            approval = AsyncMock(return_value=True)
+            tools = Tools(sandbox, approval)
+            result = await tools.call(
+                "write_file", {"path": "main.txt", "content": "new\n"},
+            )
+            self.assertTrue(result["ok"])
+            self.assertIn("-old", approval.call_args.args[1])
+            self.assertIn("+new", approval.call_args.args[1])
+            self.assertEqual(sandbox.execute.call_args.args[2], "oldhash")
 
     async def test_unknown_tool_rejected_and_chat_only_has_no_tools(self) -> None:
         sandbox = Sandbox(Settings())

@@ -526,3 +526,60 @@ text mutation backend cannot restore binary or
 non-UTF-8 snapshots; such requests are rejected explicitly. Retention cleanup
 is explicit, and interrupted/uncertain mutations are never replayed
 automatically.
+
+## Autonomy policy (Phase 10)
+
+`synai.coding_agent.policies.AutonomyPolicy` is the deterministic policy
+authority used by `CodingAgentRuntime` and `Tools.call`. It classifies exact
+registered tool names using application-owned definitions; model-supplied
+operation labels are ignored. A typed decision is `ALLOW`,
+`REQUIRE_APPROVAL`, or `DENY`, with a stable reason code, explanation,
+effective mode, category, source, constraints, and configuration fingerprint.
+`inspect_policy` produces a deterministic human-readable explanation without
+calling a model.
+
+The precedence is hard security restrictions, backend/workspace identity,
+validated arguments, operation classification, plan scope, active task/step,
+cancellation, resource availability, policy fingerprint, permitted modes,
+explicit denies, mandatory approval, then built-in safe-read rules and
+explicit eligible exemptions. Unknown operations and evaluation failures are
+denied. Policy evaluation never executes a tool and never replaces dispatcher,
+workspace, backend, command, preimage, checkpoint, or restoration checks.
+
+The built-in policy permits the existing bounded repository/file reads and
+repository-intelligence calls, while file changes/deletion, terminal and
+verification commands, network calls, Git inspection, checkpoint creation,
+and checkpoint restoration continue to require the existing operation-level
+approval. Plan approval remains a distinct SUPERVISED gate; it cannot approve
+tool actions. AGENT remains the default task mode. AUTONOMOUS does not broaden
+the built-in sensitive-operation policy.
+
+Trusted per-user preferences may contain an additive `autonomy_policy`
+object. Its version-1 typed schema supports a default mode, a permitted-mode
+set, exact tool/category deny rules, and an exact allowlist of eligible
+repository-intelligence tools. The only exemption supported is a sandbox-only
+AUTONOMOUS policy `ALLOW` for one of those bounded intelligence tools; it does
+not suppress a mandatory tool approval. Conflicting, wildcard, unknown, or
+unsupported configuration is rejected. Existing settings without the
+`autonomy_policy` field load with the secure built-in defaults. Workspace
+files, model output, project context, and plan content are never policy
+configuration sources. The application supplies the saved per-user policy to
+the existing `Tools` dispatcher; headless callers may supply the same typed
+configuration. No settings UI or new execution route is introduced in this
+phase.
+
+An active task stores its selected mode, policy version/fingerprint, backend
+identity, and a hashed workspace identity. Pending tool dispatches bind the
+exact tool/argument fingerprint and recheck task, plan scope, workspace,
+backend, cancellation, and policy state after approval and before execution.
+Any policy change invalidates a request tied to the previous fingerprint;
+the operation is denied rather than inheriting newly expanded authority.
+Checkpoint restoration continues to require explicit approval and its
+post-approval all-target integrity/conflict preflight. Task policy audit rows
+are bounded and contain only tool/category, decision/reason, mode, policy and
+workspace fingerprints, approval outcome, backend, and execution references;
+they do not contain tool arguments or file contents.
+
+Policy metadata is additive in Agent Task state. Checkpoints without the new
+fields remain readable and are treated conservatively as SUPERVISED when
+authorization context is needed; no legacy task becomes AUTONOMOUS.

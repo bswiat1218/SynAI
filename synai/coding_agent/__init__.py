@@ -13,6 +13,19 @@ from synai.coding_agent.context import (
     render_context,
 )
 from synai.coding_agent.changes import ChangeBaseline, MutationEvidence, SnapshotStore
+from synai.coding_agent.policies import (
+    AutonomyMode,
+    AutonomyPolicy,
+    AutonomyPolicyConfig,
+    OperationCategory,
+    PolicyAuditRecord,
+    PolicyDecision,
+    PolicyDecisionType,
+    PolicyReason,
+    PolicySource,
+    PolicyTaskContext,
+    inspect_policy,
+)
 from synai.coding_agent.state import (
     AgentCheckpoint,
     AgentErrorType,
@@ -66,6 +79,16 @@ __all__ = [
     "ChangeBaseline",
     "MutationEvidence",
     "SnapshotStore",
+    "AutonomyPolicy",
+    "AutonomyPolicyConfig",
+    "OperationCategory",
+    "PolicyAuditRecord",
+    "PolicyDecision",
+    "PolicyDecisionType",
+    "PolicyReason",
+    "PolicySource",
+    "PolicyTaskContext",
+    "inspect_policy",
     "AgentCheckpoint",
     "AgentErrorType",
     "AgentExecution",

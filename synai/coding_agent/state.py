@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from synai.coding_agent.changes import ChangeBaseline, MutationEvidence
+from synai.coding_agent.policies import PolicyAuditRecord, PolicyTaskContext
 
 
 def _now() -> str:
@@ -1267,6 +1268,8 @@ class AgentTask:
     change_evidence: list[MutationEvidence] = field(default_factory=list)
     terminal_summary: str | None = None
     approval_resume_state: AgentStatus | None = None
+    policy_context: PolicyTaskContext | None = None
+    policy_audit: list[PolicyAuditRecord] = field(default_factory=list)
 
     def transition(self, status: AgentStatus) -> None:
         if not isinstance(status, AgentStatus):
@@ -1519,6 +1522,20 @@ class AgentTask:
         if any(execution.status == ExecutionStatus.PENDING for execution in self.executions):
             if self.status in TERMINAL_STATUSES or self.status not in _ACTIVE_STATUSES:
                 raise ValueError("Uncertain execution is attached to an inactive agent task")
+        if self.policy_context is not None:
+            if not isinstance(self.policy_context, PolicyTaskContext):
+                raise ValueError("Invalid Agent Task policy context")
+            self.policy_context.validate()
+        if (
+            not isinstance(self.policy_audit, list)
+            or len(self.policy_audit) > 512
+            or any(not isinstance(item, PolicyAuditRecord) for item in self.policy_audit)
+        ):
+            raise ValueError("Invalid Agent Task policy audit")
+        for item in self.policy_audit:
+            item.validate()
+            if item.task_id != self.task_id:
+                raise ValueError("Policy audit belongs to another Agent Task")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -1546,6 +1563,10 @@ class AgentTask:
             "approval_resume_state": (
                 self.approval_resume_state.value if self.approval_resume_state is not None else None
             ),
+            "policy_context": (
+                self.policy_context.to_dict() if self.policy_context is not None else None
+            ),
+            "policy_audit": [item.to_dict() for item in self.policy_audit],
         }
 
     @classmethod
@@ -1561,9 +1582,10 @@ class AgentTask:
         repair_keys = extended_keys | {"repair_outcome"}
         review_keys = repair_keys | {"review_record"}
         change_keys = review_keys | {"change_baselines", "change_evidence"}
+        policy_keys = change_keys | {"policy_context", "policy_audit"}
         if not isinstance(value, dict) or set(value) not in {
             frozenset(legacy_keys), frozenset(extended_keys), frozenset(repair_keys),
-            frozenset(review_keys), frozenset(change_keys),
+            frozenset(review_keys), frozenset(change_keys), frozenset(policy_keys),
         }:
             raise ValueError("Invalid agent task fields")
         data = value
@@ -1612,6 +1634,14 @@ class AgentTask:
                     AgentStatus(data["approval_resume_state"])
                     if data["approval_resume_state"] is not None else None
                 ),
+                policy_context=(
+                    PolicyTaskContext.from_dict(data["policy_context"])
+                    if data.get("policy_context") is not None else None
+                ),
+                policy_audit=[
+                    PolicyAuditRecord.from_dict(item)
+                    for item in data.get("policy_audit", [])
+                ],
             )
             result.validate()
         except (TypeError, ValueError) as exc:

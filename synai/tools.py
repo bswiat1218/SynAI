@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,15 @@ from synai.coding_agent.git import (
     validate_git_arguments,
 )
 from synai.coding_agent.checkpoints import CheckpointManager, PreparedRestore
+from synai.coding_agent.policies import (
+    AutonomyMode,
+    AutonomyPolicy,
+    PolicyDecisionType,
+    PolicyReason,
+    PolicyRequest,
+    argument_fingerprint,
+    classify_operation,
+)
 from synai.intelligence import IndexLimits, RepositoryIndex
 from synai.models import Session
 from synai.sandbox import SandboxError
@@ -260,9 +270,133 @@ def _tool_failure(
 
 
 class Tools:
-    def __init__(self, sandbox: ExecutionBackend, approve: Approval) -> None:
+    def __init__(
+        self,
+        sandbox: ExecutionBackend,
+        approve: Approval,
+        *,
+        policy: AutonomyPolicy | None = None,
+    ) -> None:
         self.sandbox, self.approve = sandbox, approve
+        self.policy = policy or AutonomyPolicy()
         self._indexes: dict[Path, RepositoryIndex] = {}
+
+    def _default_policy_request(
+        self, name: str, arguments: dict[str, Any],
+    ) -> PolicyRequest:
+        workspace = ""
+        if self.sandbox.workspace is not None:
+            try:
+                workspace = str(Path(self.sandbox.workspace).resolve(strict=True))
+            except (OSError, ValueError):
+                workspace = str(self.sandbox.workspace)
+        return self.policy.create_request(
+            name,
+            arguments,
+            mode=AutonomyMode.AGENT,
+            task_id="dispatcher",
+            step_id=None,
+            backend_identity=self.sandbox.settings.execution_mode,
+            workspace=workspace,
+        )
+
+    def _evaluate_task_policy(
+        self,
+        request: PolicyRequest,
+        name: str,
+        arguments: dict[str, Any],
+        session: Session | None,
+        cancellation: threading.Event | None,
+    ) -> dict[str, Any] | None:
+        try:
+            request.validate()
+            category = classify_operation(
+                name,
+                arguments,
+                category_override=request.category,
+            )
+            arguments_match = (
+                request.arguments_fingerprint == argument_fingerprint(arguments)
+                and category == request.category
+            )
+            tool_matches = request.tool_name == name
+            backend_matches = (
+                request.backend_identity == self.sandbox.settings.execution_mode
+            )
+            workspace_matches = True
+            if session is not None:
+                workspace_matches = self.sandbox.matches(session)
+            if request.task_id != "dispatcher":
+                if session is None or not self.sandbox.matches(session):
+                    workspace_matches = False
+                if self.sandbox.workspace is None:
+                    workspace_matches = False
+                else:
+                    try:
+                        active_workspace = str(
+                            Path(self.sandbox.workspace).resolve(strict=True),
+                        )
+                    except (OSError, ValueError):
+                        active_workspace = ""
+                    workspace_matches = (
+                        workspace_matches and request.workspace == active_workspace
+                    )
+            effective_request = replace(
+                request,
+                tool_name=name if name in {
+                    "read_file", "list_files", "write_file", "patch_file",
+                    "delete_file", "terminal", "fetch_url", "get_project_structure",
+                    "find_symbol", "find_definition", "find_references",
+                    "find_callers", "find_implementations", "find_imports",
+                    "find_tests", "search_code", "get_diagnostics", "git_status",
+                    "git_diff", "git_log", "git_show", "git_checkpoint",
+                    "restore_checkpoint",
+                } else request.tool_name,
+                backend_valid=request.backend_valid and backend_matches,
+                workspace_valid=request.workspace_valid and workspace_matches,
+                arguments_valid=(
+                    request.arguments_valid and tool_matches and arguments_match
+                ),
+            )
+            decision = self.policy.evaluate(
+                effective_request,
+                cancelled=bool(cancellation and cancellation.is_set()),
+            )
+        except Exception:
+            _logger.exception("Autonomy policy evaluation failed; denying tool dispatch")
+            return {
+                "ok": False,
+                "denied": True,
+                "error_code": "POLICY_EVALUATION_ERROR",
+                "error": "Policy evaluation failed; the operation was denied.",
+                "policy_decision": PolicyDecisionType.DENY.value,
+                "policy_reason": PolicyReason.POLICY_EVALUATION_ERROR.value,
+            }
+        if decision.decision == PolicyDecisionType.DENY:
+            if decision.reason == PolicyReason.CANCELLED:
+                if name == "restore_checkpoint":
+                    return _restore_result(
+                        False, "CANCELLED", [], decision.explanation,
+                    )
+                if name in GIT_ARGUMENTS:
+                    return _tool_failure(
+                        name, "CANCELLED", decision.explanation,
+                        workspace=self.sandbox.workspace,
+                    )
+                if name == "git_checkpoint":
+                    return _tool_failure(
+                        name, "CANCELLED", decision.explanation,
+                        workspace=self.sandbox.workspace,
+                    )
+            return {
+                "ok": False,
+                "denied": True,
+                "error_code": "POLICY_DENIED",
+                "error": decision.explanation,
+                "policy_decision": decision.decision.value,
+                "policy_reason": decision.reason.value,
+            }
+        return None
 
     async def call(
         self,
@@ -276,6 +410,7 @@ class Tools:
         event_observer: ToolEventObserver | None = None,
         expected_preimage: tuple[bool, str | None] | None = None,
         cancellation: threading.Event | None = None,
+        policy_request: PolicyRequest | None = None,
     ) -> dict[str, Any]:
         if (
             name not in PROPERTIES and name not in INTELLIGENCE_ARGUMENTS
@@ -315,7 +450,37 @@ class Tools:
             expected = set(PROPERTIES[name])
             if set(arguments) != expected or any(not isinstance(value, str) for value in arguments.values()):
                 return {"ok": False, "error": f"{name} requires exactly these string arguments: {', '.join(sorted(expected))}"}
-        if len(json.dumps(arguments).encode()) > self.sandbox.settings.output_bytes * 2:
+        try:
+            serialized_arguments = json.dumps(
+                arguments, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":"),
+            )
+            if len(serialized_arguments.encode("utf-8")) > self.sandbox.settings.output_bytes * 2:
+                return {"ok": False, "error": "Tool arguments exceed configured limit"}
+            arguments = json.loads(serialized_arguments)
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "ok": False,
+                "error_code": "INVALID_ARGUMENTS",
+                "error": "Tool arguments could not be safely fingerprinted",
+            }
+        if cancellation is not None and cancellation.is_set():
+            if name == "restore_checkpoint":
+                return _restore_result(
+                    False, "CANCELLED", [], "Restore was cancelled before policy evaluation.",
+                )
+            if name in GIT_ARGUMENTS or name == "git_checkpoint":
+                return _tool_failure(
+                    name, "CANCELLED", "Operation was cancelled before policy evaluation.",
+                    workspace=self.sandbox.workspace,
+                )
+            return {
+                "ok": False,
+                "denied": True,
+                "error_code": "CANCELLED",
+                "error": "Operation was cancelled before policy evaluation.",
+            }
+        if len(serialized_arguments.encode("utf-8")) > self.sandbox.settings.output_bytes * 2:
             return {"ok": False, "error": "Tool arguments exceed configured limit"}
         if name in GIT_ARGUMENTS and (
             session is None or not self.sandbox.matches(session)
@@ -333,9 +498,26 @@ class Tools:
                 "error": "Checkpoint operations require the matching active conversation workspace",
                 "error_code": "CHECKPOINT_SCOPE_VIOLATION",
             }
+        if policy_request is None:
+            policy_request = self._default_policy_request(name, arguments)
+        policy_denial = self._evaluate_task_policy(
+            policy_request, name, arguments, session, cancellation,
+        )
+        if policy_denial is not None:
+            return policy_denial
         if name in INTELLIGENCE_TOOLS:
             if session is None or not self.sandbox.matches(session):
                 return {"ok": False, "error": "Repository intelligence requires the matching active conversation workspace"}
+            policy_denial = self._evaluate_task_policy(
+                policy_request, name, arguments, session, cancellation,
+            )
+            if policy_denial is not None:
+                return policy_denial
+            if (
+                cancellation is not None and cancellation.is_set()
+                or dispatch_guard is not None and not await dispatch_guard()
+            ):
+                return {"ok": False, "denied": True, "error_code": "CANCELLED", "error": "Action cancelled before dispatch"}
             return await self._intelligence(name, arguments)
         prepared_restore: PreparedRestore | None = None
         checkpoint_manager: CheckpointManager | None = None
@@ -347,6 +529,11 @@ class Tools:
                     return _restore_result(
                         False, "CANCELLED", [], "Restore was cancelled before preflight.",
                     )
+                policy_denial = self._evaluate_task_policy(
+                    policy_request, name, arguments, session, cancellation,
+                )
+                if policy_denial is not None:
+                    return policy_denial
                 if dispatch_guard is not None and not await dispatch_guard():
                     return _restore_result(
                         False, "CANCELLED", [], "Restore was cancelled before preflight.",
@@ -434,6 +621,18 @@ class Tools:
                     await self._observe_event(event_observer, event_kind, name)
                 if self.sandbox.settings.execution_mode == "host":
                     description = f"HOST EXECUTION // NOT ISOLATED\nWorkspace: {self.sandbox.workspace}\n\n{description}"
+                policy_denial = self._evaluate_task_policy(
+                    policy_request, name, arguments, session, cancellation,
+                )
+                if policy_denial is not None:
+                    return policy_denial
+                if dispatch_guard is not None and not await dispatch_guard():
+                    return {
+                        "ok": False,
+                        "denied": True,
+                        "error_code": "CANCELLED",
+                        "error": "Action eligibility changed before approval.",
+                    }
                 if approval_observer is not None:
                     await approval_observer(name, description, None)
                 if name == "restore_checkpoint":
@@ -450,6 +649,12 @@ class Tools:
                             False, "CANCELLED", [], "Restore was cancelled before approval.",
                         )
                 approved = await self.approve(name, description)
+                if type(approved) is not bool:
+                    _logger.error(
+                        "Approval callback returned a malformed result for %s; denying dispatch",
+                        name,
+                    )
+                    approved = False
                 if approval_observer is not None:
                     await approval_observer(name, description, approved)
                 if not approved:
@@ -476,6 +681,11 @@ class Tools:
                             "error": "User denied checkpoint restoration",
                         }
                     return {"ok": False, "denied": True, "error": "User denied this action"}
+                policy_denial = self._evaluate_task_policy(
+                    policy_request, name, arguments, session, cancellation,
+                )
+                if policy_denial is not None:
+                    return policy_denial
                 if dispatch_guard is not None and not await dispatch_guard():
                     if name in GIT_ARGUMENTS:
                         return _tool_failure(
@@ -499,6 +709,23 @@ class Tools:
                             if prepared_restore else "Restore preflight was not retained.",
                         )
                     return {"ok": False, "denied": True, "error": "Action cancelled before dispatch"}
+                policy_denial = self._evaluate_task_policy(
+                    policy_request, name, arguments, session, cancellation,
+                )
+                if policy_denial is not None:
+                    return policy_denial
+            policy_denial = self._evaluate_task_policy(
+                policy_request, name, arguments, session, cancellation,
+            )
+            if policy_denial is not None:
+                return policy_denial
+            if dispatch_guard is not None and not await dispatch_guard():
+                return {
+                    "ok": False,
+                    "denied": True,
+                    "error_code": "CANCELLED",
+                    "error": "Action eligibility changed before dispatch.",
+                }
             if name in GIT_ARGUMENTS:
                 result = await GitInspector(self.sandbox).inspect(name, arguments, session)
                 await self._observe_event(

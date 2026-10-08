@@ -21,6 +21,7 @@ from textual.worker import WorkerCancelled
 from textual.widgets import Button, Footer, Header, Label, RichLog, SelectionList, Static, TextArea
 
 from synai.agent import Agent
+from synai.coding_agent.policies import AutonomyPolicy
 from synai.config import ConversationEnvironment, Settings
 from synai.history import History, HistoryError, ManagedHistory
 from synai.models import Activity, ModelInfo, Session
@@ -283,7 +284,17 @@ class CodingApp(App[None]):
         self.setup_task: asyncio.Task[None] | None = None
         self.approval_future: asyncio.Future[bool] | None = None
         self.history_paths: dict[str, Path] = {}
-        self.agent = Agent(self.provider, self.history, Tools(self.sandbox, self.approve), self.render_session, settings.tool_budget)
+        self.agent = Agent(
+            self.provider,
+            self.history,
+            Tools(
+                self.sandbox,
+                self.approve,
+                policy=AutonomyPolicy(self.preferences.autonomy_policy),
+            ),
+            self.render_session,
+            settings.tool_budget,
+        )
         self.agent.connection_endpoint = settings.ollama_url
         self.loading = False
         self.render_dirty = False

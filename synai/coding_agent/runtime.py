@@ -8,7 +8,7 @@ import stat
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -35,6 +35,14 @@ from synai.coding_agent.verifier import (
     VerificationRunResult,
 )
 from synai.coding_agent.git import GIT_TOOLS
+from synai.coding_agent.policies import (
+    AutonomyMode,
+    OperationCategory,
+    PolicyAuditRecord,
+    PolicyDecisionType,
+    PolicyRequest,
+    workspace_fingerprint,
+)
 from synai.coding_agent.state import (
     AgentCheckpoint,
     AgentErrorType,
@@ -56,12 +64,6 @@ from synai.tools import INTELLIGENCE_TOOLS, Tools, schemas
 
 if TYPE_CHECKING:
     from synai.coding_agent.reviewer import ReviewLimits
-
-
-class AutonomyMode(StrEnum):
-    SUPERVISED = "supervised"
-    AGENT = "agent"
-    AUTONOMOUS = "autonomous"
 
 
 class PlanApprovalDecision(StrEnum):
@@ -316,7 +318,7 @@ class CodingAgentRuntime:
         repository: RepositoryIndex,
         *,
         model: str,
-        autonomy: AutonomyMode = AutonomyMode.AGENT,
+        autonomy: AutonomyMode | None = None,
         context: ContextPackage | None = None,
         plan: AgentPlan | None = None,
         planner: Planner | None = None,
@@ -331,8 +333,11 @@ class CodingAgentRuntime:
             return self._result(task, RuntimeFailure(
                 RuntimeErrorCode.INVALID_TASK, "A typed task and conversation session are required",
             ))
-        if not isinstance(autonomy, AutonomyMode):
+        if autonomy is not None and not isinstance(autonomy, AutonomyMode):
             return self._fail(task, RuntimeErrorCode.INVALID_TASK, "Unknown autonomy mode")
+        autonomy = autonomy or self.tools.policy.configuration.default_mode
+        if autonomy not in self.tools.policy.configuration.permitted_modes:
+            return self._fail(task, RuntimeErrorCode.INVALID_TASK, "Autonomy mode is not permitted by trusted policy")
         if not isinstance(task_prompt, str) or not task_prompt.strip() or len(task_prompt) > 16_384:
             return self._fail(task, RuntimeErrorCode.INVALID_TASK, "Task prompt must be bounded non-empty text")
         if not isinstance(model, str) or not model.strip() or len(model) > 512:
@@ -354,6 +359,28 @@ class CodingAgentRuntime:
             await self._checkpoint(task, checkpoint)
             await self._emit(task, "context_gathering_started", event_sink)
             root = self._validate_runtime_workspace(session, repository)
+            task_policy_context = self.tools.policy.create_task_context(
+                autonomy, str(root), self.tools.sandbox.settings.execution_mode,
+            )
+            if task.policy_context is None:
+                task.policy_context = task_policy_context
+            elif (
+                task.policy_context.mode != autonomy
+                or task.policy_context.policy_fingerprint != self.tools.policy.fingerprint
+                or task.policy_context.workspace_identity != task_policy_context.workspace_identity
+                or task.policy_context.backend_identity != task_policy_context.backend_identity
+            ):
+                raise _RuntimeStop(
+                    RuntimeErrorCode.INVALID_TASK,
+                    "An existing task policy context cannot be replaced.",
+                )
+            await self._checkpoint(task, checkpoint)
+            await self._emit(
+                task,
+                "autonomy_mode_selected",
+                event_sink,
+                message=f"Selected {autonomy.value.upper()} for this Agent Task.",
+            )
             if context is None:
                 context = await self._build_context(
                     task_prompt, repository, cancellation, task_metadata,
@@ -522,6 +549,19 @@ class CodingAgentRuntime:
                     "Task is not waiting for a plan approval decision",
                 )
             self._validate_context(context, task.goal)
+            if task.policy_context is None:
+                policy_root = self._validate_runtime_workspace(session, repository)
+                task.policy_context = self.tools.policy.create_task_context(
+                    AutonomyMode.SUPERVISED,
+                    str(policy_root),
+                    self.tools.sandbox.settings.execution_mode,
+                )
+                await self._checkpoint(task, checkpoint)
+            elif task.policy_context.mode != AutonomyMode.SUPERVISED:
+                raise _RuntimeStop(
+                    RuntimeErrorCode.INVALID_TASK,
+                    "Plan approval cannot change the task autonomy mode.",
+                )
             if decision == PlanApprovalDecision.PENDING:
                 return self._result(task, RuntimeFailure(
                     RuntimeErrorCode.PLAN_APPROVAL_PENDING,
@@ -936,6 +976,65 @@ class CodingAgentRuntime:
                 task.executions.append(execution)
                 if len(task.executions) > 512:
                     raise _RuntimeStop(RuntimeErrorCode.RESOURCE_LIMIT, "Execution-record limit exhausted", step.step_id)
+                policy_request = self._policy_request(
+                    task,
+                    name,
+                    arguments,
+                    session,
+                    repository,
+                    step.step_id,
+                    operation=operation,
+                    scope_valid=True,
+                    task_active=active_task and active_step,
+                )
+                policy_decision = self.tools.policy.evaluate(
+                    policy_request,
+                    cancelled=bool(cancellation and cancellation.is_set()),
+                )
+                self._record_policy_decision(
+                    task, policy_decision, step.step_id, execution.execution_id,
+                    policy_request=policy_request,
+                    approval_outcome=(
+                        "pending"
+                        if policy_decision.decision == PolicyDecisionType.REQUIRE_APPROVAL
+                        else "policy_denied"
+                        if policy_decision.decision == PolicyDecisionType.DENY
+                        else "not_required"
+                    ),
+                )
+                await self._emit(
+                    task,
+                    "policy_evaluated",
+                    event_sink,
+                    step_id=step.step_id,
+                    tool_name=name,
+                    message=(
+                        f"{policy_decision.decision.value}: "
+                        f"{policy_decision.reason.value}"
+                    ),
+                )
+                if policy_decision.decision == PolicyDecisionType.DENY:
+                    self._finish_execution(
+                        execution,
+                        ExecutionStatus.DENIED,
+                        policy_decision.explanation,
+                        AgentErrorType.PERMISSION_DENIED,
+                    )
+                    await self._checkpoint(task, checkpoint)
+                    await self._emit(
+                        task,
+                        "operation_denied",
+                        event_sink,
+                        step_id=step.step_id,
+                        tool_name=name,
+                        message=policy_decision.explanation,
+                    )
+                    raise _RuntimeStop(
+                        RuntimeErrorCode.TOOL_NOT_ALLOWED_FOR_STEP,
+                        policy_decision.explanation,
+                        step.step_id,
+                        name,
+                    )
                 await self._checkpoint(task, checkpoint)
                 await self._emit(
                     task,
@@ -966,8 +1065,22 @@ class CodingAgentRuntime:
                     name,
                     arguments,
                     session=session,
+                    policy_request=policy_request,
                     approval_observer=approval_observer,
-                    dispatch_guard=self._dispatch_guard(cancellation),
+                    dispatch_guard=self._dispatch_guard(
+                        cancellation,
+                        task,
+                        step,
+                        session,
+                        repository,
+                        name,
+                        arguments,
+                        operation,
+                        target_path,
+                        policy_request,
+                        repair_mode=repair_mode,
+                        repair_allowed_paths=repair_allowed_paths,
+                    ),
                     mutation_observer=mutation_observer,
                     event_observer=self._tool_event_observer(
                         task, step.step_id, event_sink,
@@ -1000,6 +1113,22 @@ class CodingAgentRuntime:
                         step.step_id, name,
                     )
                 approved = not (isinstance(result, dict) and result.get("denied") is True)
+                if isinstance(result, dict) and result.get("error_code") == "POLICY_DENIED":
+                    self._set_policy_audit_outcome(
+                        task, execution.execution_id, "policy_denied",
+                    )
+                elif isinstance(result, dict) and result.get("error_code") == "CANCELLED":
+                    self._set_policy_audit_outcome(
+                        task, execution.execution_id, "cancelled",
+                    )
+                elif execution.approval_state == ApprovalStatus.APPROVED:
+                    self._set_policy_audit_outcome(
+                        task, execution.execution_id, "approved",
+                    )
+                elif execution.approval_state == ApprovalStatus.DENIED:
+                    self._set_policy_audit_outcome(
+                        task, execution.execution_id, "denied",
+                    )
                 if execution.approval_state == ApprovalStatus.PENDING:
                     execution.approval_state = ApprovalStatus.NOT_REQUIRED
                 if isinstance(result, dict) and result.get("ok") is True:
@@ -1167,6 +1296,9 @@ class CodingAgentRuntime:
             del description
             if decision is None:
                 execution.approval_state = ApprovalStatus.PENDING
+                self._set_policy_audit_outcome(
+                    task, execution.execution_id, "pending",
+                )
                 if task.status == AgentStatus.IMPLEMENTING:
                     task.transition(AgentStatus.WAITING_FOR_APPROVAL)
                     await self._checkpoint(task, checkpoint)
@@ -1178,11 +1310,21 @@ class CodingAgentRuntime:
                 execution.approval_state = (
                     ApprovalStatus.APPROVED if decision else ApprovalStatus.DENIED
                 )
+                self._set_policy_audit_outcome(
+                    task,
+                    execution.execution_id,
+                    "approved" if decision else "denied",
+                )
                 task.resolve_approval(True)
                 await self._checkpoint(task, checkpoint)
             else:
                 execution.approval_state = (
                     ApprovalStatus.APPROVED if decision else ApprovalStatus.DENIED
+                )
+                self._set_policy_audit_outcome(
+                    task,
+                    execution.execution_id,
+                    "approved" if decision else "denied",
                 )
 
         return observe
@@ -1318,10 +1460,170 @@ class CodingAgentRuntime:
 
         return observe
 
+    def _policy_request(
+        self,
+        task: AgentTask,
+        name: str,
+        arguments: dict[str, Any],
+        session: Session,
+        repository: RepositoryIndex,
+        step_id: str | None,
+        *,
+        operation: PlanOperation | None = None,
+        scope_valid: bool,
+        task_active: bool,
+    ) -> PolicyRequest:
+        backend = self.tools.sandbox
+        try:
+            workspace = str(validate_workspace(
+                Path(session.workspace),
+                backend.settings,
+                sandbox=backend.settings.execution_mode == "sandbox",
+            ))
+            workspace_valid = (
+                backend.matches(session)
+                and backend.workspace is not None
+                and str(Path(backend.workspace).resolve(strict=True)) == workspace
+                and repository.root == Path(workspace)
+            )
+        except (OSError, ValueError):
+            workspace = ""
+            workspace_valid = False
+        task_policy = task.policy_context
+        if task_policy is None:
+            mode = AutonomyMode.SUPERVISED
+            expected_fingerprint = self.tools.policy.fingerprint
+        else:
+            mode = task_policy.mode
+            expected_fingerprint = task_policy.policy_fingerprint
+            workspace_valid = workspace_valid and (
+                task_policy.backend_identity == backend.settings.execution_mode
+                and task_policy.workspace_identity == workspace_fingerprint(workspace)
+            )
+        category = None
+        target_exists = None
+        if operation == PlanOperation.CREATE:
+            category = OperationCategory.FILE_CREATION
+            target_exists = False
+        elif operation in {PlanOperation.MODIFY, PlanOperation.DOCUMENT}:
+            category = OperationCategory.FILE_MODIFICATION
+            target_exists = True
+        elif operation == PlanOperation.DELETE:
+            category = OperationCategory.FILE_DELETION
+        return self.tools.policy.create_request(
+            name,
+            arguments,
+            mode=mode,
+            task_id=task.task_id,
+            step_id=step_id,
+            backend_identity=backend.settings.execution_mode,
+            workspace=workspace,
+            policy_fingerprint=expected_fingerprint,
+            category=category,
+            target_exists=target_exists,
+            workspace_valid=workspace_valid,
+            plan_scope_valid=scope_valid,
+            task_active=task_active,
+            resource_available=True,
+        )
+
     @staticmethod
-    def _dispatch_guard(cancellation: threading.Event | None) -> Callable[[], Awaitable[bool]]:
+    def _record_policy_decision(
+        task: AgentTask,
+        decision: Any,
+        step_id: str | None,
+        execution_id: str | None,
+        *,
+        policy_request: PolicyRequest,
+        approval_outcome: str,
+    ) -> None:
+        record = PolicyAuditRecord(
+            task_id=task.task_id,
+            step_id=step_id,
+            execution_id=execution_id,
+            tool_name=decision.tool_name,
+            category=decision.category,
+            mode=decision.mode,
+            decision=decision.decision,
+            reason=decision.reason,
+            policy_fingerprint=decision.policy_fingerprint,
+            approval_required=decision.decision == PolicyDecisionType.REQUIRE_APPROVAL,
+            approval_outcome=approval_outcome,
+            backend_identity=policy_request.backend_identity,
+            workspace_identity=workspace_fingerprint(policy_request.workspace),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        record.validate()
+        task.policy_audit.append(record)
+        del task.policy_audit[:-512]
+
+    @staticmethod
+    def _set_policy_audit_outcome(
+        task: AgentTask,
+        execution_id: str,
+        approval_outcome: str,
+    ) -> None:
+        for index in range(len(task.policy_audit) - 1, -1, -1):
+            record = task.policy_audit[index]
+            if record.execution_id == execution_id:
+                task.policy_audit[index] = replace(
+                    record, approval_outcome=approval_outcome,
+                )
+                return
+
+    def _dispatch_guard(
+        self,
+        cancellation: threading.Event | None,
+        task: AgentTask,
+        step: Any,
+        session: Session,
+        repository: RepositoryIndex,
+        tool_name: str,
+        arguments: dict[str, Any],
+        expected_operation: PlanOperation | None,
+        expected_path: str | None,
+        policy_request: PolicyRequest,
+        *,
+        repair_mode: bool,
+        repair_allowed_paths: frozenset[str],
+    ) -> Callable[[], Awaitable[bool]]:
         async def can_dispatch() -> bool:
-            return not (cancellation and cancellation.is_set())
+            if cancellation and cancellation.is_set():
+                return False
+            expected_task_state = (
+                task.status == AgentStatus.REPAIRING
+                if repair_mode else task.status == AgentStatus.IMPLEMENTING
+            )
+            expected_step_state = (
+                step.status == StepStatus.COMPLETED
+                if repair_mode else step.status == StepStatus.RUNNING
+            )
+            if not expected_task_state or not expected_step_state:
+                return False
+            try:
+                root = self._validate_runtime_workspace(session, repository)
+                operation, path = self._classify_and_check_call(
+                    tool_name,
+                    arguments,
+                    step,
+                    root,
+                    repair_mode=repair_mode,
+                    repair_allowed_paths=repair_allowed_paths,
+                    repair_created_paths=frozenset(
+                        execution.target_path for execution in task.executions
+                        if execution.status == ExecutionStatus.SUCCEEDED
+                        and execution.operation == PlanOperation.CREATE
+                        and execution.target_path is not None
+                    ),
+                )
+            except (_RuntimeStop, OSError, ValueError):
+                return False
+            if operation != expected_operation or path != expected_path:
+                return False
+            return self.tools.policy.evaluate(
+                policy_request,
+                cancelled=bool(cancellation and cancellation.is_set()),
+            ).decision != PolicyDecisionType.DENY
 
         return can_dispatch
 
