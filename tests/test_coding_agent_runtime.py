@@ -292,6 +292,43 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.kind == "waiting_for_tool_approval" for event in events))
         self.assertTrue(task.plan.verification_intent == [VerificationIntent.TARGETED_TESTS])
 
+    async def test_observer_failure_does_not_fail_implementation_step(self) -> None:
+        provider = FakeProvider(execution=[
+            (
+                self.patch_call("app/client.py", "        return url", "        return url + '!'"),
+                "Patch the planned client.",
+            ),
+            ([], "The implementation is complete."),
+        ])
+        runtime = self.make_runtime(provider)
+        task = AgentTask(TASK)
+
+        async def event_sink(event: Any) -> None:
+            if event.kind == "step_started":
+                raise RuntimeError("observer unavailable")
+
+        with self.assertLogs("synai.coding_agent.runtime", level="WARNING"):
+            result = await runtime.run_task(
+                task,
+                TASK,
+                self.session,
+                self.repository,
+                model=MODEL,
+                plan=typed_plan([
+                    AgentStep(
+                        "step-1",
+                        "Modify client",
+                        paths=["app/client.py"],
+                        operations=[PlanOperation.MODIFY],
+                    ),
+                ]),
+                event_sink=event_sink,
+            )
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.state, AgentStatus.VERIFYING)
+        self.assertEqual(task.plan.steps[0].status, StepStatus.COMPLETED)
+
     async def test_supervised_plan_denial_executes_no_tool_or_step(self) -> None:
         provider = FakeProvider()
         runtime = self.make_runtime(provider)
@@ -674,22 +711,65 @@ class RuntimeFixture(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.approvals, ["patch_file"])
 
-    async def test_test_and_verify_operations_stop_at_phase_six_boundary(self) -> None:
-        provider = FakeProvider()
+    async def test_test_and_verify_steps_are_rejected_before_implementation(self) -> None:
+        for operation in (PlanOperation.TEST, PlanOperation.VERIFY):
+            with self.subTest(operation=operation):
+                provider = FakeProvider()
+                runtime = self.make_runtime(provider)
+                plan = typed_plan([
+                    AgentStep(
+                        "step-1", "Run focused tests", operations=[operation],
+                        expected_outcome="Tests pass",
+                    ),
+                ])
+                result = await runtime.run_task(
+                    AgentTask(TASK), TASK, self.session, self.repository,
+                    model=MODEL, plan=plan,
+                )
+                self.assertEqual(
+                    result.error.code, RuntimeErrorCode.VERIFICATION_NOT_IMPLEMENTED,
+                )
+                self.assertEqual(self.backend.calls, [])
+                self.assertEqual(self.approvals, [])
+                self.assertEqual(provider.requests, [])
+
+    async def test_missing_explicit_required_output_fails_after_other_mutation(self) -> None:
+        (self.root / "app" / "config.py").write_text("RETRIES = 2\n", encoding="utf-8")
+        provider = FakeProvider(execution=[
+            (
+                self.patch_call(
+                    "app/client.py",
+                    "        return url",
+                    "        return url + '!'",
+                ),
+                "Updated the client.",
+            ),
+            ([], "The step is complete."),
+        ])
         runtime = self.make_runtime(provider)
         plan = typed_plan([
             AgentStep(
-                "step-1", "Run focused tests", operations=[PlanOperation.TEST],
-                expected_outcome="Tests pass",
+                "step-1",
+                "Update client and required config output",
+                paths=["app/client.py", "app/config.py"],
+                operations=[PlanOperation.MODIFY],
+                required_outputs=["app/config.py"],
+                expected_outcome="The retry configuration is updated",
             ),
         ])
+
         result = await runtime.run_task(
             AgentTask(TASK), TASK, self.session, self.repository,
             model=MODEL, plan=plan,
         )
-        self.assertEqual(result.error.code, RuntimeErrorCode.VERIFICATION_NOT_IMPLEMENTED)
-        self.assertEqual(self.backend.calls, [])
-        self.assertEqual(self.approvals, [])
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error.code, RuntimeErrorCode.EXPECTED_MUTATION_NOT_PERFORMED)
+        self.assertIn("app/config.py", result.error.message)
+        self.assertEqual(
+            (self.root / "app" / "client.py").read_text(),
+            "class Client:\n    def request(self, url):\n        return url + '!'\n",
+        )
 
     async def test_pending_mutation_checkpoint_recovers_interrupted_without_replay(self) -> None:
         self.backend.block_mutation = True

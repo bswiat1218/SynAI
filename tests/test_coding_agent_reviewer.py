@@ -26,6 +26,12 @@ from synai.coding_agent import (
     VerificationIntent,
     VerificationOutcome,
 )
+from synai.coding_agent.context import (
+    ContextConfidence,
+    ContextItem,
+    ContextKind,
+    ContextPackage,
+)
 from synai.config import ConversationEnvironment, Settings
 from synai.intelligence import RepositoryIndex
 from synai.models import ChatEvent, ModelInfo, Session
@@ -231,7 +237,7 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
             "recommendation": "Implement and verify the stated behavior without widening plan scope.",
             "plan_step_id": "step-1",
             "execution_id": None,
-            "blocking": blocking,
+            "suggested_blocking": blocking,
         }
 
     async def test_passing_review_completes_task_and_never_mutates_source(self) -> None:
@@ -261,6 +267,32 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.task.status, AgentStatus.COMPLETED)
         self.assertEqual(restored.task.review_record.outcome, ReviewOutcome.PASSED)
 
+    async def test_observer_failure_after_persisted_completion_does_not_revert_result(self) -> None:
+        task = await self.verified_task()
+        saved: list[AgentCheckpoint] = []
+
+        async def checkpoint(value: AgentCheckpoint) -> None:
+            saved.append(value)
+
+        async def event_sink(event: Any) -> None:
+            if event.kind == "task_completed":
+                raise RuntimeError("observer unavailable")
+
+        with self.assertLogs("synai.coding_agent.reviewer", level="WARNING"):
+            result = await self.runtime.run_review(
+                task,
+                self.session,
+                self.repository,
+                checkpoint=checkpoint,
+                event_sink=event_sink,
+            )
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(result.state, AgentStatus.COMPLETED)
+        self.assertEqual(task.status, AgentStatus.COMPLETED)
+        self.assertEqual(task.review_record.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(saved[-1].task.status, AgentStatus.COMPLETED)
+
     async def test_high_confidence_correctness_finding_requests_changes(self) -> None:
         task = await self.verified_task()
         response = json.dumps({
@@ -272,12 +304,30 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.runtime.run_review(task, self.session, self.repository)
 
-        self.assertEqual(result.outcome, ReviewOutcome.CHANGES_REQUESTED)
+        self.assertEqual(result.outcome, ReviewOutcome.CHANGES_REQUESTED, result.error)
         self.assertEqual(task.status, AgentStatus.REVIEWING)
         self.assertEqual(result.findings[0].severity, ReviewSeverity.HIGH)
         self.assertTrue(result.findings[0].blocking)
         self.assertEqual((self.root / "app" / "client.py").read_bytes(), before)
         self.assertEqual(len(self.backend.calls), 1)
+
+    async def test_high_severity_finding_blocks_despite_false_model_suggestion(self) -> None:
+        task = await self.verified_task()
+        self.provider.responses = [json.dumps({
+            "summary": "A material verified correctness defect remains.",
+            "findings": [self.issue(
+                severity="critical",
+                blocking=False,
+            )],
+        })]
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.CHANGES_REQUESTED)
+        self.assertTrue(result.findings[0].blocking)
+        finding_data = result.findings[0].to_dict()
+        self.assertIn("blocking", finding_data)
+        self.assertNotIn("suggested_blocking", finding_data)
 
     async def test_suspicious_test_change_is_reported_but_not_edited(self) -> None:
         self.test_path.write_text(
@@ -320,7 +370,7 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
 
         result = await self.runtime.run_review(task, self.session, self.repository)
 
-        self.assertEqual(result.outcome, ReviewOutcome.BLOCKED)
+        self.assertEqual(result.outcome, ReviewOutcome.BLOCKED, result.error)
         self.assertEqual(task.status, AgentStatus.REVIEWING)
         self.assertIn("stale", result.error)
         self.assertEqual(self.provider.calls, [])
@@ -499,6 +549,133 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.findings[0].blocking)
         self.assertEqual(task.review_record.outcome, ReviewOutcome.PASSED_WITH_WARNINGS)
 
+    async def test_valid_execution_evidence_is_path_bound_but_not_source_proof(self) -> None:
+        task = await self.verified_task()
+        execution_id = task.executions[0].execution_id
+        self.provider.responses = [json.dumps({
+            "summary": "The execution record is noted, but its summary alone does not prove a defect.",
+            "findings": [self.issue(
+                severity="critical",
+                path="app/client.py",
+                line=None,
+                evidence="Updated the request implementation.",
+                blocking=True,
+            ) | {"execution_id": execution_id}],
+        })]
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED_WITH_WARNINGS)
+        self.assertFalse(result.findings[0].blocking)
+
+    async def test_wrong_execution_path_is_rejected(self) -> None:
+        task = await self.verified_task()
+        execution_id = task.executions[0].execution_id
+        mismatched = self.issue(
+            path="tests/test_client.py",
+            line=5,
+            evidence="        self.assertTrue(request(1))",
+        ) | {"execution_id": execution_id}
+        self.provider.responses = [json.dumps({
+            "summary": "Invalidly associated execution evidence.",
+            "findings": [mismatched],
+        }), empty_review()]
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(len(self.provider.calls), 2)
+        self.assertFalse(result.findings)
+
+    async def test_invalid_execution_id_is_rejected(self) -> None:
+        task = await self.verified_task()
+        invalid = self.issue() | {"execution_id": "not-an-execution"}
+        self.provider.responses = [json.dumps({
+            "summary": "Unknown execution reference.",
+            "findings": [invalid],
+        }), empty_review()]
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(len(self.provider.calls), 2)
+
+    async def test_unsupported_critical_quote_cannot_block(self) -> None:
+        task = await self.verified_task()
+        unsupported = self.issue(
+            severity="critical",
+            evidence="This quote is absent from the verified source.",
+            blocking=False,
+        )
+        self.provider.responses = [json.dumps({
+            "summary": "Unsubstantiated critical allegation.",
+            "findings": [unsupported],
+        }), empty_review()]
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(result.findings, ())
+        self.assertEqual(len(self.provider.calls), 2)
+
+    async def test_review_refreshes_stale_phase3_excerpt_before_prompting(self) -> None:
+        historical_excerpt = "def request(value):\n    return value"
+        item = ContextItem(
+            ContextKind.FILE,
+            "app/client.py",
+            None,
+            1,
+            2,
+            historical_excerpt,
+            100,
+            ("explicit_path",),
+            "repository_index.read_source",
+            "static_source_range",
+            ContextConfidence.HIGH,
+            len(historical_excerpt),
+        )
+        context = ContextPackage(
+            GOAL,
+            (item,),
+            4096,
+            0,
+            item.estimated_cost,
+            4096 - item.estimated_cost,
+            False,
+            (),
+            (),
+            (),
+        )
+        (self.root / "app" / "client.py").write_text(
+            "def request(value):\n    return value + 2\n",
+            encoding="utf-8",
+        )
+        task = self.make_task()
+        result = await self.runtime.run_verification(
+            task, self.session, self.repository, context=context,
+        )
+        self.assertEqual(result.outcome, VerificationOutcome.PASSED)
+
+        review = await self.runtime.run_review(
+            task, self.session, self.repository, context=context,
+        )
+
+        self.assertEqual(review.outcome, ReviewOutcome.PASSED, review.error)
+        payload = json.loads(self.provider.calls[-1][1][1].content)
+        current = next(
+            source for source in payload["review_sources"]
+            if source["path"] == "app/client.py"
+        )
+        self.assertEqual(current["freshness"], "current")
+        self.assertIn("return value + 2", current["content"])
+        historical = next(
+            item for item in payload["phase3_context"]["items"]
+            if item["path"] == "app/client.py"
+        )
+        self.assertEqual(historical["freshness"], "historical_only")
+        self.assertEqual(historical["content"], "")
+        self.assertIn("stale", " ".join(review.record.limitations).lower())
+
     async def test_legitimate_test_assertion_change_is_not_automatically_flagged(self) -> None:
         self.test_path.write_text(
             "import unittest\n\n"
@@ -536,6 +713,46 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outcome, ReviewOutcome.CHANGES_REQUESTED)
         self.assertEqual(result.findings[0].category.value, "plan_alignment")
         self.assertEqual(self.provider.calls, [])
+
+    async def test_unchanged_optional_planned_path_does_not_block_review(self) -> None:
+        config = self.root / "app" / "config.py"
+        config.write_text("RETRIES = 2\n", encoding="utf-8")
+        task = self.make_task()
+        task.plan.steps[0].paths.append("app/config.py")
+        task.plan.validate()
+        verified = await self.runtime.run_verification(
+            task, self.session, self.repository,
+        )
+        self.assertEqual(verified.outcome, VerificationOutcome.PASSED)
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(result.findings, ())
+
+    async def test_multiple_planned_paths_and_mutations_are_reviewed(self) -> None:
+        config = self.root / "app" / "config.py"
+        config.write_text("RETRIES = 3\n", encoding="utf-8")
+        task = self.make_task()
+        task.plan.steps[0].paths.append("app/config.py")
+        task.executions.append(AgentExecution(
+            step_id="step-1",
+            tool_name="patch_file",
+            status=ExecutionStatus.SUCCEEDED,
+            operation=PlanOperation.MODIFY,
+            target_path="app/config.py",
+            result_summary="Updated retry configuration.",
+        ))
+        task.plan.validate()
+        verified = await self.runtime.run_verification(
+            task, self.session, self.repository,
+        )
+        self.assertEqual(verified.outcome, VerificationOutcome.PASSED)
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED)
+        self.assertEqual(result.findings, ())
 
     async def test_context_character_limit_blocks_before_model_request(self) -> None:
         task = await self.verified_task()

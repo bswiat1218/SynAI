@@ -463,6 +463,7 @@ class AgentStep:
     expected_outcome: str = ""
     verification_criteria: list[str] = field(default_factory=list)
     verification_intents: list[VerificationIntent] = field(default_factory=list)
+    required_outputs: list[str] = field(default_factory=list)
 
     def transition(self, status: StepStatus) -> None:
         if not isinstance(self.status, StepStatus) or not isinstance(status, StepStatus):
@@ -524,6 +525,18 @@ class AgentStep:
             raise ValueError("Invalid agent step operations")
         if len(set(self.operations)) != len(self.operations):
             raise ValueError("Duplicate agent step operation")
+        if (
+            not isinstance(self.required_outputs, list)
+            or len(self.required_outputs) > 32
+            or any(not _safe_verification_path(path) for path in self.required_outputs)
+            or len(set(self.required_outputs)) != len(self.required_outputs)
+            or any(path not in self.paths for path in self.required_outputs)
+        ):
+            raise ValueError("Invalid required agent step outputs")
+        if self.required_outputs and not set(self.operations) & {
+            PlanOperation.CREATE, PlanOperation.MODIFY, PlanOperation.DOCUMENT,
+        }:
+            raise ValueError("Required outputs need a create, modify, or document operation")
         if not isinstance(self.verification_intents, list) or any(
             not isinstance(value, VerificationIntent) for value in self.verification_intents
         ):
@@ -545,7 +558,10 @@ class AgentStep:
             "purpose", "depends_on", "paths", "symbols", "operations", "expected_outcome",
             "verification_criteria", "verification_intents",
         }
-        if not isinstance(value, dict) or set(value) not in (legacy_keys, plan_keys):
+        required_output_keys = plan_keys | {"required_outputs"}
+        if not isinstance(value, dict) or set(value) not in (
+            legacy_keys, plan_keys, required_output_keys,
+        ):
             raise ValueError("Invalid agent step fields")
         data = value
         try:
@@ -563,6 +579,7 @@ class AgentStep:
                     VerificationIntent(intent)
                     for intent in data.get("verification_intents", [])
                 ],
+                data.get("required_outputs", []),
             )
             result.validate()
         except (TypeError, ValueError) as exc:

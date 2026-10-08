@@ -165,12 +165,22 @@ warnings.
 
 Plan operations (`read`, `search`, `create`, `modify`, `delete`, `test`,
 `verify`, `document`) and verification intents are typed categories, not
-authorization. A DELETE is surfaced as destructive. Paths are normalized,
+authorization. At validation, legacy `TEST` operations become the typed
+`targeted_tests` verification intent. `VERIFY` is normalized only when a
+typed verification intent is also present; an untyped `VERIFY` is rejected.
+Neither remains a Phase 5 execution operation. Persisted plans that still
+contain either operation are rejected by Phase 5 preflight before execution.
+A DELETE is surfaced as destructive. Paths are normalized,
 workspace-relative, checked component-by-component for symlinks, and checked
 against the active root; new targets are allowed only for CREATE steps.
 Verification intent contains fixed categories, never executable shell
 commands. No planner result grants approvals or changes tool, sandbox,
 network, or workspace policies.
+
+Planned paths define permitted scope, not a requirement to modify every
+listed file. Steps declare `required_outputs` when a particular
+workspace-relative artifact must be produced; legacy plans without the
+additive field remain readable.
 
 Malformed or invalid model output receives at most one bounded correction
 request by default, including structured validation errors. Provider failures,
@@ -207,8 +217,8 @@ expand tool authority. Every tool call still goes through the existing
 `Tools.call(...)`, its schema checks, approvals, previews/hash checks, and
 `ExecutionBackend`. A step policy exposes only read/intelligence and
 operation-compatible file tools. Terminal and network tools are not exposed
-in Phase 5; `TEST`/`VERIFY` plan steps stop explicitly at the Phase 6
-boundary.
+in Phase 5; normalized `TEST`/`VERIFY` requirements are carried to Phase 6
+rather than executed as Phase 5 tool operations.
 
 The runtime revalidates model availability, backend/session/workspace identity,
 the provider/model provenance recorded by the plan, plan schema and order,
@@ -230,6 +240,13 @@ resolved after the existing tool result. Recovery marks uncertain calls and
 the active step interrupted and never replays them. Cancellation and failures
 stop scheduling subsequent steps. The runtime does not run verification,
 replanning, code repair, review, Git operations, model routing, or UI flows.
+
+A modifying step requires at least one successful in-scope mutation; its
+other declared paths remain optional. Explicit `required_outputs` are checked
+separately for a successful authorized mutation and current existence.
+Runtime event callbacks are observational: ordinary callback failures are
+logged and isolated from task transitions. Approval, cancellation, and
+checkpoint persistence remain required control/state boundaries.
 
 ## Verification engine (Phase 6)
 
@@ -257,6 +274,16 @@ authoritative. Command arguments come from fixed application templates and
 validated workspace-relative paths, not task/model prose. Per-check and
 per-run output is bounded and persisted with typed status, exit code, timing,
 approval state, and concise failure/infrastructure evidence.
+
+Process outcome, diagnostic completeness, and repairability are separate.
+Known exit codes remain authoritative when output is truncated, but truncated
+or ambiguous failures do not authorize automatic source repair. Repair
+eligibility requires bounded evidence for a recognized assertion, syntax, or
+type-check failure (or an explicitly classified configuration failure).
+Missing verifier executables, approval denial, unavailable backends, and
+external-service failures are not code-repair candidates; unrecognized
+failures remain `UNKNOWN`. Missing-verifier detection uses precise
+launch/module evidence rather than generic phrases in test output.
 
 A required command failure transitions `VERIFYING → REPAIRING` with
 `CODE_FAILURE`; a successful verification transitions `VERIFYING → REVIEWING`
@@ -344,6 +371,9 @@ concise structured diagnosis from the already selected model. A diagnosis
 cannot grant mutation authority: target paths must already belong to a
 completed mutable Phase 4 plan step. Test and configuration paths remain
 eligible only when the original task and validated plan authorize them.
+Repair entry is accepted only for a task in `REPAIRING` with a `CODE_FAILURE`;
+unknown, blocked, and non-repairable verification outcomes do not authorize
+automatic mutation.
 
 Repair tool calls use the existing Phase 5 step executor, `Tools.call`,
 approval callbacks, and configured execution backend. The repair-mode tool
@@ -362,6 +392,12 @@ in-scope content change is required, and every completed repair mutation is
 followed by the existing Phase 6 verification plan. The model cannot choose
 weaker verification. A passing verification leaves the task in `REVIEWING`;
 Phase 7 does not review or complete the task.
+
+Repair snapshots use the bounded Phase 2 source reader, which opens files
+relative to the validated workspace with no-follow traversal, regular-file
+validation, and size limits. Digests are confirmed by a second fresh bounded
+read; missing, changed, unsafe, or unindexed targets fail capture rather than
+expanding repair scope.
 
 `RepairAttempt` records the triggering verification run/check, model
 provenance, diagnosis, plan step, intended/mutated paths, tool execution IDs,
@@ -387,6 +423,10 @@ fingerprints for every recorded mutation with fingerprints captured when
 Phase 6 completed. Stale or unavailable source, incomplete fingerprint
 coverage, pending executions, context integrity errors, and cancellation
 prevent completion; a new verification run is required after stale changes.
+Selected Phase 3 source excerpts are refreshed using the current Phase 2
+reader. Historical text is labeled historical-only in the prompt; stale
+excerpts are not current evidence, and source quotes must match the refreshed
+excerpt and its fingerprint.
 
 The review request is bounded and reuses the Phase 3 `ContextEngine`. It
 prioritizes the original goal, validated plan, actual changed source and tests,
@@ -405,9 +445,13 @@ terminal, Git, or other mutation tools. Structured JSON is strictly validated
 against the centralized finding categories, severity, confidence, paths,
 locations, evidence quotes, and plan/execution references. A small configured
 retry bound applies only to malformed review output. Blocking status is
-derived from a material high/critical finding with high confidence and
-validated source or execution evidence; lower-confidence observations remain
-warnings. Categories cover correctness, regression risk, security, plan
+derived by application policy: a high/critical, high-confidence finding must
+include a quote and line location verified against current fingerprinted
+source. An execution ID must match the cited path, operation, and step, but
+execution summaries alone do not confirm a blocking source allegation. The
+model's `suggested_blocking` preference cannot force or suppress the
+application-derived value; persisted review records retain the compatible
+`blocking` field. Categories cover correctness, regression risk, security, plan
 alignment, test integrity, architecture consistency, maintainability, and
 insufficient evidence.
 
@@ -422,3 +466,7 @@ source. Review limits bound prompt context, files/snippets, findings,
 evidence, response size, retry attempts, duration, and persisted data.
 Interrupted review recovery preserves earlier implementation and verification
 evidence and never resumes a model call or mutation automatically.
+Runtime, verification, repair, and review event callbacks are observational;
+ordinary callback exceptions are logged without reversing persisted task
+state. Cancellation remains authoritative, while approval and checkpoint
+failures remain task/control failures.

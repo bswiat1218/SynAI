@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import stat
 import threading
@@ -155,8 +156,13 @@ class RuntimeLimits:
 PlanApproval = Callable[[AgentTask, str], Awaitable[PlanApprovalDecision]]
 CheckpointHook = Callable[[AgentCheckpoint], Awaitable[None]]
 EventSink = Callable[[RuntimeEvent], Awaitable[None]]
+_logger = logging.getLogger(__name__)
 
 _READ_TOOLS = frozenset({"read_file", "list_files", *INTELLIGENCE_TOOLS})
+_MUTATING_OPERATIONS = frozenset({
+    PlanOperation.CREATE, PlanOperation.MODIFY,
+    PlanOperation.DELETE, PlanOperation.DOCUMENT,
+})
 _MUTATION_TOOLS = {
     "write_file": frozenset({PlanOperation.CREATE, PlanOperation.MODIFY, PlanOperation.DOCUMENT}),
     "patch_file": frozenset({PlanOperation.MODIFY, PlanOperation.DOCUMENT}),
@@ -658,6 +664,34 @@ class CodingAgentRuntime:
                 raise _RuntimeStop(
                     RuntimeErrorCode.EXPECTED_MUTATION_NOT_PERFORMED,
                     "The modifying step completed without a successful in-scope mutation",
+                    step_id,
+                )
+            successful_outputs = {
+                execution.target_path
+                for execution in task.executions
+                if execution.step_id == step_id
+                and execution.status == ExecutionStatus.SUCCEEDED
+                and execution.operation in _MUTATING_OPERATIONS
+            }
+            missing_outputs: list[str] = []
+            for path in step.required_outputs:
+                try:
+                    exists = _validate_plan_path(root, path)
+                except ValueError as exc:
+                    raise _RuntimeStop(
+                        RuntimeErrorCode.WORKSPACE_CHANGED,
+                        f"Required output cannot be safely validated: {path}",
+                        step_id,
+                    ) from exc
+                if path not in successful_outputs or not exists:
+                    missing_outputs.append(path)
+            if missing_outputs:
+                step.status = StepStatus.FAILED
+                await self._checkpoint(task, checkpoint)
+                raise _RuntimeStop(
+                    RuntimeErrorCode.EXPECTED_MUTATION_NOT_PERFORMED,
+                    "The step did not produce its required output(s): "
+                    + ", ".join(missing_outputs),
                     step_id,
                 )
             step.transition(StepStatus.COMPLETED)
@@ -1198,10 +1232,16 @@ class CodingAgentRuntime:
         message: str | None = None,
     ) -> None:
         if callback is not None:
-            await callback(RuntimeEvent(
-                kind, task.task_id, task.status, step_id, tool_name,
-                message[:4096] if message else None,
-            ))
+            try:
+                await callback(RuntimeEvent(
+                    kind, task.task_id, task.status, step_id, tool_name,
+                    message[:4096] if message else None,
+                ))
+            except Exception as exc:
+                _logger.warning(
+                    "Observer event delivery failed for task %s event %s: %s",
+                    task.task_id, kind, str(exc)[:512],
+                )
 
     def _validate_runtime_workspace(self, session: Session, repository: RepositoryIndex) -> Path:
         backend = self.tools.sandbox
@@ -1338,7 +1378,11 @@ class CodingAgentRuntime:
                     step.step_id,
                 )
         if set(step.operations) & {PlanOperation.TEST, PlanOperation.VERIFY}:
-            return
+            raise _RuntimeStop(
+                RuntimeErrorCode.VERIFICATION_NOT_IMPLEMENTED,
+                "TEST/VERIFY are verification intents, not Phase 5 execution operations",
+                step.step_id,
+            )
         if set(step.operations) & {
             PlanOperation.CREATE, PlanOperation.MODIFY, PlanOperation.DELETE,
             PlanOperation.DOCUMENT,

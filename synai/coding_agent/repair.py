@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -29,6 +29,9 @@ from synai.coding_agent.state import (
 )
 from synai.intelligence import RepositoryIndex
 from synai.models import Message, Session
+
+
+_logger = logging.getLogger(__name__)
 
 
 _FAILURE_PATH = re.compile(
@@ -144,6 +147,15 @@ class RepairController:
         if not isinstance(request, RepairRequest) or not isinstance(request.task, AgentTask):
             raise TypeError("A typed RepairRequest with an AgentTask is required")
         task = request.task
+        if (
+            task.status != AgentStatus.REPAIRING
+            or task.verification_outcome != VerificationOutcome.CODE_FAILURE
+        ):
+            return self._result(
+                task,
+                RepairOutcome.REPAIR_BLOCKED,
+                "Automatic repair requires a repair-eligible Phase 6 CODE_FAILURE.",
+            )
         try:
             self._validate_request(request)
             if request.cancellation and request.cancellation.is_set():
@@ -279,7 +291,9 @@ class RepairController:
                             RepairStatus.REPLAN_REQUIRED,
                             "Intended paths do not belong to a single validated executable plan scope.",
                         )
-                    before = self._snapshots(request.session.workspace, diagnosis.intended_targets)
+                    before = self._snapshots(
+                        request.session, request.repository, diagnosis.intended_targets,
+                    )
                     evidence = self._render_repair_evidence(
                         request, failure_data, repair_context, diagnosis, attempt_number,
                     )
@@ -305,7 +319,8 @@ class RepairController:
                         attempt.mutated_paths = tuple(sorted(set(
                             attempt.mutated_paths
                             + self._changed_paths(
-                                request.session.workspace, before, new_executions,
+                                request.session, request.repository,
+                                before, new_executions,
                             )
                         )))
                         if request.checkpoint is not None:
@@ -435,7 +450,7 @@ class RepairController:
                     attempt.execution_ids = tuple(item.execution_id for item in new_executions)
                     attempt.mutated_paths = tuple(sorted(set(
                         attempt.mutated_paths + self._changed_paths(
-                            request.session.workspace, before, new_executions,
+                            request.session, request.repository, before, new_executions,
                         )
                     )))
                     if not mutations_reported or not attempt.mutated_paths:
@@ -1035,28 +1050,49 @@ class RepairController:
                 return True
         return False
 
-    def _snapshots(self, workspace: str, targets: tuple[str, ...]) -> dict[str, str | None]:
-        root = Path(workspace)
+    def _snapshots(
+        self,
+        session: Session,
+        repository: RepositoryIndex,
+        targets: tuple[str, ...],
+    ) -> dict[str, str | None]:
+        if not targets:
+            return {}
+        from synai.coding_agent.runtime import _validate_plan_path
+
+        root = self.runtime._validate_runtime_workspace(session, repository)
+        exists_before = {
+            path: _validate_plan_path(root, path, allow_missing=True)
+            for path in targets
+        }
+        snapshots = repository.read_sources(targets)
+        confirmed = repository.read_sources(targets)
         output: dict[str, str | None] = {}
         for path in targets:
-            try:
-                from synai.coding_agent.runtime import _validate_plan_path
-
-                exists = _validate_plan_path(root, path, allow_missing=True)
-                if not exists:
-                    output[path] = None
-                    continue
-                candidate = root.joinpath(*PurePosixPath(path).parts)
-                if candidate.stat().st_size > 1_048_576:
-                    continue
-                output[path] = hashlib.sha256(candidate.read_bytes()).hexdigest()
-            except (OSError, ValueError):
-                continue
+            exists_after = _validate_plan_path(root, path, allow_missing=True)
+            snapshot = snapshots[path]
+            confirmation = confirmed[path]
+            if exists_before[path] != exists_after:
+                raise OSError(f"Repair snapshot target changed during capture: {path}")
+            if (
+                (snapshot is None) != (confirmation is None)
+                or snapshot is not None and confirmation is not None
+                and snapshot.sha256 != confirmation.sha256
+            ):
+                raise OSError(f"Repair snapshot target changed during capture: {path}")
+            if exists_before[path] and snapshot is None:
+                raise OSError(
+                    f"Repair snapshot target could not be read as a safe regular file: {path}"
+                )
+            if not exists_before[path] and snapshot is not None:
+                raise OSError(f"Repair snapshot target appeared during capture: {path}")
+            output[path] = snapshot.sha256 if snapshot is not None else None
         return output
 
     def _changed_paths(
         self,
-        workspace: str,
+        session: Session,
+        repository: RepositoryIndex,
         before: dict[str, str | None],
         executions: list[Any],
     ) -> tuple[str, ...]:
@@ -1066,7 +1102,9 @@ class RepairController:
             and item.operation in _MUTABLE_OPERATIONS
             and item.target_path is not None
         }
-        after = self._snapshots(workspace, tuple(successful_paths))
+        after = self._snapshots(
+            session, repository, tuple(sorted(successful_paths)),
+        )
         return tuple(sorted(
             path for path, digest in after.items()
             if path not in before or before[path] != digest
@@ -1088,7 +1126,9 @@ class RepairController:
         ))
         attempt.mutated_paths = tuple(sorted(set(
             attempt.mutated_paths
-            + self._changed_paths(request.session.workspace, before, new_executions)
+            + self._changed_paths(
+                request.session, request.repository, before, new_executions,
+            )
         )))
 
     async def _await_attempt(
@@ -1275,14 +1315,20 @@ class RepairController:
             return
         from synai.coding_agent.runtime import RuntimeEvent
 
-        await request.event_sink(RuntimeEvent(
-            kind=kind,
-            task_id=task.task_id,
-            state=task.status,
-            step_id=f"repair-{attempt}" if attempt is not None else None,
-            tool_name=None,
-            message=message[:1024] if message else None,
-        ))
+        try:
+            await request.event_sink(RuntimeEvent(
+                kind=kind,
+                task_id=task.task_id,
+                state=task.status,
+                step_id=f"repair-{attempt}" if attempt is not None else None,
+                tool_name=None,
+                message=message[:1024] if message else None,
+            ))
+        except Exception as exc:
+            _logger.warning(
+                "Observer event delivery failed for task %s event %s: %s",
+                task.task_id, kind, str(exc)[:512],
+            )
 
     @staticmethod
     def _event_for(outcome: RepairOutcome) -> str:

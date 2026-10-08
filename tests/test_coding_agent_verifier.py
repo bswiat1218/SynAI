@@ -8,6 +8,7 @@ import threading
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -31,6 +32,7 @@ from synai.coding_agent import (
     VerificationRequest,
     VerificationStatus,
 )
+from synai.coding_agent.repair import RepairController
 from synai.config import ConversationEnvironment, Settings
 from synai.intelligence import RepositoryIndex
 from synai.models import ChatEvent, ModelInfo, Session
@@ -460,6 +462,104 @@ class VerifierFixture(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Symlink", result.error)
         self.assertEqual(self.backend.calls, [])
 
+    async def test_repair_snapshot_uses_safe_workspace_reader(self) -> None:
+        controller = RepairController(self.runtime)
+        expected = hashlib.sha256(
+            (self.root / "app" / "client.py").read_bytes(),
+        ).hexdigest()
+
+        snapshots = controller._snapshots(
+            self.session, self.repository, ("app/client.py", "app/missing.py"),
+        )
+
+        self.assertEqual(snapshots, {
+            "app/client.py": expected,
+            "app/missing.py": None,
+        })
+
+    async def test_repair_snapshot_rejects_file_deleted_during_capture(self) -> None:
+        controller = RepairController(self.runtime)
+        target = self.root / "app" / "client.py"
+        original_read = self.repository.read_sources
+
+        def delete_before_read(paths: tuple[str, ...], cancellation: Any = None):
+            if target.exists():
+                target.unlink()
+            return original_read(paths, cancellation)
+
+        with patch.object(
+            self.repository, "read_sources", side_effect=delete_before_read,
+        ):
+            with self.assertRaisesRegex(OSError, "changed during capture"):
+                controller._snapshots(
+                    self.session, self.repository, ("app/client.py",),
+                )
+
+    async def test_repair_snapshot_rejects_file_replacement_during_safe_read(self) -> None:
+        controller = RepairController(self.runtime)
+        target = self.root / "app" / "client.py"
+        original_read = self.repository.read_sources
+        calls = 0
+
+        def replace_after_first_read(paths: tuple[str, ...], cancellation: Any = None):
+            nonlocal calls
+            snapshots = original_read(paths, cancellation)
+            calls += 1
+            if calls == 1:
+                target.write_text("def request():\n    return False\n", encoding="utf-8")
+            return snapshots
+
+        with patch.object(self.repository, "read_sources", side_effect=replace_after_first_read):
+            with self.assertRaisesRegex(OSError, "changed during capture"):
+                controller._snapshots(
+                    self.session, self.repository, ("app/client.py",),
+                )
+
+    async def test_repair_snapshot_rejects_file_and_parent_symlinks(self) -> None:
+        controller = RepairController(self.runtime)
+        outside = self.base / "outside.py"
+        outside.write_text("secret = True\n", encoding="utf-8")
+        linked_file = self.root / "app" / "linked.py"
+        linked_file.symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            controller._snapshots(
+                self.session, self.repository, ("app/linked.py",),
+            )
+
+        app = self.root / "app"
+        moved = self.root / "app-original"
+        app.rename(moved)
+        app.symlink_to(self.base, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            controller._snapshots(
+                self.session, self.repository, ("app/outside.py",),
+            )
+
+    async def test_repair_snapshot_rejects_oversized_nonregular_and_mismatched_workspace(self) -> None:
+        controller = RepairController(self.runtime)
+        target = self.root / "app" / "client.py"
+        target.write_bytes(b"x" * (1_048_577))
+        with self.assertRaisesRegex(OSError, "safe regular file"):
+            controller._snapshots(
+                self.session, self.repository, ("app/client.py",),
+            )
+
+        target.unlink()
+        import os
+
+        os.mkfifo(target)
+        with self.assertRaisesRegex(ValueError, "regular"):
+            controller._snapshots(
+                self.session, self.repository, ("app/client.py",),
+            )
+
+        other = self.base / "other"
+        other.mkdir()
+        with self.assertRaisesRegex(Exception, "Workspace identity changed"):
+            controller._snapshots(
+                self.session, RepositoryIndex(other), ("app/client.py",),
+            )
+
     async def test_terminal_approval_denial_blocks_without_dispatch_or_repair(self) -> None:
         self.approve = False
         task = self.make_task([VerificationIntent.TARGETED_TESTS])
@@ -492,6 +592,136 @@ class VerifierFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.results[0].status, VerificationStatus.UNAVAILABLE)
         self.assertEqual(result.outcome, VerificationOutcome.BLOCKED)
         self.assertFalse(result.repair_required)
+
+    async def test_assertion_text_containing_missing_file_phrases_is_repairable(self) -> None:
+        for message in (
+            "AssertionError: Expected customer record not found",
+            "AssertionError: no such file or directory",
+        ):
+            with self.subTest(message=message):
+                self.backend.outcomes = [{
+                    "ok": False,
+                    "stdout": f"FAIL: test_client\n{message}\n",
+                    "stderr": "",
+                    "exit_code": 1,
+                    "duration": 0.1,
+                    "timed_out": False,
+                    "truncated": False,
+                }]
+                result = await self.verify(self.make_task([VerificationIntent.TARGETED_TESTS]))
+
+                self.assertEqual(result.results[0].status, VerificationStatus.FAILED)
+                self.assertEqual(result.outcome, VerificationOutcome.CODE_FAILURE)
+                self.assertEqual(
+                    result.results[0].repairability,
+                    Repairability.CODE_REPAIR_CANDIDATE,
+                )
+
+    async def test_missing_python_executable_is_unavailable(self) -> None:
+        self.backend.outcomes = [{
+            "ok": False,
+            "stdout": "",
+            "stderr": "/bin/sh: 1: python3: not found\n",
+            "exit_code": 127,
+            "duration": 0.01,
+            "timed_out": False,
+            "truncated": False,
+        }]
+
+        result = await self.verify(self.make_task([VerificationIntent.TARGETED_TESTS]))
+
+        self.assertEqual(result.results[0].status, VerificationStatus.UNAVAILABLE)
+        self.assertEqual(result.results[0].repairability, Repairability.NOT_REPAIRABLE)
+        self.assertEqual(result.outcome, VerificationOutcome.BLOCKED)
+
+    async def test_missing_project_dependency_is_unknown_not_repairable(self) -> None:
+        self.backend.outcomes = [{
+            "ok": False,
+            "stdout": "",
+            "stderr": "ModuleNotFoundError: No module named 'customer_sdk'\n",
+            "exit_code": 1,
+            "duration": 0.1,
+            "timed_out": False,
+            "truncated": False,
+        }]
+
+        task = self.make_task([VerificationIntent.TARGETED_TESTS])
+        result = await self.verify(task)
+
+        self.assertEqual(result.results[0].status, VerificationStatus.FAILED)
+        self.assertEqual(result.results[0].repairability, Repairability.UNKNOWN)
+        self.assertEqual(result.outcome, VerificationOutcome.BLOCKED)
+        repair = await self.runtime.run_repair(task, self.session, self.repository)
+        self.assertEqual(repair.outcome.value, "repair_blocked")
+        self.assertEqual(self.provider.calls, 0)
+
+    async def test_unrecognized_nonzero_exit_is_unknown(self) -> None:
+        self.backend.outcomes = [{
+            "ok": False,
+            "stdout": "The runner stopped for an unclassified environment reason.\n",
+            "stderr": "",
+            "exit_code": 2,
+            "duration": 0.1,
+            "timed_out": False,
+            "truncated": False,
+        }]
+
+        result = await self.verify(self.make_task([VerificationIntent.TARGETED_TESTS]))
+
+        self.assertEqual(result.results[0].status, VerificationStatus.FAILED)
+        self.assertEqual(result.results[0].repairability, Repairability.UNKNOWN)
+        self.assertEqual(result.outcome, VerificationOutcome.BLOCKED)
+
+    async def test_truncated_output_preserves_exit_status_but_not_repairability(self) -> None:
+        self.backend.outcomes = [
+            {
+                "ok": False,
+                "stdout": "passed " * 100,
+                "stderr": "",
+                "exit_code": 0,
+                "duration": 0.1,
+                "timed_out": False,
+                "truncated": True,
+            },
+            {
+                "ok": False,
+                "stdout": "FAIL: test_client\nAssertionError: expected true\n" * 100,
+                "stderr": "",
+                "exit_code": 1,
+                "duration": 0.1,
+                "timed_out": False,
+                "truncated": True,
+            },
+        ]
+        task = self.make_task([
+            VerificationIntent.TARGETED_TESTS,
+            VerificationIntent.FULL_TEST_SUITE,
+        ])
+        result = await self.verify(task)
+
+        self.assertEqual(
+            [item.status for item in result.results],
+            [VerificationStatus.PASSED, VerificationStatus.FAILED],
+        )
+        self.assertTrue(all(item.truncated for item in result.results))
+        self.assertEqual(result.outcome, VerificationOutcome.BLOCKED)
+        self.assertEqual(result.results[1].repairability, Repairability.UNKNOWN)
+        self.assertFalse(result.repair_required)
+
+    async def test_infrastructure_launch_failure_without_exit_code_is_blocked(self) -> None:
+        self.backend.outcomes = [{
+            "ok": False,
+            "error": "Permission denied before terminal command launch",
+            "duration": 0.01,
+            "timed_out": False,
+            "truncated": False,
+        }]
+
+        result = await self.verify(self.make_task([VerificationIntent.TARGETED_TESTS]))
+
+        self.assertEqual(result.results[0].status, VerificationStatus.BLOCKED)
+        self.assertEqual(result.results[0].repairability, Repairability.NOT_REPAIRABLE)
+        self.assertEqual(result.outcome, VerificationOutcome.BLOCKED)
 
     async def test_timed_out_command_is_blocked_and_not_repairable(self) -> None:
         task = self.make_task([VerificationIntent.TARGETED_TESTS])
@@ -1108,7 +1338,15 @@ class VerifierFixture(unittest.IsolatedAsyncioTestCase):
 
     async def test_latest_nonrepairable_failure_blocks_earlier_repairable_failure(self) -> None:
         self.backend.outcomes = [
-            self._verification_result(False),
+            {
+                "ok": False,
+                "stdout": "",
+                "stderr": "app/client.py:1: SyntaxError: invalid syntax\n",
+                "exit_code": 1,
+                "duration": 0.1,
+                "timed_out": False,
+                "truncated": False,
+            },
             self._verification_result(False),
         ]
         task = self.make_task([

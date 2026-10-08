@@ -327,7 +327,7 @@ class RepositoryIndex:
         ):
             raise ValueError("Source paths must be a bounded set of safe workspace-relative paths")
         with self._lock:
-            self._refresh(cancellation)
+            self._refresh(cancellation, refresh_paths=frozenset(paths))
             if cancellation and cancellation.is_set():
                 raise InterruptedError("Repository intelligence query cancelled")
             result: dict[str, SourceSnapshot | None] = {}
@@ -370,7 +370,12 @@ class RepositoryIndex:
             item = self._files.get(path)
             return [dict(record) for record in item.imports] if item else []
 
-    def _refresh(self, cancellation: threading.Event | None) -> None:
+    def _refresh(
+        self,
+        cancellation: threading.Event | None,
+        *,
+        refresh_paths: frozenset[str] = frozenset(),
+    ) -> None:
         started = time.monotonic()
         old_files = self._files
         current: dict[str, _IndexedFile] = {}
@@ -455,14 +460,19 @@ class RepositoryIndex:
                     cached.size == info.st_size
                     and cached.mtime_ns == info.st_mtime_ns
                     and cached.inode == info.st_ino
-                ):
+                ) and relative not in refresh_paths:
                     current[relative] = cached
                     indexed_bytes += cached.size
                     scanned_bytes += cached.size
                     diagnostics.extend(cached.diagnostics)
                     continue
                 try:
-                    data = _read_workspace_file(self.root, relative, self.limits.max_file_bytes)
+                    data = _read_workspace_file(
+                        self.root,
+                        relative,
+                        self.limits.max_file_bytes,
+                        expected_info=info,
+                    )
                 except OSError as exc:
                     diagnostics.append(self._diagnostic(relative, "unreadable_file", str(exc)))
                     continue
@@ -846,7 +856,13 @@ def _open_workspace_directory(root: Path, relative: str) -> int:
         raise
 
 
-def _read_workspace_file(root: Path, relative: str, maximum: int) -> bytes | None:
+def _read_workspace_file(
+    root: Path,
+    relative: str,
+    maximum: int,
+    *,
+    expected_info: os.stat_result | None = None,
+) -> bytes | None:
     components = Path(relative).parts
     if not components or Path(relative).is_absolute() or ".." in components:
         return None
@@ -862,9 +878,21 @@ def _read_workspace_file(root: Path, relative: str, maximum: int) -> bytes | Non
         info = os.fstat(file_fd)
         if not stat.S_ISREG(info.st_mode):
             return None
+        if expected_info is not None and not _same_file_state(info, expected_info):
+            raise OSError("Workspace file changed before safe open")
         with os.fdopen(file_fd, "rb") as handle:
             file_fd = None
-            return handle.read(maximum + 1)
+            data = handle.read(maximum + 1)
+            final_info = os.fstat(handle.fileno())
+            current_path_info = os.stat(
+                components[-1], dir_fd=directory_fd, follow_symlinks=False,
+            )
+            if (
+                not _same_file_state(info, final_info)
+                or not _same_file_state(info, current_path_info)
+            ):
+                raise OSError("Workspace file changed during safe read")
+            return data
     except OSError:
         raise
     finally:
@@ -872,3 +900,12 @@ def _read_workspace_file(root: Path, relative: str, maximum: int) -> bytes | Non
             os.close(file_fd)
         if directory_fd is not None:
             os.close(directory_fd)
+
+
+def _same_file_state(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+    )

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -40,6 +42,9 @@ from synai.coding_agent.state import (
 )
 from synai.intelligence import RepositoryIndex
 from synai.models import ChatEvent, Message, Session
+
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -128,6 +133,7 @@ class ReviewSource:
             "line_count": self.line_count,
             "content": self.content,
             "digest": self.digest,
+            "freshness": "current" if self.digest is not None else "missing",
             "truncated": self.truncated,
             "reasons": list(self.reasons),
             "confidence": self.confidence,
@@ -227,7 +233,9 @@ class ReviewRequest:
                 for item in self.repair_attempts[-8:]
             ],
             "phase3_context": {
-                "items": [item.to_dict() for item in self.context.items],
+                "items": [
+                    _historical_context_item(item) for item in self.context.items
+                ],
                 "truncated": self.context.truncated,
                 "truncation_reasons": list(self.context.truncation_reasons),
                 "limitations": list(self.context.limitations),
@@ -609,11 +617,6 @@ class ReviewEngine:
             execution.execution_id: execution for execution in task.executions
         }
         findings: list[ReviewFinding] = []
-        successful = {
-            (execution.step_id, execution.target_path, execution.operation)
-            for execution in task.executions
-            if execution.status == ExecutionStatus.SUCCEEDED
-        }
         for execution in task.executions:
             if (
                 execution.status != ExecutionStatus.SUCCEEDED
@@ -685,33 +688,6 @@ class ReviewEngine:
                             if attempt.step_id in steps else None
                         ),
                         execution_id=related_execution,
-                    ))
-        for step in task.plan.steps:
-            mutable_operations = set(step.operations) & {
-                PlanOperation.CREATE, PlanOperation.MODIFY,
-                PlanOperation.DELETE, PlanOperation.DOCUMENT,
-            }
-            if not mutable_operations:
-                continue
-            for path in step.paths:
-                if not any(
-                    (step.step_id, path, operation) in successful
-                    for operation in mutable_operations
-                ):
-                    findings.append(ReviewFinding(
-                        finding_id="finding-missing-activity-" + hashlib.sha256(
-                            f"{step.step_id}:{path}".encode("utf-8")
-                        ).hexdigest()[:24],
-                        category=ReviewCategory.PLAN_ALIGNMENT,
-                        severity=ReviewSeverity.HIGH,
-                        confidence=ReviewConfidence.HIGH,
-                        description="A declared mutable plan path has no successful mutation record.",
-                        evidence=f"Plan step {step.step_id} declares a mutable operation for {path}.",
-                        impact="The implementation may have omitted work required by the validated plan.",
-                        recommendation="Complete the authorized path operation and rerun verification.",
-                        blocking=True,
-                        path=path,
-                        plan_step_id=step.step_id,
                     ))
         return findings[:self.limits.max_findings]
 
@@ -926,8 +902,13 @@ class ReviewEngine:
             (item.path, item.reasons[0], item)
             for item in context.items if item.path is not None
         )
+        source_paths = tuple(dict.fromkeys(
+            path for path, _, _ in candidates
+        ))
         try:
-            touched_sources = index.read_sources(touched, request.cancellation) if touched else {}
+            touched_sources = index.read_sources(
+                source_paths[:128], request.cancellation,
+            ) if source_paths else {}
         except InterruptedError as exc:
             if request.cancellation and request.cancellation.is_set():
                 raise asyncio.CancelledError from exc
@@ -935,6 +916,23 @@ class ReviewEngine:
                 ReviewOutcome.BLOCKED,
                 f"Review source gathering was interrupted: {str(exc)[:512]}",
             ) from exc
+        if len(source_paths) > 128:
+            limitations.append(
+                "Review source refresh reached the repository reader's 128-path bound."
+            )
+        for path, _, context_item in candidates:
+            snapshot = touched_sources.get(path)
+            if (
+                context_item is not None
+                and context_item.content
+                and snapshot is not None
+                and _find_excerpt_line(
+                    context_item.content, snapshot.text.splitlines(),
+                ) is None
+            ):
+                limitations.append(
+                    f"Phase 3 source context was stale for {path}; current source was refreshed."
+                )
         for path, reason, context_item in candidates:
             if path in seen:
                 continue
@@ -945,9 +943,9 @@ class ReviewEngine:
             if len(sources) >= self.limits.max_source_snippets:
                 limitations.append("Review source selection reached the configured snippet limit.")
                 break
-            if context_item is None:
-                snapshot = touched_sources.get(path)
-                if snapshot is None:
+            snapshot = touched_sources.get(path)
+            if snapshot is None:
+                if context_item is None:
                     try:
                         from synai.coding_agent.runtime import _validate_plan_path
 
@@ -955,69 +953,73 @@ class ReviewEngine:
                         if not exists:
                             sources.append(ReviewSource(
                                 path, 1, 0, "", None, False, (reason,),
-                                ContextConfidence.HIGH.value, ("The file is absent in the verified workspace.",),
+                                ContextConfidence.HIGH.value,
+                                ("The file is absent in the verified workspace.",),
                             ))
                             continue
                     except (OSError, ValueError):
                         pass
                     limitations.append(f"Current indexed source is unavailable for {path}.")
-                    continue
-                snippet_limit = min(
-                    self.limits.max_source_snippet_characters,
-                    remaining_source_characters,
-                )
-                if snippet_limit < 1:
-                    limitations.append("Review source content reached its configured character budget.")
-                    continue
-                content = snapshot.text[:snippet_limit]
-                remaining_source_characters -= len(content)
-                was_truncated = len(content) < len(snapshot.text)
-                item_limitations = (
-                    ("Only a bounded prefix of this source file was included.",)
-                    if was_truncated else ()
-                )
-                sources.append(ReviewSource(
-                    path,
-                    1,
-                    len(snapshot.text.splitlines()),
-                    content,
-                    snapshot.sha256,
-                    was_truncated,
-                    (reason,),
-                    ContextConfidence.HIGH.value,
-                    item_limitations,
-                ))
-                if was_truncated:
-                    limitations.append(f"Source excerpt truncated for {path}.")
+                else:
+                    limitations.append(
+                        f"Historical Phase 3 source for {path} is stale or unavailable and was omitted."
+                    )
+                continue
+            snippet_limit = min(
+                self.limits.max_source_snippet_characters,
+                remaining_source_characters,
+            )
+            if snippet_limit < 1:
+                limitations.append("Review source content reached its configured character budget.")
+                continue
+            current_lines = snapshot.text.splitlines()
+            if context_item is None:
+                start_line = 1
+                end_line = len(current_lines)
+                reasons = (reason,)
+                confidence = ContextConfidence.HIGH.value
+                item_limitations: tuple[str, ...] = ()
             else:
-                snippet_limit = min(
-                    self.limits.max_source_snippet_characters,
-                    remaining_source_characters,
-                )
-                if snippet_limit < 1:
-                    limitations.append("Review source content reached its configured character budget.")
-                    continue
-                content = context_item.content[:snippet_limit]
-                remaining_source_characters -= len(content)
-                truncated = len(content) < len(context_item.content)
-                sources.append(ReviewSource(
-                    path,
-                    context_item.start_line or 1,
-                    context_item.end_line or (
-                        (context_item.start_line or 1)
-                        + max(0, len(content.splitlines()) - 1)
-                    ),
-                    content,
-                    None,
-                    truncated,
-                    context_item.reasons,
-                    context_item.confidence.value,
-                    context_item.limitations + (
-                        ("Review source excerpt truncated.",) if truncated else ()
-                    ),
-                ))
-                if truncated:
-                    limitations.append(f"Context snippet truncated for {path}.")
+                old_excerpt = context_item.content
+                old_lines = old_excerpt.splitlines()
+                old_line_count = max(1, len(old_lines))
+                matching_line = _find_excerpt_line(old_excerpt, current_lines)
+                if matching_line is not None:
+                    start_line = matching_line + 1
+                else:
+                    start_line = context_item.start_line or 1
+                    item_limitations = (
+                        "Historical Phase 3 excerpt did not match current source; "
+                        "the excerpt was refreshed from current workspace contents.",
+                    )
+                end_line = min(len(current_lines), start_line + old_line_count - 1)
+                reasons = context_item.reasons
+                confidence = context_item.confidence.value
+                if matching_line is not None:
+                    item_limitations = ()
+                item_limitations += context_item.limitations
+            start_line = min(max(start_line, 1), max(len(current_lines), 1))
+            end_line = max(start_line, end_line)
+            content = "\n".join(current_lines[start_line - 1:end_line])[:snippet_limit]
+            remaining_source_characters -= len(content)
+            was_truncated = (
+                len(content) < len(snapshot.text)
+                or len(content) < len("\n".join(current_lines[start_line - 1:end_line]))
+            )
+            if was_truncated:
+                item_limitations += ("Current source excerpt was bounded.",)
+                limitations.append(f"Current source excerpt truncated for {path}.")
+            sources.append(ReviewSource(
+                path,
+                start_line,
+                len(current_lines),
+                content,
+                snapshot.sha256,
+                was_truncated,
+                reasons,
+                confidence,
+                tuple(dict.fromkeys(item_limitations)),
+            ))
         if len(touched) > len(sources):
             raise _ReviewStop(
                 ReviewOutcome.BLOCKED,
@@ -1044,7 +1046,11 @@ class ReviewEngine:
             "Cite a workspace-relative source path and an exact source line quote when possible. "
             "Return exactly one JSON object with keys summary and findings. Each finding must "
             "have exactly: category, severity, confidence, path, symbol, start_line, end_line, "
-            "description, evidence, impact, recommendation, plan_step_id, execution_id, blocking. "
+            "description, evidence, impact, recommendation, plan_step_id, execution_id, "
+            "suggested_blocking. "
+            "Each finding's suggested_blocking is only your proposal; SynAI independently decides "
+            "the final persisted blocking value from verified evidence. Historical Phase 3 excerpts "
+            "are context only and never current source evidence; cite review_sources for source claims. "
             "Use the supplied taxonomy values and JSON null for unavailable optional values. "
             "No markdown fences and no tool calls."
         )
@@ -1167,7 +1173,7 @@ class ReviewEngine:
         sources_by_path = {source.path: source for source in review.sources}
         plan_step_ids = {step.step_id for step in review.plan.steps}
         executions = {
-            item["execution_id"] for item in review.change_summaries
+            item["execution_id"]: item for item in review.change_summaries
             if isinstance(item.get("execution_id"), str)
         }
         findings: list[ReviewFinding] = []
@@ -1175,7 +1181,7 @@ class ReviewEngine:
             keys = {
                 "category", "severity", "confidence", "path", "symbol",
                 "start_line", "end_line", "description", "evidence", "impact",
-                "recommendation", "plan_step_id", "execution_id", "blocking",
+                "recommendation", "plan_step_id", "execution_id", "suggested_blocking",
             }
             if not isinstance(raw_finding, dict) or set(raw_finding) != keys:
                 raise ValueError("Review finding has missing or unexpected fields.")
@@ -1203,10 +1209,22 @@ class ReviewEngine:
                 not isinstance(step_id, str) or step_id not in plan_step_ids
             ):
                 raise ValueError("Review finding references an unknown plan step.")
-            if execution_id is not None and (
-                not isinstance(execution_id, str) or execution_id not in executions
-            ):
-                raise ValueError("Review finding references an unknown execution.")
+            execution: dict[str, str | None] | None = None
+            if execution_id is not None:
+                if not isinstance(execution_id, str) or execution_id not in executions:
+                    raise ValueError("Review finding references an unknown execution.")
+                execution = executions[execution_id]
+                if (
+                    execution.get("operation") not in {
+                        PlanOperation.CREATE.value, PlanOperation.MODIFY.value,
+                        PlanOperation.DELETE.value, PlanOperation.DOCUMENT.value,
+                    }
+                    or path is not None and execution.get("path") != path
+                    or step_id is not None and execution.get("step_id") != step_id
+                ):
+                    raise ValueError(
+                        "Review finding execution does not support its cited path, operation, or plan step."
+                    )
             evidence = raw_finding["evidence"]
             if not isinstance(evidence, str) or not evidence.strip() or (
                 len(evidence) > self.limits.max_evidence_characters
@@ -1223,14 +1241,24 @@ class ReviewEngine:
                     raise ValueError("Review finding source location or quote is unsupported.")
             elif start_line is not None or end_line is not None:
                 raise ValueError("Review finding lines require a cited source path.")
-            requested_blocking = raw_finding["blocking"]
-            if type(requested_blocking) is not bool:
-                raise ValueError("Review finding blocking flag must be boolean.")
-            evidence_supported = (
-                path is not None and start_line is not None
-            ) or execution_id is not None
+            suggested_blocking = raw_finding["suggested_blocking"]
+            if type(suggested_blocking) is not bool:
+                raise ValueError("Review finding suggested_blocking flag must be boolean.")
+            if (
+                execution is not None
+                and not (path is not None and start_line is not None)
+                and evidence not in (execution.get("summary") or "")
+            ):
+                raise ValueError(
+                    "Execution evidence must quote the cited execution summary."
+                )
+            current_source_evidence = (
+                path is not None
+                and start_line is not None
+                and bool(re.fullmatch(r"[0-9a-f]{64}", sources_by_path[path].digest or ""))
+            )
             blocking = (
-                evidence_supported
+                current_source_evidence
                 and category != ReviewCategory.INSUFFICIENT_EVIDENCE
                 and severity in {ReviewSeverity.CRITICAL, ReviewSeverity.HIGH}
                 and confidence == ReviewConfidence.HIGH
@@ -1407,9 +1435,15 @@ class ReviewEngine:
         if request.event_sink is not None:
             from synai.coding_agent.runtime import RuntimeEvent
 
-            await request.event_sink(RuntimeEvent(
-                kind, task.task_id, task.status, message=message[:4096] if message else None,
-            ))
+            try:
+                await request.event_sink(RuntimeEvent(
+                    kind, task.task_id, task.status, message=message[:4096] if message else None,
+                ))
+            except Exception as exc:
+                _logger.warning(
+                    "Observer event delivery failed for task %s event %s: %s",
+                    task.task_id, kind, str(exc)[:512],
+                )
 
     @staticmethod
     def _check_cancelled(request: ReviewInput) -> None:
@@ -1457,6 +1491,28 @@ def _evidence_matches(
         if evidence in line
     ]
     return any(start_line <= line <= end_line for line in quoted)
+
+
+def _find_excerpt_line(content: str, current_lines: list[str]) -> int | None:
+    excerpt_lines = content.splitlines()
+    if not excerpt_lines:
+        return None
+    for offset in range(max(0, len(current_lines) - len(excerpt_lines) + 1)):
+        if current_lines[offset:offset + len(excerpt_lines)] == excerpt_lines:
+            return offset
+    return None
+
+
+def _historical_context_item(item: ContextItem) -> dict[str, Any]:
+    data = item.to_dict()
+    if item.path is not None and item.content:
+        data["content"] = ""
+        data["freshness"] = "historical_only"
+        data["limitations"] = list(dict.fromkeys((
+            *item.limitations,
+            "Historical Phase 3 source text is not current review evidence.",
+        )))
+    return data
 
 
 def _now() -> str:

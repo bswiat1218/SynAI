@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
+import hashlib
+import logging
 import math
 import os
 import re
@@ -57,12 +58,12 @@ _EXCLUDED_DIRS = {
 _MUTATIONS = {
     PlanOperation.CREATE, PlanOperation.MODIFY, PlanOperation.DELETE, PlanOperation.DOCUMENT,
 }
-_MODULE_MISSING = re.compile(r"No module named\s+['\"]?([A-Za-z0-9_.-]+)['\"]?")
 _FAILURE_HINT = re.compile(
     r"(?:FAILED\b|ERROR\b|FAIL:|AssertionError|SyntaxError|TypeError|"
     r"error\[E\d{4}\]|error TS\d+|error:|Traceback \(most recent call last\))",
     re.IGNORECASE,
 )
+_logger = logging.getLogger(__name__)
 
 
 def _verification_requirements_fingerprint(plan: VerificationPlan) -> str:
@@ -790,26 +791,25 @@ class VerificationEngine:
             record.status = VerificationStatus.TIMED_OUT
             record.infrastructure_error = str(value.get("error", "Verification command timed out"))[:2048]
             record.repairability = Repairability.NOT_REPAIRABLE
-        elif record.truncated:
-            record.status = VerificationStatus.BLOCKED
-            record.infrastructure_error = "Terminal output exceeded a configured output limit."
-            record.repairability = Repairability.NOT_REPAIRABLE
         elif record.exit_code is None:
             record.status = VerificationStatus.BLOCKED
             record.infrastructure_error = str(value.get("error", "Terminal execution is unavailable"))[:2048]
             record.repairability = Repairability.NOT_REPAIRABLE
-        elif _is_missing_verifier(record.exit_code, record.stderr):
+        elif _is_missing_verifier(record.exit_code, record.stderr, check.argv):
             record.status = VerificationStatus.UNAVAILABLE
             record.infrastructure_error = _failure_excerpt(record.stderr or str(value.get("error", "")), self.limits.max_diagnostics)
             record.repairability = Repairability.NOT_REPAIRABLE
-        elif record.exit_code == 0 and value.get("ok") is True:
+        elif record.exit_code == 0:
             record.status = VerificationStatus.PASSED
             record.repairability = Repairability.NOT_REPAIRABLE
         elif record.exit_code != 0:
             record.status = VerificationStatus.FAILED
             combined = "\n".join(part for part in (record.stdout, record.stderr) if part)
             record.failure_summary = _failure_excerpt(combined, self.limits.max_diagnostics)
-            record.repairability = _repairability(record.failure_summary, combined)
+            record.repairability = _repairability(
+                record.failure_summary, combined, check.intent,
+                truncated=record.truncated,
+            )
         else:
             record.status = VerificationStatus.ERROR
             record.infrastructure_error = str(value.get("error", "Terminal tool reported an inconsistent result"))[:2048]
@@ -942,14 +942,20 @@ class VerificationEngine:
             return
         from synai.coding_agent.runtime import RuntimeEvent
 
-        await self.event_sink(RuntimeEvent(
-            kind=kind,
-            task_id=task.task_id,
-            state=task.status,
-            step_id=check_id,
-            tool_name="terminal" if check_id else None,
-            message=message[:4096] if message else None,
-        ))
+        try:
+            await self.event_sink(RuntimeEvent(
+                kind=kind,
+                task_id=task.task_id,
+                state=task.status,
+                step_id=check_id,
+                tool_name="terminal" if check_id else None,
+                message=message[:4096] if message else None,
+            ))
+        except Exception as exc:
+            _logger.warning(
+                "Observer event delivery failed for task %s event %s: %s",
+                task.task_id, kind, str(exc)[:512],
+            )
 
     @staticmethod
     def _event_for_status(status: VerificationStatus) -> str:
@@ -987,10 +993,22 @@ class VerificationEngine:
             return VerificationOutcome.BLOCKED
         if plan.unsupported_intents:
             return VerificationOutcome.BLOCKED
-        if any(item.status == VerificationStatus.FAILED for item in current):
-            return VerificationOutcome.CODE_FAILURE
         if any(item.status == VerificationStatus.RUNNING for item in current):
             return VerificationOutcome.UNKNOWN
+        failed = [
+            item for item in current
+            if item.required and item.status == VerificationStatus.FAILED
+        ]
+        if failed and any(
+            item.repairability not in {
+                Repairability.CODE_REPAIR_CANDIDATE,
+                Repairability.CONFIGURATION_REPAIR_CANDIDATE,
+            }
+            for item in failed
+        ):
+            return VerificationOutcome.BLOCKED
+        if failed:
+            return VerificationOutcome.CODE_FAILURE
         if any(item.status == VerificationStatus.PASSED for item in current):
             return VerificationOutcome.PASSED
         return VerificationOutcome.BLOCKED
@@ -1798,33 +1816,85 @@ def _command_is_application_owned(check: VerificationCheck) -> bool:
     return False
 
 
-def _is_missing_verifier(exit_code: int, stderr: str) -> bool:
+def _is_missing_verifier(
+    exit_code: int,
+    stderr: str,
+    argv: tuple[str, ...],
+) -> bool:
     if exit_code not in {1, 126, 127}:
         return False
-    lowered = stderr.lower()
-    if any(text in lowered for text in (
-        "command not found", "not found", "no such file or directory",
-        "is not recognized as an internal or external command",
-    )):
+    executable = argv[0] if argv else ""
+    if executable in {"python", "python3", "python3.14"} and re.fullmatch(
+        rf"(?:/bin/sh: \d+: )?{re.escape(executable)}: "
+        r"(?:not found|No such file or directory)",
+        stderr.strip(),
+        re.IGNORECASE,
+    ):
         return True
-    missing_module = _MODULE_MISSING.search(stderr)
-    if missing_module:
-        requested = {
-            "pytest": "pytest", "build": "build", "ruff": "ruff",
-            "mypy": "mypy", "pyright": "pyright",
-        }
-        return missing_module.group(1).split(".", 1)[0] in requested
+    if len(argv) >= 3 and argv[1] == "-m":
+        expected_module = argv[2].split(".", 1)[0]
+        if expected_module in {"pytest", "build", "ruff", "mypy", "pyright"}:
+            for line in stderr.splitlines():
+                missing_module = re.fullmatch(
+                    r"(?:[^:\n]+: )?No module named ['\"]?([A-Za-z0-9_.-]+)['\"]?",
+                    line.strip(),
+                )
+                if (
+                    missing_module
+                    and missing_module.group(1).split(".", 1)[0] == expected_module
+                ):
+                    return True
     return False
 
 
-def _repairability(summary: str, output: str) -> Repairability:
-    lowered = f"{summary}\n{output}".lower()
-    if any(term in lowered for term in (
-        "invalid pyproject", "configuration error", "failed to parse",
-        "toml decode", "invalid configuration", "malformed package.json",
-    )):
+def _repairability(
+    summary: str,
+    output: str,
+    intent: VerificationIntent,
+    *,
+    truncated: bool,
+) -> Repairability:
+    if truncated:
+        return Repairability.UNKNOWN
+    text = f"{summary}\n{output}"
+    if re.search(
+        r"(?im)^(?:.*(?:pyproject\.toml|package\.json|Cargo\.toml).*)?"
+        r"(?:TOMLDecodeError|ConfigurationError|invalid configuration|"
+        r"failed to parse (?:configuration|pyproject\.toml|package\.json)|"
+        r"malformed package\.json)\b",
+        text,
+    ):
         return Repairability.CONFIGURATION_REPAIR_CANDIDATE
-    return Repairability.CODE_REPAIR_CANDIDATE
+    if intent in {
+        VerificationIntent.TARGETED_TESTS,
+        VerificationIntent.RELEVANT_TESTS,
+        VerificationIntent.FULL_TEST_SUITE,
+    } and re.search(
+        r"(?im)^(?:FAIL:|FAILED\s+\S+|.*\bAssertionError\b|"
+        r".*\b(?:assertEqual|assertTrue|assertFalse)\b)",
+        text,
+    ):
+        return Repairability.CODE_REPAIR_CANDIDATE
+    if intent == VerificationIntent.SYNTAX_CHECK and re.search(
+        r"(?im)^(?:.*\b(?:SyntaxError|IndentationError)\b|"
+        r"\*\*\* Error compiling ['\"].+)",
+        text,
+    ):
+        return Repairability.CODE_REPAIR_CANDIDATE
+    if intent == VerificationIntent.TYPE_CHECK and re.search(
+        r"(?im)^(?:\S+\.py:\d+(?::\d+)?: error:|"
+        r".+\s+\d+\s+\d+\s+-\s+error:)",
+        text,
+    ):
+        return Repairability.CODE_REPAIR_CANDIDATE
+    if re.search(
+        r"(?im)^(?:.*\b(?:ConnectionRefusedError|"
+        r"Temporary failure in name resolution|"
+        r"Name or service not known|Connection timed out)\b)",
+        text,
+    ):
+        return Repairability.NOT_REPAIRABLE
+    return Repairability.UNKNOWN
 
 
 def _failure_excerpt(output: str, max_diagnostics: int) -> str:

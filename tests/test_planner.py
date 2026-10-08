@@ -39,6 +39,7 @@ def make_plan(
     operations: list[str] | None = None,
     verification_criteria: list[str] | None = None,
     verification_intent: list[str] | None = None,
+    required_outputs: list[str] | None = None,
 ) -> dict:
     return {
         "goal": "Add bounded retry handling to Client.request",
@@ -62,6 +63,7 @@ def make_plan(
                 else ["Focused retry tests pass"]
             ),
             "verification_intents": [],
+            **({"required_outputs": required_outputs} if required_outputs is not None else {}),
         }],
     }
 
@@ -176,6 +178,12 @@ class PlannerSchemaAndValidationTests(PlannerFixture):
         self.assertTrue(result.ok, result.errors)
         self.assertEqual(result.plan.executable_order, ["step-1", "step-2"])
         self.assertEqual(result.plan.steps[1].depends_on, ["step-1"])
+        self.assertEqual(
+            result.plan.steps[1].operations, [PlanOperation.MODIFY],
+        )
+        self.assertEqual(
+            result.plan.verification_intent, [VerificationIntent.TARGETED_TESTS],
+        )
 
     async def test_stable_topological_order_adjusts_model_order_to_respect_dependencies(self) -> None:
         raw = make_plan()
@@ -310,10 +318,45 @@ class PlannerSchemaAndValidationTests(PlannerFixture):
         (self.root / "tests" / "test_retries.py").unlink(missing_ok=True)
         raw = make_plan(
             paths=["tests/test_retries.py"], symbols=[],
-            operations=["create", "test"],
+            operations=["create"], verification_intent=["targeted_tests"],
         )
         result, _ = await self.plan(raw)
         self.assertTrue(result.ok, result.errors)
+
+    async def test_test_and_verify_steps_are_normalized_to_typed_verification_intents(self) -> None:
+        for operation in ("test", "verify"):
+            with self.subTest(operation=operation):
+                result, _ = await self.plan(
+                    make_plan(operations=[operation]),
+                )
+                self.assertTrue(result.ok, result.errors)
+                self.assertNotIn(
+                    PlanOperation.TEST, result.plan.steps[0].operations,
+                )
+                self.assertNotIn(
+                    PlanOperation.VERIFY, result.plan.steps[0].operations,
+                )
+                self.assertIn(
+                    VerificationIntent.TARGETED_TESTS,
+                    result.plan.verification_intent,
+                )
+
+    async def test_verify_step_without_typed_intent_is_rejected(self) -> None:
+        raw = make_plan(operations=["verify"], verification_intent=[])
+        result, _ = await self.plan(
+            raw, limits=PlannerLimits(max_planning_attempts=1),
+        )
+        self.assertFalse(result.ok)
+        self.assertIn(
+            PlanningErrorCode.MISSING_VERIFICATION_INTENT,
+            {issue.code for issue in result.errors},
+        )
+
+    async def test_required_outputs_are_explicit_plan_outcomes(self) -> None:
+        raw = make_plan(required_outputs=["app/client.py"])
+        result, _ = await self.plan(raw)
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.plan.steps[0].required_outputs, ["app/client.py"])
 
     async def test_absolute_traversal_non_normalized_and_external_paths_are_rejected(self) -> None:
         for path in (
