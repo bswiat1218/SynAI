@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from synai.coding_agent.context import (
     ContextEngine,
@@ -49,6 +49,9 @@ from synai.intelligence import RepositoryIndex
 from synai.models import ChatEvent, Message, Session
 from synai.providers.base import ModelProvider, ProviderError
 from synai.tools import INTELLIGENCE_TOOLS, Tools, schemas
+
+if TYPE_CHECKING:
+    from synai.coding_agent.reviewer import ReviewLimits
 
 
 class AutonomyMode(StrEnum):
@@ -257,6 +260,34 @@ class CodingAgentRuntime:
             max_attempt_seconds=max_attempt_seconds,
         ))
         return await controller.run(RepairRequest(
+            task=task,
+            session=session,
+            repository=repository,
+            context=context,
+            cancellation=cancellation,
+            checkpoint=self._session_checkpoint(session, checkpoint),
+            event_sink=event_sink,
+        ))
+
+    async def run_review(
+        self,
+        task: AgentTask,
+        session: Session,
+        repository: RepositoryIndex,
+        *,
+        context: ContextPackage | None = None,
+        cancellation: threading.Event | None = None,
+        checkpoint: CheckpointHook | None = None,
+        event_sink: EventSink | None = None,
+        limits: ReviewLimits | None = None,
+    ):
+        """Run the bounded, read-only Phase 8 review for verified task changes."""
+        from synai.coding_agent.reviewer import ReviewEngine, ReviewInput, ReviewLimits
+
+        if limits is not None and not isinstance(limits, ReviewLimits):
+            raise TypeError("Review limits must be a ReviewLimits value")
+        engine = ReviewEngine(self, limits=limits)
+        return await engine.run(ReviewInput(
             task=task,
             session=session,
             repository=repository,

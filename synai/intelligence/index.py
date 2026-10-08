@@ -308,19 +308,36 @@ class RepositoryIndex:
         self, path: str, cancellation: threading.Event | None = None,
     ) -> SourceSnapshot | None:
         """Read a bounded file already admitted by this index, without accepting host paths."""
+        return self.read_sources((path,), cancellation)[path]
+
+    def read_sources(
+        self,
+        paths: tuple[str, ...],
+        cancellation: threading.Event | None = None,
+    ) -> dict[str, SourceSnapshot | None]:
+        """Read bounded indexed files from one refreshed workspace snapshot."""
         if (
-            not isinstance(path, str) or not path or "\\" in path or "\x00" in path
-            or Path(path).is_absolute() or ".." in Path(path).parts
+            not isinstance(paths, tuple) or not 1 <= len(paths) <= 128
+            or any(
+                not isinstance(path, str) or not path or "\\" in path or "\x00" in path
+                or Path(path).is_absolute() or ".." in Path(path).parts
+                for path in paths
+            )
+            or len(set(paths)) != len(paths)
         ):
-            raise ValueError("Source path must be a safe workspace-relative path")
+            raise ValueError("Source paths must be a bounded set of safe workspace-relative paths")
         with self._lock:
             self._refresh(cancellation)
             if cancellation and cancellation.is_set():
                 raise InterruptedError("Repository intelligence query cancelled")
-            item = self._files.get(path)
-            if item is None:
-                return None
-            return SourceSnapshot(item.path, item.text, item.digest, item.size)
+            result: dict[str, SourceSnapshot | None] = {}
+            for path in paths:
+                item = self._files.get(path)
+                result[path] = (
+                    SourceSnapshot(item.path, item.text, item.digest, item.size)
+                    if item is not None else None
+                )
+            return result
 
     def read_symbol_source(
         self, qualified_name: str, cancellation: threading.Event | None = None,

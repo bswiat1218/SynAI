@@ -156,6 +156,40 @@ class RepairOutcome(StrEnum):
     REPAIR_INTERRUPTED = "repair_interrupted"
 
 
+class ReviewCategory(StrEnum):
+    CORRECTNESS = "correctness"
+    REGRESSION_RISK = "regression_risk"
+    SECURITY = "security"
+    PLAN_ALIGNMENT = "plan_alignment"
+    TEST_INTEGRITY = "test_integrity"
+    ARCHITECTURE_CONSISTENCY = "architecture_consistency"
+    MAINTAINABILITY = "maintainability"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+
+
+class ReviewSeverity(StrEnum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
+
+
+class ReviewConfidence(StrEnum):
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+class ReviewOutcome(StrEnum):
+    PASSED = "passed"
+    PASSED_WITH_WARNINGS = "passed_with_warnings"
+    CHANGES_REQUESTED = "changes_requested"
+    BLOCKED = "blocked"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+
 class PlanOperation(StrEnum):
     READ = "read"
     SEARCH = "search"
@@ -272,6 +306,8 @@ class VerificationPlan:
     warnings: list[str] = field(default_factory=list)
     run_id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(default_factory=_now)
+    source_fingerprints: dict[str, str] = field(default_factory=dict)
+    requirements_fingerprint: str | None = None
 
     def validate(self) -> None:
         _text(self.project_type, "verification project type", limit=64)
@@ -300,6 +336,23 @@ class VerificationPlan:
             raise ValueError("Invalid verification warnings")
         for warning in self.warnings:
             _text(warning, "verification warning", limit=1024)
+        if not isinstance(self.source_fingerprints, dict) or len(self.source_fingerprints) > 128:
+            raise ValueError("Invalid verification source fingerprints")
+        for path, fingerprint in self.source_fingerprints.items():
+            if not _safe_verification_path(path) or not isinstance(fingerprint, str):
+                raise ValueError("Invalid verification source fingerprint entry")
+            if fingerprint != "missing" and not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+                raise ValueError("Invalid verification source fingerprint")
+        _text(
+            self.requirements_fingerprint,
+            "verification requirements fingerprint",
+            optional=True,
+            limit=64,
+        )
+        if self.requirements_fingerprint is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.requirements_fingerprint,
+        ):
+            raise ValueError("Invalid verification requirements fingerprint")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -308,18 +361,31 @@ class VerificationPlan:
             "checks": [check.to_dict() for check in self.checks],
             "unsupported_intents": [intent.value for intent in self.unsupported_intents],
             "warnings": list(self.warnings), "run_id": self.run_id, "created_at": self.created_at,
+            "source_fingerprints": dict(self.source_fingerprints),
+            "requirements_fingerprint": self.requirements_fingerprint,
         }
 
     @classmethod
     def from_dict(cls, value: object) -> VerificationPlan:
-        data = _object(value, "verification plan", {
+        legacy_keys = {
             "project_type", "project_roots", "checks", "unsupported_intents",
             "warnings", "run_id", "created_at",
-        })
+        }
+        data = value
+        valid_keys = {
+            frozenset(legacy_keys),
+            frozenset(legacy_keys | {"source_fingerprints"}),
+            frozenset(legacy_keys | {"requirements_fingerprint"}),
+            frozenset(legacy_keys | {"source_fingerprints", "requirements_fingerprint"}),
+        }
+        if not isinstance(data, dict) or frozenset(data) not in valid_keys:
+            raise ValueError("Invalid agent verification plan fields")
         if any(not isinstance(data[key], list) for key in (
             "project_roots", "checks", "unsupported_intents", "warnings",
         )):
             raise ValueError("Invalid verification plan sequences")
+        if not isinstance(data.get("source_fingerprints", {}), dict):
+            raise ValueError("Invalid verification source fingerprints")
         try:
             result = cls(
                 project_type=data["project_type"], project_roots=tuple(data["project_roots"]),
@@ -328,6 +394,8 @@ class VerificationPlan:
                     VerificationIntent(intent) for intent in data["unsupported_intents"]
                 ],
                 warnings=data["warnings"], run_id=data["run_id"], created_at=data["created_at"],
+                source_fingerprints=dict(data.get("source_fingerprints", {})),
+                requirements_fingerprint=data.get("requirements_fingerprint"),
             )
             result.validate()
         except (TypeError, ValueError) as exc:
@@ -962,6 +1030,203 @@ class RepairAttempt:
 
 
 @dataclass
+class ReviewFinding:
+    finding_id: str
+    category: ReviewCategory
+    severity: ReviewSeverity
+    confidence: ReviewConfidence
+    description: str
+    evidence: str
+    impact: str
+    recommendation: str
+    blocking: bool
+    path: str | None = None
+    symbol: str | None = None
+    start_line: int | None = None
+    end_line: int | None = None
+    plan_step_id: str | None = None
+    execution_id: str | None = None
+
+    def validate(self) -> None:
+        _text(self.finding_id, "review finding ID", limit=128)
+        if not re.fullmatch(r"finding-[a-z0-9-]{1,120}", self.finding_id):
+            raise ValueError("Invalid review finding ID")
+        for value, label, limit in (
+            (self.description, "review finding description", 2048),
+            (self.evidence, "review finding evidence", 4096),
+            (self.impact, "review finding impact", 2048),
+            (self.recommendation, "review finding recommendation", 2048),
+        ):
+            _text(value, label, limit=limit)
+        if not isinstance(self.category, ReviewCategory):
+            raise ValueError("Invalid review finding category")
+        if not isinstance(self.severity, ReviewSeverity):
+            raise ValueError("Invalid review finding severity")
+        if not isinstance(self.confidence, ReviewConfidence):
+            raise ValueError("Invalid review finding confidence")
+        if type(self.blocking) is not bool:
+            raise ValueError("Invalid review finding blocking state")
+        if self.path is not None and not _safe_verification_path(self.path):
+            raise ValueError("Invalid review finding path")
+        _text(self.symbol, "review finding symbol", optional=True, limit=512)
+        for line in (self.start_line, self.end_line):
+            if line is not None and (type(line) is not int or line < 1):
+                raise ValueError("Invalid review finding line")
+        if (
+            self.start_line is not None and self.end_line is not None
+            and self.end_line < self.start_line
+        ):
+            raise ValueError("Invalid review finding line range")
+        _text(self.plan_step_id, "review finding plan step", optional=True, limit=128)
+        _text(self.execution_id, "review finding execution ID", optional=True, limit=128)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        result = asdict(self)
+        result["category"] = self.category.value
+        result["severity"] = self.severity.value
+        result["confidence"] = self.confidence.value
+        return result
+
+    @classmethod
+    def from_dict(cls, value: object) -> ReviewFinding:
+        keys = {
+            "finding_id", "category", "severity", "confidence", "description", "evidence",
+            "impact", "recommendation", "blocking", "path", "symbol", "start_line",
+            "end_line", "plan_step_id", "execution_id",
+        }
+        data = _object(value, "review finding", keys)
+        try:
+            result = cls(
+                finding_id=data["finding_id"],
+                category=ReviewCategory(data["category"]),
+                severity=ReviewSeverity(data["severity"]),
+                confidence=ReviewConfidence(data["confidence"]),
+                description=data["description"],
+                evidence=data["evidence"],
+                impact=data["impact"],
+                recommendation=data["recommendation"],
+                blocking=data["blocking"],
+                path=data["path"],
+                symbol=data["symbol"],
+                start_line=data["start_line"],
+                end_line=data["end_line"],
+                plan_step_id=data["plan_step_id"],
+                execution_id=data["execution_id"],
+            )
+            result.validate()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid agent review finding: {exc}") from exc
+        return result
+
+
+@dataclass
+class ReviewRecord:
+    task_id: str
+    plan_id: str | None
+    verification_run_id: str | None
+    outcome: ReviewOutcome
+    provider: str | None
+    model: str | None
+    workspace_identity: str | None
+    backend_identity: str | None
+    context_fingerprint: str
+    findings: list[ReviewFinding]
+    summary: str
+    started_at: str = field(default_factory=_now)
+    completed_at: str = field(default_factory=_now)
+    limitations: list[str] = field(default_factory=list)
+
+    def validate(self) -> None:
+        for value, label, limit in (
+            (self.task_id, "review task ID", 128),
+            (self.summary, "review summary", 4096),
+        ):
+            _text(value, label, limit=limit)
+        for value, label, limit in (
+            (self.plan_id, "review plan ID", 128),
+            (self.verification_run_id, "review verification run ID", 128),
+            (self.provider, "review provider", 128),
+            (self.model, "review model", 512),
+            (self.workspace_identity, "review workspace identity", 2048),
+            (self.backend_identity, "review backend identity", 128),
+        ):
+            _text(value, label, optional=True, limit=limit)
+        if not isinstance(self.outcome, ReviewOutcome):
+            raise ValueError("Invalid review outcome")
+        if not isinstance(self.context_fingerprint, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", self.context_fingerprint,
+        ):
+            raise ValueError("Invalid review context fingerprint")
+        _timestamp(self.started_at, "review start timestamp")
+        _timestamp(self.completed_at, "review completion timestamp")
+        if not isinstance(self.findings, list) or len(self.findings) > 64:
+            raise ValueError("Invalid review findings")
+        for finding in self.findings:
+            if not isinstance(finding, ReviewFinding):
+                raise ValueError("Invalid review finding")
+            finding.validate()
+        if len({finding.finding_id for finding in self.findings}) != len(self.findings):
+            raise ValueError("Duplicate review finding ID")
+        if not isinstance(self.limitations, list) or len(self.limitations) > 32:
+            raise ValueError("Invalid review limitations")
+        for limitation in self.limitations:
+            _text(limitation, "review limitation", limit=1024)
+        if len(json.dumps(self.to_dict(), ensure_ascii=True).encode("utf-8")) > 128 * 1024:
+            raise ValueError("Review record exceeds 128 KiB")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "plan_id": self.plan_id,
+            "verification_run_id": self.verification_run_id,
+            "outcome": self.outcome.value,
+            "provider": self.provider,
+            "model": self.model,
+            "workspace_identity": self.workspace_identity,
+            "backend_identity": self.backend_identity,
+            "context_fingerprint": self.context_fingerprint,
+            "findings": [item.to_dict() for item in self.findings],
+            "summary": self.summary,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "limitations": list(self.limitations),
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> ReviewRecord:
+        keys = {
+            "task_id", "plan_id", "verification_run_id", "outcome", "provider", "model",
+            "workspace_identity", "backend_identity", "context_fingerprint", "findings",
+            "summary", "started_at", "completed_at", "limitations",
+        }
+        data = _object(value, "review record", keys)
+        if not isinstance(data["findings"], list) or not isinstance(data["limitations"], list):
+            raise ValueError("Invalid agent review sequences")
+        try:
+            result = cls(
+                task_id=data["task_id"],
+                plan_id=data["plan_id"],
+                verification_run_id=data["verification_run_id"],
+                outcome=ReviewOutcome(data["outcome"]),
+                provider=data["provider"],
+                model=data["model"],
+                workspace_identity=data["workspace_identity"],
+                backend_identity=data["backend_identity"],
+                context_fingerprint=data["context_fingerprint"],
+                findings=[ReviewFinding.from_dict(item) for item in data["findings"]],
+                summary=data["summary"],
+                started_at=data["started_at"],
+                completed_at=data["completed_at"],
+                limitations=data["limitations"],
+            )
+            result.validate()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid agent review record: {exc}") from exc
+        return result
+
+
+@dataclass
 class AgentTask:
     goal: str
     task_id: str = field(default_factory=lambda: uuid4().hex)
@@ -978,6 +1243,7 @@ class AgentTask:
     current_verification_check_id: str | None = None
     repair_attempts: list[RepairAttempt] = field(default_factory=list)
     repair_outcome: RepairOutcome | None = None
+    review_record: ReviewRecord | None = None
     terminal_summary: str | None = None
     approval_resume_state: AgentStatus | None = None
 
@@ -1022,6 +1288,28 @@ class AgentTask:
             self._mark_pending_steps(StepStatus.BLOCKED)
             self.status = AgentStatus.FAILED
             self.terminal_summary = "Approval denied; no further task steps were executed."
+        self.updated_at = _now()
+
+    def rollback_review_completion(self, outcome: ReviewOutcome, summary: str) -> None:
+        if (
+            self.status != AgentStatus.COMPLETED
+            or self.review_record is None
+            or self.review_record.outcome not in {
+                ReviewOutcome.PASSED, ReviewOutcome.PASSED_WITH_WARNINGS,
+            }
+            or outcome not in {ReviewOutcome.ERROR, ReviewOutcome.CANCELLED}
+        ):
+            raise ValueError("Only a just-completed review can be rolled back")
+        _text(summary, "review rollback summary", limit=4096)
+        self.status = (
+            AgentStatus.CANCELLED
+            if outcome == ReviewOutcome.CANCELLED
+            else AgentStatus.REVIEWING
+        )
+        self.review_record.outcome = outcome
+        self.review_record.summary = summary
+        self.review_record.completed_at = _now()
+        self.terminal_summary = summary
         self.updated_at = _now()
 
     def recover_interrupted(self) -> bool:
@@ -1127,6 +1415,33 @@ class AgentTask:
             raise ValueError("Invalid agent verification outcome")
         if self.repair_outcome is not None and not isinstance(self.repair_outcome, RepairOutcome):
             raise ValueError("Invalid agent repair outcome")
+        if self.review_record is not None:
+            if not isinstance(self.review_record, ReviewRecord):
+                raise ValueError("Invalid agent review record")
+            self.review_record.validate()
+            if self.review_record.task_id != self.task_id:
+                raise ValueError("Review record references a different task")
+            if (
+                self.review_record.plan_id is not None
+                and (self.plan is None or self.review_record.plan_id != self.plan.plan_id)
+            ):
+                raise ValueError("Review record references a different plan")
+            if (
+                self.review_record.verification_run_id is not None
+                and (
+                    self.verification_plan is None
+                    or self.review_record.verification_run_id != self.verification_plan.run_id
+                )
+            ):
+                raise ValueError("Review record references a different verification run")
+            step_ids = {step.step_id for step in self.plan.steps}
+            execution_ids = {execution.execution_id for execution in self.executions}
+            if any(
+                finding.plan_step_id is not None and finding.plan_step_id not in step_ids
+                or finding.execution_id is not None and finding.execution_id not in execution_ids
+                for finding in self.review_record.findings
+            ):
+                raise ValueError("Review finding references unknown task evidence")
         if self.current_verification_check_id is not None and (
             self.verification_plan is None
             or self.current_verification_check_id not in {
@@ -1187,6 +1502,7 @@ class AgentTask:
             "current_verification_check_id": self.current_verification_check_id,
             "repair_attempts": [item.to_dict() for item in self.repair_attempts],
             "repair_outcome": self.repair_outcome.value if self.repair_outcome else None,
+            "review_record": self.review_record.to_dict() if self.review_record else None,
             "terminal_summary": self.terminal_summary,
             "approval_resume_state": (
                 self.approval_resume_state.value if self.approval_resume_state is not None else None
@@ -1204,8 +1520,10 @@ class AgentTask:
             "verification_plan", "verification_outcome", "current_verification_check_id",
         }
         repair_keys = extended_keys | {"repair_outcome"}
+        review_keys = repair_keys | {"review_record"}
         if not isinstance(value, dict) or set(value) not in {
             frozenset(legacy_keys), frozenset(extended_keys), frozenset(repair_keys),
+            frozenset(review_keys),
         }:
             raise ValueError("Invalid agent task fields")
         data = value
@@ -1236,6 +1554,10 @@ class AgentTask:
                 repair_outcome=(
                     RepairOutcome(data["repair_outcome"])
                     if data.get("repair_outcome") is not None else None
+                ),
+                review_record=(
+                    ReviewRecord.from_dict(data["review_record"])
+                    if data.get("review_record") is not None else None
                 ),
                 terminal_summary=data["terminal_summary"],
                 approval_resume_state=(

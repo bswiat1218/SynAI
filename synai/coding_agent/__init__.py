@@ -27,6 +27,12 @@ from synai.coding_agent.state import (
     RepairOutcome,
     Repairability,
     RepairStatus,
+    ReviewCategory,
+    ReviewConfidence,
+    ReviewFinding,
+    ReviewOutcome,
+    ReviewRecord,
+    ReviewSeverity,
     StepStatus,
     VerificationCheck,
     VerificationOutcome,
@@ -86,6 +92,17 @@ __all__ = [
     "RepairRunResult",
     "Repairability",
     "RepairStatus",
+    "ReviewCategory",
+    "ReviewConfidence",
+    "ReviewEngine",
+    "ReviewFinding",
+    "ReviewInput",
+    "ReviewLimits",
+    "ReviewOutcome",
+    "ReviewRecord",
+    "ReviewRequest",
+    "ReviewRunResult",
+    "ReviewSeverity",
     "RuntimeErrorCode",
     "RuntimeEvent",
     "RuntimeFailure",
@@ -145,4 +162,15 @@ def __getattr__(name: str):
         from synai.coding_agent import repair
 
         return getattr(repair, name)
+    review_names = {
+        "ReviewEngine",
+        "ReviewInput",
+        "ReviewLimits",
+        "ReviewRequest",
+        "ReviewRunResult",
+    }
+    if name in review_names:
+        from synai.coding_agent import reviewer
+
+        return getattr(reviewer, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

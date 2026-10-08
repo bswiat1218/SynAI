@@ -65,6 +65,16 @@ _FAILURE_HINT = re.compile(
 )
 
 
+def _verification_requirements_fingerprint(plan: VerificationPlan) -> str:
+    serialized = json.dumps(
+        [check.to_dict() for check in plan.checks],
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class VerificationLimits:
     max_checks: int = 16
@@ -199,6 +209,7 @@ class VerificationEngine:
             await self._checkpoint(task)
             await self._emit(task, "verification_started")
             plan = self._build_plan(request, intents)
+            plan.requirements_fingerprint = _verification_requirements_fingerprint(plan)
             task.verification_plan = plan
             await self._checkpoint(task)
             await self._emit(task, "verification_plan_ready", message=self._render_plan(plan))
@@ -342,6 +353,10 @@ class VerificationEngine:
                     syntax_failed = True
 
             outcome = self._overall(plan, task.verification_results)
+            if plan.requirements_fingerprint != _verification_requirements_fingerprint(plan):
+                outcome = VerificationOutcome.BLOCKED
+            if outcome == VerificationOutcome.PASSED:
+                plan.source_fingerprints = self._capture_source_fingerprints(request)
             task.verification_outcome = outcome
             if outcome == VerificationOutcome.PASSED:
                 task.transition(AgentStatus.REVIEWING)
@@ -507,6 +522,54 @@ class VerificationEngine:
                     raise ValueError("Successful mutation record is outside the validated plan scope")
                 _validate_relative(root, execution.target_path, allow_missing=True)
         return root
+
+    @staticmethod
+    def _capture_source_fingerprints(
+        request: VerificationRequest,
+    ) -> dict[str, str]:
+        if request.task.plan is None:
+            return {}
+        plan_paths = (
+            path
+            for step in request.task.plan.steps
+            if set(step.operations) & _MUTATIONS
+            for path in step.paths
+        )
+        execution_paths = (
+            execution.target_path
+            for execution in request.task.executions
+            if execution.status == ExecutionStatus.SUCCEEDED
+            and execution.operation in _MUTATIONS
+            and execution.target_path is not None
+        )
+        context_paths = (
+            item.path
+            for item in request.context.items
+            if item.path is not None
+        ) if request.context is not None else ()
+        paths = tuple(dict.fromkeys((
+            *plan_paths, *execution_paths, *context_paths,
+        )))
+        if not paths:
+            return {}
+        snapshots = request.repository.read_sources(paths[:128], request.cancellation)
+        fingerprints: dict[str, str] = {}
+        for path in paths[:128]:
+            if request.cancellation and request.cancellation.is_set():
+                raise InterruptedError("Verification fingerprint capture cancelled")
+            try:
+                target = _validate_relative(
+                    request.repository.root, path, allow_missing=True,
+                )
+                if not target.exists():
+                    fingerprints[path] = "missing"
+                    continue
+                snapshot = snapshots[path]
+                if snapshot is not None:
+                    fingerprints[path] = snapshot.sha256
+            except (OSError, ValueError):
+                continue
+        return fingerprints
 
     def _build_plan(
         self,

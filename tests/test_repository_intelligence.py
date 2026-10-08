@@ -78,6 +78,23 @@ class RepositoryIndexTests(unittest.TestCase):
         self.assertEqual([row["qualified_name"] for row in implementation["results"]], ["pkg.core.Child"])
         self.assertEqual(implementation["results"][0]["relationship"], "direct_subclass")
 
+    def test_batch_source_reads_share_a_workspace_refresh_and_validate_paths(self) -> None:
+        sources = self.index.read_sources(("pkg/core.py", "missing.py"))
+        source = sources["pkg/core.py"]
+        self.assertIsNotNone(source)
+        assert source is not None
+
+        self.assertEqual(source.path, "pkg/core.py")
+        individual = self.index.read_source("pkg/core.py")
+        self.assertIsNotNone(individual)
+        assert individual is not None
+        self.assertEqual(source.sha256, individual.sha256)
+        self.assertIsNone(sources["missing.py"])
+        with self.assertRaisesRegex(ValueError, "safe workspace-relative"):
+            self.index.read_sources(("../outside.py",))
+        with self.assertRaisesRegex(ValueError, "safe workspace-relative"):
+            self.index.read_sources(("pkg/core.py", "pkg/core.py"))
+
     def test_definitions_references_callers_and_imports_report_static_limits(self) -> None:
         definitions = self.query("find_definition", {"name": "helper"})["results"]
         self.assertEqual(len(definitions), 1)

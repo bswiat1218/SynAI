@@ -371,3 +371,54 @@ dispatch. Recovery marks pending repair work interrupted and uncertain
 executions interrupted; neither the mutation nor verification is replayed
 automatically. Events expose repair lifecycle boundaries without exposing
 hidden reasoning.
+
+## Read-only review engine (Phase 8)
+
+`CodingAgentRuntime.run_review` is a separate, explicit Phase 8 operation. It
+accepts only a task in `REVIEWING` with completed plan steps and a successful,
+current Phase 6 run. The required check results must match that verification
+plan/run, all implementation calls must be settled, and the selected provider,
+model, workspace, and execution backend must still match the task provenance.
+The Phase 6 check requirements are fingerprinted before execution and compared
+again before review so changing a required check to optional cannot silently
+weaken the gate.
+Before model review, the engine compares workspace-relative SHA-256
+fingerprints for every recorded mutation with fingerprints captured when
+Phase 6 completed. Stale or unavailable source, incomplete fingerprint
+coverage, pending executions, context integrity errors, and cancellation
+prevent completion; a new verification run is required after stale changes.
+
+The review request is bounded and reuses the Phase 3 `ContextEngine`. It
+prioritizes the original goal, validated plan, actual changed source and tests,
+repair history, required verification results, and selected conventions. Phase
+3 inclusion reasons, confidence, resolution, limitations, and truncation data
+are retained. Successful Phase 5/7 mutation records provide touched paths and
+summaries. Since earlier phases did not retain pre-change snapshots or complete
+patch previews, the reviewer explicitly receives that limitation and does not
+claim to inspect a complete diff. Changed paths that cannot be safely
+fingerprinted or gathered as indexed source block review instead of being
+silently omitted.
+
+The model receives a dedicated review prompt and an empty tool list. Any
+provider-generated tool call is rejected; review never dispatches filesystem,
+terminal, Git, or other mutation tools. Structured JSON is strictly validated
+against the centralized finding categories, severity, confidence, paths,
+locations, evidence quotes, and plan/execution references. A small configured
+retry bound applies only to malformed review output. Blocking status is
+derived from a material high/critical finding with high confidence and
+validated source or execution evidence; lower-confidence observations remain
+warnings. Categories cover correctness, regression risk, security, plan
+alignment, test integrity, architecture consistency, maintainability, and
+insufficient evidence.
+
+Passing review (`PASSED` or `PASSED_WITH_WARNINGS`) persists a bounded review
+record and transitions `REVIEWING → COMPLETED`. Material supported findings
+produce `CHANGES_REQUESTED` and preserve the task in `REVIEWING`; blocked,
+error, and cancelled reviews are persisted as non-completed outcomes when
+checkpointing is available. No review finding is converted into a Phase 6
+failure or automatically sent through Phase 7. Remediation must follow a
+separately authorized and verified workflow; the reviewer itself never edits
+source. Review limits bound prompt context, files/snippets, findings,
+evidence, response size, retry attempts, duration, and persisted data.
+Interrupted review recovery preserves earlier implementation and verification
+evidence and never resumes a model call or mutation automatically.
