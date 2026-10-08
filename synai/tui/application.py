@@ -510,8 +510,8 @@ class CodingApp(App[None]):
                 runtime=settings.runtime if sandbox else "",
                 container=(self.sandbox.container_id or "") if sandbox else "",
                 uid=self.sandbox.uid if sandbox else os.getuid(),
-                mini_path="/opt/synai/mini.nvim" if sandbox else str(
-                    Path(os.environ.get("SYNAI_MINI_PATH", "~/.local/share/synai/mini.nvim")).expanduser().resolve()),
+                mini_path=str(Path(os.environ["SYNAI_MINI_PATH"]).expanduser().resolve())
+                if not sandbox and os.environ.get("SYNAI_MINI_PATH") else "",
                 shell="/bin/sh" if sandbox else os.environ.get("SHELL", "/bin/sh"),
             )
             if not self.editor.active:
@@ -637,7 +637,16 @@ class CodingApp(App[None]):
                 raise ValueError("Conversation opening cancelled.")
         legacy = session.environment is None
         session.set_environment(self.history.environment_for(session))
+        state_before_recovery = session.state
+        task_status_before_recovery = (
+            session.agent_checkpoint.task.status if session.agent_checkpoint is not None else None
+        )
         Agent.recover(session)
+        if session.agent_checkpoint is not None and (
+            session.state != state_before_recovery
+            or session.agent_checkpoint.task.status != task_status_before_recovery
+        ):
+            self.history.save(session)
         if not await self.switch_session(session, persist=True):
             raise ValueError("Conversation switch cancelled.")
         notice = "History reopened; environment restored. " + (

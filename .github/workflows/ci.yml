@@ -1,4 +1,4 @@
-name: Test and build distributions
+name: Test source checkout
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  distribution:
+  tests:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -19,17 +19,14 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Install build and verification tools
-        run: python -m pip install '.[release]'
-      - name: Build wheel and source archive
-        run: python -m build
-      - name: Check distribution metadata
-        run: python -m twine check --strict dist/*.whl dist/*.tar.gz
-      - name: Verify clean installations and run installed test suite
-        run: python scripts/verify_release.py --run-tests
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: synai-python-${{ matrix.python }}
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
+      - name: Install development dependencies
+        run: python -m pip install -e .
+      - name: Run source test suite
+        run: python -m unittest discover -s tests -v
+      - name: Install graphical editor test prerequisites
+        run: sudo apt-get update && sudo apt-get install -y python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91 xvfb
+      - name: Test graphical editor child from source
+        run: SYNAI_TEST_DESKTOP=1 xvfb-run -a python -m unittest discover -s tests -p 'test_editor.py'
+      - name: Verify bundled editor desktop without external editor dependencies
+        run: |
+          SYNAI_TEST_DESKTOP=1 xvfb-run -a /usr/bin/python3 -m unittest discover -s tests -p 'test_editor_desktop.py'

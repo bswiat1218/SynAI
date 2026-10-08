@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
+from synai.coding_agent.state import AgentCheckpoint
 from synai.config import ConversationEnvironment, Settings
 from synai.models import Activity, GenerationSource, Message, Session, now
 from synai.storage import ConversationStorage, checked_path
@@ -36,6 +37,7 @@ class History:
         return environment
 
     def save(self, session: Session) -> None:
+        self._prepare_agent_checkpoint(session)
         self._validate_environment(session)
         self._attribute_legacy_messages(session)
         if session.schema_version in {2, 3, 4} and session.environment is not None:
@@ -64,22 +66,33 @@ class History:
             if path.is_symlink():
                 raise ValueError("Symlink history files are not supported")
             value = json.loads(path.read_text(encoding="utf-8"))
-            if type(value.get("schema_version")) is not int or value["schema_version"] not in {1, 2, 3, 4, 5}:
+            if type(value.get("schema_version")) is not int or value["schema_version"] not in {1, 2, 3, 4, 5, 6}:
                 raise ValueError("Unsupported history version")
-            if value["schema_version"] in {4, 5} and type(value.get("managed_workspace_created")) is not bool:
+            if value["schema_version"] in {4, 5, 6} and type(value.get("managed_workspace_created")) is not bool:
                 raise ValueError("Managed history requires a workspace-allocation flag")
+            schema_version = value["schema_version"]
+            checkpoint_present = "agent_checkpoint" in value
+            checkpoint_data = value.pop("agent_checkpoint", None)
+            if schema_version == 6:
+                if not checkpoint_present or not isinstance(checkpoint_data, dict):
+                    raise ValueError("Version 6 history requires an agent checkpoint")
+                agent_checkpoint = AgentCheckpoint.from_dict(checkpoint_data)
+            else:
+                if checkpoint_present:
+                    raise ValueError("Agent checkpoint requires history version 6")
+                agent_checkpoint = None
             environment_data = value.pop("environment", None)
             environment = None
             if environment_data is not None:
                 if not isinstance(environment_data, dict):
                     raise ValueError("Invalid conversation environment")
-                if value["schema_version"] < 3:
+                if schema_version < 3:
                     if "execution_mode" in environment_data:
                         raise ValueError("Legacy histories cannot specify execution mode")
                     environment_data["execution_mode"] = "sandbox"
                 elif "execution_mode" not in environment_data:
                     raise ValueError("Version 3 environment requires execution mode")
-                if value["schema_version"] < 5:
+                if schema_version < 5:
                     endpoint = environment_data.pop("ollama_url")
                     timeout = environment_data.pop("request_timeout")
                     replace(self.defaults, ollama_url=endpoint, request_timeout=timeout).validate()
@@ -97,11 +110,14 @@ class History:
                     )) or type(source.legacy) is not bool:
                         raise ValueError("Invalid generation provenance")
                     replace(self.defaults, ollama_url=source.endpoint).validate()
-                elif value["schema_version"] < 5 and item.get("role") == "assistant":
+                elif schema_version < 5 and item.get("role") == "assistant":
                     source = GenerationSource(value["model"], value["endpoint"], legacy=True)
                 messages.append(Message(**item, source=source))
             activity = [Activity(**item) for item in value.pop("activity")]
-            session = Session(**value, messages=messages, activity=activity, environment=environment)
+            session = Session(
+                **value, messages=messages, activity=activity, environment=environment,
+                agent_checkpoint=agent_checkpoint,
+            )
             if self.identifier(path) != session.session_id:
                 raise ValueError("History ID differs from filename")
             if not all(isinstance(field, str) for field in (
@@ -141,8 +157,12 @@ class History:
             replace(self.defaults, **session.limits).validate()
             if session.legacy_request_timeout is not None:
                 replace(self.defaults, request_timeout=session.legacy_request_timeout).validate()
-            if session.schema_version in {2, 3, 4, 5} and session.environment is None:
+            if session.schema_version in {2, 3, 4, 5, 6} and session.environment is None:
                 raise ValueError("Version 2/3 history requires a conversation environment")
+            if session.schema_version == 6 and session.agent_checkpoint is None:
+                raise ValueError("Version 6 history requires an agent checkpoint")
+            if session.schema_version != 6 and session.agent_checkpoint is not None:
+                raise ValueError("Agent checkpoint requires history version 6")
             environment = self.environment_for(session)
             environment.validate()
             if session.schema_version < 3 and environment.execution_mode != "sandbox":
@@ -156,6 +176,20 @@ class History:
                     raise ValueError("Saved environment differs from workspace/limits")
         except (ValueError, TypeError, OverflowError) as exc:
             raise HistoryError(f"Invalid saved environment: {exc}") from exc
+
+    @staticmethod
+    def _prepare_agent_checkpoint(session: Session) -> None:
+        if session.agent_checkpoint is None:
+            if session.schema_version == 6:
+                raise HistoryError("Version 6 history requires an agent checkpoint")
+            return
+        if not isinstance(session.agent_checkpoint, AgentCheckpoint):
+            raise HistoryError("Invalid agent checkpoint")
+        try:
+            session.agent_checkpoint.validate()
+        except ValueError as exc:
+            raise HistoryError(f"Invalid agent checkpoint: {exc}") from exc
+        session.schema_version = 6
 
     @staticmethod
     def _attribute_legacy_messages(session: Session) -> None:
@@ -199,8 +233,8 @@ class ManagedHistory(History):
 
     def _validate_environment(self, session: Session) -> None:
         super()._validate_environment(session)
-        if session.schema_version not in {4, 5} or session.environment is None:
-            raise HistoryError("Managed conversation requires schema version 4/5")
+        if session.schema_version not in {4, 5, 6} or session.environment is None:
+            raise HistoryError("Managed conversation requires schema version 4/5/6")
         if type(session.managed_workspace_created) is not bool:
             raise HistoryError("Invalid workspace-allocation flag")
         try:
@@ -213,6 +247,7 @@ class ManagedHistory(History):
             raise HistoryError(str(exc)) from exc
 
     def save(self, session: Session) -> None:
+        self._prepare_agent_checkpoint(session)
         self._validate_environment(session)
         self._attribute_legacy_messages(session)
         if session.environment is not None:

@@ -11,9 +11,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from synai.editor.bundle import verify_assets
 from synai.editor.protocol import EditorError
 
-ASSETS = ("init.lua", "theme.lua", "supervisor.py")
+ASSETS = ("init.lua", "theme.lua", "supervisor.py", "bundle.py")
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,8 @@ class EditorContext:
             raise EditorError("Editor requires an existing workspace and non-root user")
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", self.session_id):
             raise EditorError("Invalid editor conversation identity")
-        if not Path(self.mini_path).is_absolute() or not Path(self.shell).is_absolute():
+        if ((self.mini_path and not Path(self.mini_path).is_absolute())
+                or not Path(self.shell).is_absolute()):
             raise EditorError("Plugin and shell paths must be absolute")
         if self.mode == "sandbox" and (
             self.runtime not in {"docker", "podman"}
@@ -80,7 +82,7 @@ class EditorContext:
 
 def run(context: EditorContext, *args: str, input_data: bytes | None = None,
         timeout: float = 10) -> str:
-    if args and args[0] == "nvim":
+    if args and (args[0] == "nvim" or args[0].endswith("/bin/nvim")):
         # Remote clients must not fall back to writing .nvimlog in /workspace.
         args = ("env", "NVIM_LOG_FILE=/dev/null", *args)
     try:
@@ -120,41 +122,59 @@ def desktop_python() -> str:
 
 def prepare(context: EditorContext) -> str:
     context.validate()
-    check = (
-        "import os,pathlib,shutil,subprocess,sys,json;"
-        "n=shutil.which('nvim');"
-        "assert n, 'Install Neovim 0.10+ in the selected environment';"
-        "v=subprocess.run([n,'--version'],capture_output=True,text=True,check=True,"
-        "env=dict(os.environ,NVIM_LOG_FILE=os.devnull)).stdout.splitlines()[0];"
-        "import re;m=re.search(r'v(\\d+)\\.(\\d+)',v);"
-        "assert m and tuple(map(int,m.groups())) >= (0,10), 'Neovim 0.10+ required';"
-        "assert pathlib.Path(sys.argv[1],'lua/mini/ai.lua').is_file(), 'Install pinned mini.nvim; see README';"
-        "assert os.path.isfile(sys.argv[2]) and os.access(sys.argv[2],os.X_OK), 'Configured shell is not executable';"
-        "assert os.geteuid()!=0, 'Editor cannot run as root'"
-    )
-    run(context, "python3", "-c", check, context.mini_path, context.shell)
+    vendor = Path(__file__).with_name("vendor")
+    try:
+        metadata = verify_assets(vendor)
+        assets = {name: Path(__file__).with_name(name).read_text(encoding="utf-8") for name in ASSETS}
+        assets["runtime.json"] = json.dumps(metadata)
+        runtime_data = b"".join((vendor / asset["name"]).read_bytes() for asset in metadata["assets"])
+    except (ValueError, OSError) as exc:
+        raise EditorError(f"Bundled editor is incomplete or corrupt; reinstall SynAI: {exc}") from exc
     if context.mode == "host":
         directory = tempfile.mkdtemp(prefix="synai-editor-")
     else:
         directory = f"/tmp/synai-editor-{uuid4().hex}"
-    assets = {name: Path(__file__).with_name(name).read_text(encoding="utf-8") for name in ASSETS}
     staging = (
-        "import json,os,pathlib,sys;"
-        "data=json.load(sys.stdin);p=pathlib.Path(sys.argv[1]);"
-        "p.mkdir(mode=0o700,exist_ok=" + ("True" if context.mode == "host" else "False") + ");"
-        "os.chmod(p,0o700);"
-        "[(p/k).write_text(v,encoding='utf-8') for k,v in data.items()];"
-        "(p/'swap').mkdir(mode=0o700)"
+        "import json,os,pathlib,shutil,sys\n"
+        "data=json.load(sys.stdin);p=pathlib.Path(sys.argv[1])\n"
+        "assert os.geteuid()!=0, 'Editor cannot run as root'\n"
+        "p.mkdir(mode=0o700,exist_ok=" + ("True" if context.mode == "host" else "False") + ")\n"
+        "try:\n"
+        " os.chmod(p,0o700)\n"
+        " for k,v in data.items(): (p/k).write_text(v,encoding='utf-8')\n"
+        " (p/'swap').mkdir(mode=0o700)\n"
+        "except OSError:\n"
+        " shutil.rmtree(p)\n"
+        " raise\n"
     )
+    staged = False
     try:
         run(context, "python3", "-c", staging, directory,
             input_data=json.dumps(assets).encode())
-    except EditorError:
-        if context.mode == "host":
+        staged = True
+        run(context, "python3", str(Path(directory) / "bundle.py"), directory,
+            input_data=runtime_data,
+            timeout=30)
+        check = (
+            "import os,pathlib,sys;"
+            "assert pathlib.Path(sys.argv[1],'lua/mini/ai.lua').is_file(), "
+            "'Configured mini.nvim override is missing; unset SYNAI_MINI_PATH to use the bundled plugin';"
+            "assert os.path.isfile(sys.argv[2]) and os.access(sys.argv[2],os.X_OK), "
+            "'Configured shell is not executable';"
+            "assert os.geteuid()!=0, 'Editor cannot run as root'"
+        )
+        run(context, "python3", "-c", check,
+            context.mini_path or str(Path(directory) / "mini.nvim"), context.shell)
+    except (EditorError, OSError):
+        if context.mode == "host" and Path(directory).exists():
             shutil.rmtree(directory)
+        elif staged:
+            run(context, "python3", "-c",
+                "import pathlib,shutil,sys;p=pathlib.Path(sys.argv[1]);"
+                "shutil.rmtree(p) if p.exists() else None", directory)
         raise
     return directory
 
 
 def cleanup(context: EditorContext, directory: str) -> None:
-    run(context, "python3", str(Path(directory) / "supervisor.py"), "cleanup", directory)
+    run(context, "python3", str(Path(directory) / "supervisor.py"), "cleanup", directory, timeout=30)

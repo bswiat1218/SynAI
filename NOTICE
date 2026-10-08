@@ -1,8 +1,0 @@
-SynAI
-Copyright 2026 SynAI contributors
-
-Licensed under the Apache License, Version 2.0.
-
-Neovim, mini.nvim, GTK, VTE, Ollama, and container runtimes are separate
-components, not bundled in this Python distribution. They remain subject
-to their respective licenses.

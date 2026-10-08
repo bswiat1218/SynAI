@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 
-@unittest.skipUnless(os.environ.get("SYNAI_TEST_DESKTOP") and os.environ.get("SYNAI_TEST_MINI_PATH"),
+@unittest.skipUnless(os.environ.get("SYNAI_TEST_DESKTOP"),
                      "Run with system Python under a desktop/Xvfb and SYNAI_TEST_DESKTOP=1")
 class DesktopIntegrationTests(unittest.TestCase):
     @classmethod
@@ -51,8 +51,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         return Path(self.root.name)
 
     def make_context(self, context_type):
-        return context_type("desktop-test", str(self.workspace), "host", uid=os.getuid(),
-                            mini_path=os.environ["SYNAI_TEST_MINI_PATH"])
+        return context_type("desktop-test", str(self.workspace), "host", uid=os.getuid())
 
     def wait(self, condition, timeout: float = 25) -> None:
         end = time.monotonic() + timeout
@@ -104,7 +103,7 @@ class DesktopIntegrationTests(unittest.TestCase):
             node = desktop.tree_store.iter_next(node)
             self.assertIsNotNone(node)
         desktop.activate_file(desktop.tree, desktop.tree_store.get_path(node), None)
-        self.wait(lambda: run(desktop.context, "nvim", "--server", desktop.nvim.socket,
+        self.wait(lambda: run(desktop.context, desktop.nvim.binary, "--server", desktop.nvim.socket,
                               "--remote-expr", "expand('%:p')").strip()
                   == desktop.context.file_path(str(self.file)))
         desktop.terminal.feed_child(b"printf ready > terminal-ready\n")
@@ -114,7 +113,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         desktop.receive({"type": "theme", "id": 2, "palette": colors})
         self.wait(lambda: any(message.get("id") == 2 for message in self.messages))
         self.assertEqual(desktop.colors, colors)
-        self.assertEqual(run(desktop.context, "nvim", "--server", desktop.nvim.socket,
+        self.assertEqual(run(desktop.context, desktop.nvim.binary, "--server", desktop.nvim.socket,
                              "--remote-expr", "&background").strip(), "light")
         desktop.receive({"type": "focus", "id": 3})
         self.assertTrue(any(message.get("id") == 3 for message in self.messages))
@@ -128,7 +127,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         from synai.editor.environment import run
         desktop = self.desktop
         desktop.nvim.call("open", {"path": desktop.context.file_path(str(self.file))})
-        run(desktop.context, "nvim", "--server", desktop.nvim.socket, "--remote-expr",
+        run(desktop.context, desktop.nvim.binary, "--server", desktop.nvim.socket, "--remote-expr",
             "luaeval('vim.api.nvim_buf_set_lines(0,0,-1,false,{\"saved from GUI\"})')")
         self.respond(self.Gtk.ResponseType.CANCEL)
         desktop.close(5)
@@ -144,7 +143,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         from synai.editor.environment import run
         desktop = self.desktop
         desktop.nvim.call("open", {"path": desktop.context.file_path(str(self.file))})
-        run(desktop.context, "nvim", "--server", desktop.nvim.socket, "--remote-expr",
+        run(desktop.context, desktop.nvim.binary, "--server", desktop.nvim.socket, "--remote-expr",
             "luaeval('vim.api.nvim_buf_set_lines(0,0,-1,false,{\"discard me\"})')")
         desktop.terminal.feed_child(b"sleep 120\n")
         self.wait(lambda: bool(desktop.nvim.jobs()))
@@ -165,7 +164,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         from synai.editor.environment import run
         desktop = self.desktop
         desktop.nvim.call("open", {"path": desktop.context.file_path(str(self.file))})
-        run(desktop.context, "nvim", "--server", desktop.nvim.socket, "--remote-expr",
+        run(desktop.context, desktop.nvim.binary, "--server", desktop.nvim.socket, "--remote-expr",
             "luaeval('vim.api.nvim_buf_set_lines(0,0,-1,false,{\"must not lose\"})')")
         self.file.chmod(0o444)
         self.workspace.chmod(0o500)
@@ -186,7 +185,7 @@ class DesktopIntegrationTests(unittest.TestCase):
         from synai.editor.environment import run
         desktop = self.desktop
         desktop.nvim.call("open", {"path": desktop.context.file_path(str(self.file))})
-        run(desktop.context, "nvim", "--server", desktop.nvim.socket, "--remote-expr",
+        run(desktop.context, desktop.nvim.binary, "--server", desktop.nvim.socket, "--remote-expr",
             "luaeval('vim.api.nvim_buf_set_lines(0,0,-1,false,{\"recover me\"})')")
         self.respond(self.Gtk.ResponseType.CANCEL)
         desktop.parent_eof()
@@ -234,7 +233,7 @@ class SandboxDesktopIntegrationTests(DesktopIntegrationTests):
     def make_context(self, context_type):
         return context_type(
             self.identifier, str(self.workspace), "sandbox", self.sandbox.settings.runtime,
-            self.sandbox.container_id, self.sandbox.uid, "/opt/synai/mini.nvim")
+            self.sandbox.container_id, self.sandbox.uid)
 
     def test_container_loss_reports_failure_without_host_fallback(self) -> None:
         import asyncio

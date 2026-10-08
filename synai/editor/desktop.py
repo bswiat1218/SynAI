@@ -201,12 +201,11 @@ class Desktop:
         self.window.show_all()
         self.refresh()
         for role, terminal in (("nvim", self.editor), ("shell", self.terminal)):
+            # VTE's GI binding needs positional arguments, including child_setup_data.
             terminal.spawn_async(
-                pty_flags=Vte.PtyFlags.DEFAULT, working_directory=context.workspace,
-                argv=self.nvim.spawn(role),
-                envv=["TERM=xterm-256color", "COLORTERM=truecolor", "NVIM=", "NVIM_LISTEN_ADDRESS="],
-                spawn_flags=GLib.SpawnFlags.SEARCH_PATH, child_setup=None,
-                timeout=-1, cancellable=None, callback=self.on_spawn, user_data=role,
+                Vte.PtyFlags.DEFAULT, context.workspace, self.nvim.spawn(role),
+                ["TERM=xterm-256color", "COLORTERM=truecolor", "NVIM=", "NVIM_LISTEN_ADDRESS="],
+                GLib.SpawnFlags.SEARCH_PATH, None, None, -1, None, self.on_spawn, role,
             )
 
     def on_spawn(self, terminal, pid: int, error, role: str) -> None:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import tempfile
 import time
@@ -14,17 +13,15 @@ from synai.editor.neovim import Neovim
 from synai.editor.protocol import EditorError
 
 
-@unittest.skipUnless(shutil.which("nvim") and os.environ.get("SYNAI_TEST_MINI_PATH"),
-                     "Set SYNAI_TEST_MINI_PATH to installed pinned mini.nvim for real Neovim tests")
 class NeovimIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.workspace = tempfile.TemporaryDirectory()
         self.context = EditorContext("integration", self.workspace.name, "host",
-                                     uid=os.getuid(), mini_path=os.environ["SYNAI_TEST_MINI_PATH"])
+                                     uid=os.getuid())
         self.directory = prepare(self.context)
         self.nvim = Neovim(self.context, self.directory)
         command = self.nvim.spawn("nvim")
-        command.insert(command.index("nvim", command.index("env") + 1) + 1, "--headless")
+        command.insert(command.index(self.nvim.binary) + 1, "--headless")
         self.process = subprocess.Popen(
             command, start_new_session=True, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -46,7 +43,7 @@ class NeovimIntegrationTests(unittest.TestCase):
         self.workspace.cleanup()
 
     def query(self, expression: str):
-        return json.loads(run(self.context, "nvim", "--server", self.nvim.socket,
+        return json.loads(run(self.context, self.nvim.binary, "--server", self.nvim.socket,
                               "--remote-expr", f"json_encode({expression})"))
 
     def test_modules_and_exact_light_dark_highlights(self) -> None:
@@ -71,7 +68,7 @@ class NeovimIntegrationTests(unittest.TestCase):
         first.write_text("original\n")
         self.nvim.call("open", {"path": str(first)})
         self.assertEqual(self.query("expand('%:p')"), str(first))
-        run(self.context, "nvim", "--server", self.nvim.socket, "--remote-expr",
+        run(self.context, self.nvim.binary, "--server", self.nvim.socket, "--remote-expr",
             "luaeval('vim.api.nvim_buf_set_lines(0, 0, -1, false, {\"edited\"})')")
         second = root / "second-\u03bb.py"
         second.write_text("second\n")
@@ -84,7 +81,7 @@ class NeovimIntegrationTests(unittest.TestCase):
         self.assertFalse(self.nvim.call("state")["modified"])
 
     def test_unnamed_buffer_save_destination_and_save_error(self) -> None:
-        run(self.context, "nvim", "--server", self.nvim.socket, "--remote-expr",
+        run(self.context, self.nvim.binary, "--server", self.nvim.socket, "--remote-expr",
             "luaeval('vim.api.nvim_buf_set_lines(0, 0, -1, false, {\"new contents\"})')")
         modified = self.nvim.call("state")["modified"]
         self.assertEqual(modified[0]["name"], "")

@@ -47,15 +47,8 @@ class Agent:
             self.history.save(session)
             while True:
                 enabled = model.tools and self.tools.sandbox.matches(session)
-                wire_messages = list(session.messages)
                 mode = session.environment.execution_mode if session.environment else "sandbox"
-                wire_messages.insert(1 if wire_messages and wire_messages[0].role == "system" else 0, Message("system", (
-                    f"Current execution environment: {mode}; workspace: {session.workspace}. "
-                    + ("Host tools are NOT isolated. Never access outside the workspace or escalate privileges. "
-                       "Use workspace-relative file paths; terminal cwd is the host workspace. "
-                       if mode == "host" else "Container tool workspace is /workspace. ")
-                    + ("Tools are enabled with individual action approvals." if enabled else "Tools are disconnected; chat only.")
-                )))
+                wire_messages = self._request_messages(session, mode, enabled)
                 current = Message("assistant", status="streaming", source=GenerationSource(
                     session.model, self.connection_endpoint or session.endpoint,
                 ))
@@ -108,7 +101,7 @@ class Agent:
                     session.activity.append(Activity("tool", f"{name}: {json.dumps(arguments, ensure_ascii=True)}"))
                     self.history.save(session)
                     await self.update()
-                    result = await self.tools.call(name, arguments)
+                    result = await self.tools.call(name, arguments, session=session)
                     text = json.dumps(result, ensure_ascii=True)
                     session.messages.append(Message("tool", text, tool_name=name))
                     session.activity.append(Activity("result", f"{name}: {text}"))
@@ -134,6 +127,20 @@ class Agent:
             await self.update()
 
     @staticmethod
+    def _request_messages(session: Session, mode: str, enabled: bool) -> list[Message]:
+        """Build model-only environment context without changing persisted history."""
+        messages = list(session.messages)
+        environment = Message("system", (
+            f"Current execution environment: {mode}; workspace: {session.workspace}. "
+            + ("Host tools are NOT isolated. Never access outside the workspace or escalate privileges. "
+               "Use workspace-relative file paths; terminal cwd is the host workspace. "
+               if mode == "host" else "Container tool workspace is /workspace. ")
+            + ("Tools are enabled with individual action approvals." if enabled else "Tools are disconnected; chat only.")
+        ))
+        messages.insert(1 if messages and messages[0].role == "system" else 0, environment)
+        return messages
+
+    @staticmethod
     def _resolve_pending(session: Session, assistant: Message) -> None:
         offset = next(index for index, message in enumerate(session.messages) if message is assistant)
         completed = sum(message.role == "tool" for message in session.messages[offset + 1:])
@@ -154,3 +161,9 @@ class Agent:
                     Agent._resolve_pending(session, message)
                     break
             session.activity.append(Activity("resume", "Interrupted turn recovered without replaying actions"))
+        if session.agent_checkpoint is not None:
+            task_recovered = session.agent_checkpoint.recover_interrupted()
+            if task_recovered:
+                session.activity.append(Activity(
+                    "resume", "Interrupted coding-agent task recovered; uncertain operations were not replayed",
+                ))

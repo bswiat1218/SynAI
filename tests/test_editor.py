@@ -116,16 +116,15 @@ class EditorManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(manager.active)
 
 
-@unittest.skipUnless(os.environ.get("SYNAI_TEST_DESKTOP") and os.environ.get("SYNAI_TEST_MINI_PATH"),
-                     "Run under a desktop/Xvfb with installed test mini.nvim")
+@unittest.skipUnless(os.environ.get("SYNAI_TEST_DESKTOP"),
+                     "Run under a desktop/Xvfb with SYNAI_TEST_DESKTOP=1")
 class EditorChildIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_child_handshake_focus_theme_and_close(self) -> None:
         reports = []
         manager = EditorManager(lambda message, error: reports.append((message, error)))
         with tempfile.TemporaryDirectory() as directory:
             context = EditorContext(
-                "child-test", directory, "host", uid=os.getuid(),
-                mini_path=os.environ["SYNAI_TEST_MINI_PATH"])
+                "child-test", directory, "host", uid=os.getuid())
             try:
                 await manager.launch(context, colors())
                 self.assertTrue(manager.active)
@@ -156,8 +155,7 @@ class EditorChildIntegrationTests(unittest.IsolatedAsyncioTestCase):
         manager = EditorManager(lambda _message, _error: None)
         with tempfile.TemporaryDirectory() as directory:
             context = EditorContext(
-                "child-test", directory, "host", uid=os.getuid(),
-                mini_path=os.environ["SYNAI_TEST_MINI_PATH"])
+                "child-test", directory, "host", uid=os.getuid())
             await manager.launch(context, colors())
             await manager.parent_shutdown()
             await asyncio.wait_for(manager.process.wait(), 15)
@@ -208,6 +206,7 @@ class EditorApplicationTests(unittest.IsolatedAsyncioTestCase):
                     context, initial = launch.call_args.args
                     self.assertEqual(context.mode, "host")
                     self.assertEqual(context.workspace, str(workspace))
+                    self.assertEqual(context.mini_path, "")
                     self.assertEqual(palette(initial), initial)
                     if not isinstance(app.screen, MainMenu):
                         await pilot.press("f2")

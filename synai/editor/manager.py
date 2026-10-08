@@ -47,7 +47,7 @@ class EditorManager:
             )
             self.reader = asyncio.create_task(self.read_messages())
             self.errors = asyncio.create_task(self.read_errors())
-            ready = await self.request("launch", context=context.payload(), palette=palette(colors), timeout=40)
+            ready = await self.request("launch", context=context.payload(), palette=palette(colors), timeout=60)
             self.recovery_directory = str(ready.get("recovery", ""))
         except (OSError, EditorError, TimeoutError) as exc:
             await self.abort_startup()

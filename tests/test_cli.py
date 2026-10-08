@@ -41,7 +41,9 @@ class CliTests(unittest.TestCase):
             main(["--print-editor-image-recipe"])
         self.assertEqual(output.getvalue(), files("synai.editor").joinpath(
             "sandbox-editor.Dockerfile").read_text(encoding="utf-8"))
-        self.assertIn("94cae4660a8b2d95dbbd56e1fbc6fcfa2716d152", output.getvalue())
+        self.assertIn("FROM python:3.12-slim-bookworm", output.getvalue())
+        self.assertNotIn("apt-get", output.getvalue())
+        self.assertNotIn("git clone", output.getvalue())
 
     def test_version_uses_authoritative_package_version(self) -> None:
         output = io.StringIO()

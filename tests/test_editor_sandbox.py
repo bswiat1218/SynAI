@@ -38,12 +38,12 @@ class SandboxEditorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(sandbox.healthy)
                 context = EditorContext(
                     identifier, str(workspace), "sandbox", settings.runtime,
-                    sandbox.container_id, sandbox.uid, "/opt/synai/mini.nvim")
+                    sandbox.container_id, sandbox.uid)
                 staging = await asyncio.to_thread(prepare, context)
                 nvim = Neovim(context, staging)
                 command = nvim.spawn("nvim")
                 command[command.index("-it")] = "-i"
-                command.insert(command.index("nvim", command.index("env") + 1) + 1, "--headless")
+                command.insert(command.index(nvim.binary) + 1, "--headless")
                 process = subprocess.Popen(command, stdin=subprocess.PIPE,
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 try:
@@ -58,14 +58,14 @@ class SandboxEditorIntegrationTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.sleep(0.1)
                     await asyncio.to_thread(nvim.call, "open", {"path": context.file_path(str(file))})
                     opened = await asyncio.to_thread(
-                        run, context, "nvim", "--server", nvim.socket, "--remote-expr", "expand('%:p')")
+                        run, context, nvim.binary, "--server", nvim.socket, "--remote-expr", "expand('%:p')")
                     self.assertEqual(opened.strip(), "/workspace/sandbox file.py")
                     identity = json.loads(await asyncio.to_thread(
                         run, context, "python3", "-c",
                         "import os,json;print(json.dumps([os.geteuid(),os.getcwd()]))"))
                     self.assertEqual(identity, [sandbox.uid, "/workspace"])
                     await asyncio.to_thread(
-                        run, context, "nvim", "--server", nvim.socket, "--remote-expr",
+                        run, context, nvim.binary, "--server", nvim.socket, "--remote-expr",
                         "luaeval('vim.api.nvim_buf_set_lines(0,0,-1,false,{\"sandbox edited\"})')")
                     await asyncio.to_thread(nvim.call, "save")
                     self.assertEqual(file.read_text(), "sandbox edited\n")

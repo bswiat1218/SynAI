@@ -1,0 +1,29 @@
+{
+  "platform": "manylinux_2_34_x86_64",
+  "neovim_version": "0.11.5",
+  "mini_commit": "94cae4660a8b2d95dbbd56e1fbc6fcfa2716d152",
+  "assets": [
+    {
+      "name": "nvim-linux-x86_64.tar.gz",
+      "url": "https://github.com/neovim/neovim/releases/download/v0.11.5/nvim-linux-x86_64.tar.gz",
+      "sha256": "b2f91117be5b5ea39edd7297156dc2a4a8df4add6c95a90809a8df19e7ab6f52",
+      "size": 10973811,
+      "root": "nvim-linux-x86_64",
+      "destination": "nvim-linux-x86_64"
+    },
+    {
+      "name": "mini.nvim.tar.gz",
+      "url": "https://codeload.github.com/nvim-mini/mini.nvim/tar.gz/94cae4660a8b2d95dbbd56e1fbc6fcfa2716d152",
+      "sha256": "9919c5646c3a950cb32c0feba524235a51da427c487b78690ef16411c9544c92",
+      "size": 1777279,
+      "root": "mini.nvim-94cae4660a8b2d95dbbd56e1fbc6fcfa2716d152",
+      "destination": "mini.nvim"
+    },
+    {
+      "name": "neovim-LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/neovim/neovim/v0.11.5/LICENSE.txt",
+      "sha256": "e1ff044cabc90a87faf9356618a5c43078c020c3c5e98a4dee570dd098da043d",
+      "size": 16050
+    }
+  ]
+}

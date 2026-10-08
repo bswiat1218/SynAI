@@ -22,18 +22,19 @@ class Neovim:
         self.context = context
         self.directory = directory
         self.socket = str(Path(directory) / "nvim.sock")
+        self.binary = str(Path(directory) / "nvim-linux-x86_64/bin/nvim")
 
     def spawn(self, role: str) -> list[str]:
         if role == "nvim":
             args = [
                 "env", f"SYNAI_EDITOR_DIR={self.directory}",
-                f"SYNAI_MINI_PATH={self.context.mini_path}",
+                f"SYNAI_MINI_PATH={self.context.mini_path or str(Path(self.directory) / 'mini.nvim')}",
                 f"NVIM_LOG_FILE={self.directory}/nvim.log",
                 f"XDG_CONFIG_HOME={self.directory}/config",
                 f"XDG_DATA_HOME={self.directory}/data",
                 f"XDG_STATE_HOME={self.directory}/state",
                 f"XDG_CACHE_HOME={self.directory}/cache",
-                "nvim", "--noplugin", "-u", str(Path(self.directory) / "init.lua"),
+                self.binary, "--noplugin", "-u", str(Path(self.directory) / "init.lua"),
                 "--listen", self.socket, "-i", "NONE",
             ]
         else:
@@ -45,7 +46,7 @@ class Neovim:
 
     def call(self, operation: str, data: dict[str, Any] | None = None) -> dict[str, Any]:
         output = run(
-            self.context, "nvim", "--server", self.socket,
+            self.context, self.binary, "--server", self.socket,
             "--remote-expr", expression(operation, data or {}),
         )
         try:

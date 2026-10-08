@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import uuid4
 
+from synai.coding_agent.state import AgentCheckpoint
 from synai.config import ConversationEnvironment
 
 
@@ -83,11 +84,12 @@ class Session:
     environment: ConversationEnvironment | None = None
     managed_workspace_created: bool = False
     legacy_request_timeout: float | None = None
+    agent_checkpoint: AgentCheckpoint | None = None
 
     def set_environment(self, environment: ConversationEnvironment) -> None:
         environment.validate()
         self.environment = environment
-        self.schema_version = 5
+        self.schema_version = 6 if self.agent_checkpoint is not None else 5
         self.workspace = environment.workspace
         self.limits = {
             "command_timeout": environment.command_timeout, "output_bytes": environment.output_bytes,
@@ -95,4 +97,7 @@ class Session:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        if self.agent_checkpoint is None:
+            result.pop("agent_checkpoint")
+        return result

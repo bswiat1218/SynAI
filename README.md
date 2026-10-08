@@ -4,35 +4,14 @@
 
 This replaces the old benchmark CLI. `list-models`, `run`, and `run-all` are no longer commands. Existing `prompts/` and `results/` files are preserved, but are not automatically imported, run, or sent to the model.
 
-## Install and launch
+## Develop and launch from source
 
-SynAI **0.3.0** supports **Linux**, **Python 3.12+**, and an interactive terminal.
-Ollama can run locally or at a trusted remote endpoint. GTK, Neovim, and a
-container runtime are not required for chat-only startup.
-
-Install the verified local wheel with pipx (installed separately by your Linux
-distribution or Python tooling):
-
-```sh
-pipx install --python python3.12 ./dist/synai-0.3.0-py3-none-any.whl
-synai --version
-synai
-```
-
-Alternatively, use a dedicated virtual environment:
-
-```sh
-python3 -m venv ~/.local/share/synai-venv
-~/.local/share/synai-venv/bin/python -m pip install ./dist/synai-0.3.0-py3-none-any.whl
-~/.local/share/synai-venv/bin/synai
-```
-
-After a maintainer publishes this version to PyPI, index installation will be
-`pipx install --python python3.12 synai==0.3.0`. This repository's build process
-does not publish it automatically. `python -m synai` is an equivalent launcher
-when using an interpreter with SynAI installed. `--help`, `--version`, and
-`--print-editor-image-recipe` exit without initializing storage or contacting
-Ollama.
+SynAI is a **work in progress**, not a published release or distribution.
+Run it from this source checkout using **Python 3.12+**, Linux, and an interactive
+terminal. The bundled editor targets **Linux x86_64/glibc 2.34+**.
+Neovim and mini.nvim assets are included in the repository. Ollama can run
+locally or at a trusted remote endpoint. GTK and a container runtime are not
+required for chat-only startup.
 
 For development in VS Code, open a terminal in this checkout:
 
@@ -42,13 +21,17 @@ python3 -m venv .venv
 .venv/bin/synai
 ```
 
-`python app.py` remains a source-checkout compatibility launcher. Runtime code
-now lives under `synai`; generic internal imports such as `from config import
-Settings` are not installed APIs.
+`.venv/bin/python -m synai` is an equivalent launcher; `.venv/bin/python app.py`
+remains a source-checkout compatibility launcher. Runtime code lives under
+`synai`; generic internal imports such as `from config import Settings` are not
+supported APIs. `--help`, `--version`, and `--print-editor-image-recipe` exit
+without initializing storage or contacting Ollama. The version is a development
+identifier, not a published release.
 
-Use pipx's upgrade/reinstall commands, or install a newer wheel into the same
-dedicated venv, to upgrade. Uninstalling the Python package does **not** delete
-private conversations or preferences in `~/.synai`.
+After updating the checkout, rerun `.venv/bin/python -m pip install -e .` when
+dependencies or console scripts change. Editable installation is for development,
+not a release build. This does not delete private conversations or preferences
+in `~/.synai`.
 
 SynAI opens on its main menu. Set your Ollama server in **CONNECTION SETTINGS** if needed, then choose **NEW CONVERSATION**, review its environment, choose **NEXT**, select a model from the shared connection, and choose **CREATE CONVERSATION**. Use **CONVERSATIONS** to reopen or delete saved chats. Highlight a row with the arrows and press **Enter** or **OPEN** to restore its execution environment. Launching, configuring drafts, refreshing models, and browsing the menu do not create empty histories.
 
@@ -109,7 +92,10 @@ Use F3 to return to typing after scrolling logs. Pane shortcuts do not change fo
 
 **F7**, or **F2 / WORKSPACE EDITOR**, opens a separate SynAI-owned Linux desktop window and requests maximization. It contains a persistent file/folder tree, Neovim with **mini.nvim**, and a resizable interactive terminal below the editor. The desktop window manager controls maximization and focus requests. A local graphical display is required; SSH/headless sessions without a usable display get an explicit error.
 
-The editor is optional: normal SynAI startup does not import GTK or require Neovim. On Debian/Ubuntu, install the desktop integration explicitly:
+The editor is optional: normal SynAI startup does not import GTK or start Neovim.
+SynAI includes pinned Neovim **0.11.5**, its runtime, and mini.nvim **v0.16.0**.
+Neither needs a system installation or a plugin directory in your home folder.
+On Debian/Ubuntu, install the remaining desktop integration explicitly:
 
 ```sh
 sudo apt-get install python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
@@ -117,19 +103,26 @@ sudo apt-get install python3-gi gir1.2-gtk-3.0 gir1.2-vte-2.91
 
 SynAI checks its current Python and then `/usr/bin/python3` for Python 3.9+, GTK3/VTE, and a reachable display. The child entry point can use system Python independently of SynAI's virtual environment; do not recreate your existing virtual environment just to expose GTK. SynAI itself still requires Python 3.12+.
 
-For **host-mode** editing, install **Neovim 0.10 or newer** and put mini.nvim **v0.16.0** at the default path. Older distributions may need an explicit Neovim upgrade; SynAI will not download one on launch.
+For **host-mode** editing, SynAI verifies and extracts its packaged editor into
+private temporary storage before opening the window. Startup and remote editor
+commands use that exact binary, not `nvim` on PATH. Nothing is downloaded or
+installed on launch. The selected environment needs Linux x86_64, glibc 2.34+,
+`libgcc_s.so.1`, and executable temporary storage with room for the runtime and
+at least 32 MiB of additional space. ARM64 and Alpine/musl are not supported by
+this bundled editor runtime; incompatibility is reported rather than hidden.
 
-```sh
-mkdir -p ~/.local/share/synai
-git clone --depth 1 --branch v0.16.0 https://github.com/nvim-mini/mini.nvim.git \
-  ~/.local/share/synai/mini.nvim
-git -C ~/.local/share/synai/mini.nvim rev-parse HEAD
-# Expected release commit: 94cae4660a8b2d95dbbd56e1fbc6fcfa2716d152
-```
+`SYNAI_MINI_PATH` is an optional host-only plugin-directory override. Leave it
+unset to use the bundled mini.nvim. An invalid override is an explicit error.
+The host terminal uses `$SHELL`, or `/bin/sh` when unset. Missing or non-executable
+shells are errors, not an environment fallback.
 
-Set `SYNAI_MINI_PATH` to an absolute plugin directory if installed elsewhere. The host terminal uses `$SHELL`, or `/bin/sh` when unset. Missing or non-executable shells are errors, not an environment fallback.
-
-For **sandbox-mode** editing, **both Neovim and the terminal run inside the conversation's validated, attached sandbox**, with its numeric non-root user, `/workspace` working directory, and existing resource limits. The default `python:3.12-slim` image is not editor-ready. Build the example image explicitly:
+For **sandbox-mode** editing, **both Neovim and the terminal run inside the
+conversation's validated, attached sandbox**, with its numeric non-root user,
+`/workspace` working directory, and existing resource limits. SynAI streams the
+same packaged runtime into private `/tmp` storage there. A compatible ordinary
+Python sandbox does not need Neovim or mini.nvim preinstalled. The default
+`python:3.12-slim` image is compatible when it targets x86_64/glibc 2.34+.
+For an explicit Debian-based example, build the minimal recipe:
 
 ```sh
 mkdir -p synai-editor-build
@@ -137,11 +130,17 @@ synai --print-editor-image-recipe > synai-editor-build/Dockerfile
 docker build -t synai-editor:local synai-editor-build
 ```
 
-For Podman, use `podman build` instead. Set this image in the conversation's sandbox settings, create or attach the sandbox through the normal approved workflow, then press F7. The recipe pins mini.nvim's release commit at `/opt/synai/mini.nvim`; it verifies Neovim 0.10+ during the build. There are no extra workspace mounts, automatic container starts, plugin downloads, or installs on editor launch. A missing, mismatched, or unavailable sandbox blocks launch; it **never opens a host shell instead**.
+For Podman, use `podman build` instead. Set this image in the conversation's
+sandbox settings, create or attach the sandbox through the normal approved
+workflow, then press F7. There are no extra workspace mounts, automatic container
+starts, plugin downloads, or installs on editor launch. Existing sandbox limits
+are not increased; insufficient temporary space or a non-executable `/tmp`
+blocks launch. A missing, mismatched, incompatible, or unavailable sandbox
+blocks launch; it **never opens a host shell instead**.
 
 Use a dedicated build directory containing only the exported Dockerfile, never
 your project or private conversation storage as a build context. Recipe printing
-does not run Docker/Podman. The canonical recipe ships in the wheel at
+does not run Docker/Podman. The canonical recipe lives in the source checkout at
 `synai/editor/sandbox-editor.Dockerfile`.
 
 Opening the editor requires deliberate consent. Manual editing and interactive shell commands are **human-driven operations, not AI tool calls**: they do not receive per-command approvals or the noninteractive tool helper's command timeout/output budget. Host mode is prominently labeled **HOST // NOT ISOLATED** and has your account's access. Sandbox mode retains the selected container's restrictions. Opening the editor does not authorize AI host tools.
@@ -157,21 +156,28 @@ Opening the editor requires deliberate consent. Manual editing and interactive s
 
 No sidebar rename/delete UI, automatic language-server installation, or plugin-manager UI is included.
 
-Editor tests follow the existing unittest suite. Real integration tests are opt-in:
+Editor tests follow the existing unittest suite. Bundled headless Neovim tests
+run normally, without any external editor installation:
 
 ```sh
-SYNAI_TEST_MINI_PATH="$HOME/.local/share/synai/mini.nvim" \
-  .venv/bin/python -m unittest discover -s tests -p 'test_editor*.py'
+.venv/bin/python -m unittest discover -s tests -p 'test_editor*.py'
 ```
 
 For graphical tests, use system Python with GTK and a desktop, or `xvfb-run`:
 
 ```sh
-SYNAI_TEST_DESKTOP=1 SYNAI_TEST_MINI_PATH="$HOME/.local/share/synai/mini.nvim" \
+SYNAI_TEST_DESKTOP=1 \
+  xvfb-run -a .venv/bin/python -m unittest discover -s tests -p 'test_editor.py'
+SYNAI_TEST_DESKTOP=1 \
   xvfb-run -a /usr/bin/python3 -m unittest discover -s tests -p 'test_editor_desktop.py'
 ```
 
-Set `SYNAI_TEST_WINDOW_MANAGER=/usr/bin/xfwm4` when available to verify the actual maximized window state under Xvfb. Only after approving temporary container creation, set `SYNAI_TEST_EDITOR_IMAGE=synai-editor:local` to also exercise restricted sandbox Neovim and desktop PTYs. Tests remove the containers they create, never unrelated containers.
+Set `SYNAI_TEST_WINDOW_MANAGER=/usr/bin/xfwm4` when available to verify the actual
+maximized window state under Xvfb. Only after approving temporary container
+creation, set `SYNAI_TEST_EDITOR_IMAGE=python:3.12-slim-bookworm` (already pulled)
+to also exercise restricted sandbox Neovim and desktop PTYs without an
+editor-ready image. Tests remove the containers they create, never unrelated
+containers.
 
 Arrow navigation skips hidden and disabled controls and scrolls the destination into view. Within a scrollable menu body, it prefers controls in that body before moving out to footer actions, so offscreen fields are not skipped. In configuration, focusing a page button immediately opens that page, whether reached with arrows, Tab or mouse. Page focus preserves drafts and never saves settings or approves an action.
 
@@ -249,7 +255,7 @@ Replies are labeled with the exact model that generated them (including tags suc
 
 Activity timestamps show local clock time; original UTC timestamps, raw native tool arguments/results and full bounded output stay unchanged in JSON history. Shortened previews are labeled. Older saved chats use the same readable view; unrecognized or malformed entries are explicitly shown as unformatted rather than silently dropped.
 
-The Python distribution and installed launch command are named `synai`.
+The Python project and development launch command are named `synai`.
 Conversation storage lives under `~/.synai`; see the legacy cleanup instructions
 below. Developers should rerun `.venv/bin/python -m pip install -e .` to refresh
 editable package metadata and console scripts after updating.
@@ -403,16 +409,27 @@ These checks cover modal alignment, complete footer labels and long directory pa
 
 Theme-picker checks additionally verify preview/cancel without preference writes, explicit confirmation, restart persistence, failed-save retry, rollback to an unsaved original theme, rapid preview transitions, modal guards, field focus restoration and streaming continuity.
 
-## Building and publishing
+## Maintaining bundled editor assets
 
-See [the release guide](docs/RELEASING.md) for clean wheel/source builds,
-installed-artifact verification, checksums, and manually approved GitHub/PyPI
-Trusted Publishing. Publishing requires a real repository, protected GitHub
-environment, and a configured PyPI project/publisher; local builds do not
-upload packages.
+Pinned Neovim and mini.nvim archives and their notices live under
+`synai/editor/vendor`. `runtime.json` records exact versions, upstream URLs,
+lengths and SHA-256 checksums. Normal application startup never downloads
+editor assets. To explicitly restore the pinned files during development:
+
+```sh
+.venv/bin/python scripts/prepare_editor_assets.py
+# Or restore from previously downloaded files without network access:
+.venv/bin/python scripts/prepare_editor_assets.py --from-directory /path/to/assets
+```
+
+Review upstream licenses, checksums, binary compatibility and extracted size
+before updating these assets. The editor needs glibc 2.34+, `libgcc_s.so.1`,
+and executable temporary storage. Keep it within the sandbox's existing
+256 MiB tmpfs with room for swaps/recovery. Run the editor tests after changes.
 
 ## License
 
 SynAI is licensed under [Apache-2.0](LICENSE), copyright SynAI contributors.
-See [NOTICE](NOTICE) for component boundaries. Optional editor/system tools
-retain their own licenses and are not bundled in the Python distribution.
+See [NOTICE](NOTICE) for component boundaries. Bundled Neovim and mini.nvim
+retain their upstream licenses and redistribution notices. GTK/VTE, Ollama,
+and container runtimes are not bundled.
