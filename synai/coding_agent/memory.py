@@ -410,7 +410,7 @@ class ProjectMemoryStore:
         project_id = project_memory_id(workspace)
         if not isinstance(memory_id, str) or not re.fullmatch(r"[a-f0-9]{32}", memory_id):
             raise ProjectMemoryError(MemoryErrorCode.NOT_FOUND, "Memory record was not found.")
-        with self._connection(create=False, reading=True) as connection:
+        with self._connection(create=False, reading=True, readonly=True) as connection:
             self._ensure_schema(connection)
             row = connection.execute(
                 "SELECT record_json FROM memories WHERE project_id = ? AND memory_id = ?",
@@ -1222,11 +1222,26 @@ class ProjectMemoryStore:
             )
         return record
 
-    def _ensure_directory(self) -> None:
+    def _ensure_directory(self, *, create: bool = True) -> None:
         try:
-            self.application_storage.initialize()
+            if create:
+                self.application_storage.initialize()
+            else:
+                checked_path(self.application_storage.root)
+                root_info = self.application_storage.root.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(root_info.st_mode)
+                    or root_info.st_uid != os.getuid()
+                    or stat.S_IMODE(root_info.st_mode) & 0o077
+                ):
+                    raise ValueError("Storage must be a private directory owned by your user.")
             checked_path(self.directory)
             if not self.directory.exists():
+                if not create:
+                    raise ProjectMemoryError(
+                        MemoryErrorCode.STORE_UNAVAILABLE,
+                        "Project-memory database has not been initialized.",
+                    )
                 try:
                     self.directory.mkdir(mode=0o700)
                 except FileExistsError:
@@ -1256,8 +1271,12 @@ class ProjectMemoryStore:
         except (OSError, ValueError) as exc:
             raise ProjectMemoryError(MemoryErrorCode.STORE_UNAVAILABLE, str(exc)) from exc
 
-    def _connect(self, *, create: bool, timeout_ms: int | None = None) -> sqlite3.Connection:
-        self._ensure_directory()
+    def _connect(
+        self, *, create: bool, readonly: bool = False, timeout_ms: int | None = None,
+    ) -> sqlite3.Connection:
+        if readonly and create:
+            raise ValueError("A read-only connection cannot create a project-memory database.")
+        self._ensure_directory(create=create)
         connection_timeout_ms = self.busy_timeout_ms if timeout_ms is None else timeout_ms
         with self._lock:
             if not self.path.exists():
@@ -1279,16 +1298,19 @@ class ProjectMemoryStore:
                     raise ProjectMemoryError(MemoryErrorCode.STORE_UNAVAILABLE, str(exc)) from exc
             connection: sqlite3.Connection | None = None
             try:
+                target = f"{self.path.as_uri()}?mode=ro" if readonly else self.path
                 connection = sqlite3.connect(
-                    self.path,
+                    target,
+                    uri=readonly,
                     timeout=connection_timeout_ms / 1000,
                     isolation_level=None,
                 )
                 connection.execute(f"PRAGMA busy_timeout = {connection_timeout_ms}")
                 connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA journal_mode = DELETE")
-                connection.execute("PRAGMA synchronous = FULL")
-                os.chmod(self.path, 0o600, follow_symlinks=False)
+                if not readonly:
+                    connection.execute("PRAGMA journal_mode = DELETE")
+                    connection.execute("PRAGMA synchronous = FULL")
+                    os.chmod(self.path, 0o600, follow_symlinks=False)
                 return connection
             except sqlite3.DatabaseError as exc:
                 if connection is not None:
@@ -1301,9 +1323,12 @@ class ProjectMemoryStore:
 
     @contextmanager
     def _connection(
-        self, *, create: bool, reading: bool, timeout_ms: int | None = None,
+        self, *, create: bool, reading: bool, readonly: bool = False,
+        timeout_ms: int | None = None,
     ) -> Generator[sqlite3.Connection, None, None]:
-        connection = self._connect(create=create, timeout_ms=timeout_ms)
+        connection = self._connect(
+            create=create, readonly=readonly, timeout_ms=timeout_ms,
+        )
         try:
             yield connection
         except ProjectMemoryError:

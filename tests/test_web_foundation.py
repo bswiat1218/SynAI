@@ -196,6 +196,7 @@ class WebFoundationTests(unittest.TestCase):
         )
         self.assertEqual(registered.status_code, 201, registered.text)
         self.assertEqual(registered.json()["access"], "read_only")
+        self.assertEqual(registered.json()["compatibility_state"], "legacy_host_path")
         self.assertNotIn(str(self.workspace), registered.text)
         identifier = registered.json()["id"]
         self.assertEqual(

@@ -33,6 +33,35 @@ dependencies or console scripts change. Editable installation is for development
 not a release build. This does not delete private conversations or preferences
 in `~/.synai`.
 
+### Moving a source checkout to a Linux server
+
+Copy the complete checkout, including `.git`, bundled editor assets, `prompts/`
+and `results/`. Recreate `.venv` and `web/node_modules` on the destination rather
+than relying on dependencies copied from another machine. Stop SynAI before
+copying `~/.synai` separately; preserve its private file/directory permissions
+and make sure the destination files belong to the account running SynAI.
+Do not overwrite an existing destination checkout or data directory without
+reviewing and backing it up first.
+
+Saved conversations contain absolute workspace paths. Managed workspaces must
+match their new location under `~/.synai/conversations`; external host workspaces
+must be copied separately and rebound to their destination paths before use.
+Keep recorded message provenance unchanged. Saved Ollama endpoints are also
+preserved: confirm that the server can reach the configured inference machine.
+
+For an SSH alias named `home-server` and a checkout at `~/synai`, launch with:
+
+```sh
+ssh -t home-server 'cd ~/synai && .venv/bin/synai'
+```
+
+The TUI needs an interactive terminal but not a desktop. Its separate GTK editor
+still requires a usable graphical display; ordinary headless SSH is insufficient.
+The browser application is a separate, currently read-only foundation, not a web
+chat replacement. See [web deployment and shared-data ownership](docs/phase-13b-web.md)
+before hosting it; remote access requires HTTPS, and the web service and TUI
+cannot own the same data root concurrently.
+
 SynAI opens on its main menu. Set your Ollama server in **CONNECTION SETTINGS** if needed, then choose **NEW CONVERSATION**, review its environment, choose **NEXT**, select a model from the shared connection, and choose **CREATE CONVERSATION**. Use **CONVERSATIONS** to reopen or delete saved chats. Highlight a row with the arrows and press **Enter** or **OPEN** to restore its execution environment. Launching, configuring drafts, refreshing models, and browsing the menu do not create empty histories.
 
 In a conversation, type your prompt in the composer, then choose **SEND** or press **Ctrl+Enter / Ctrl+S**. Without a ready approved execution environment and a native-tool-capable model, this is chat-only: the model cannot execute tools. **Escape / STOP** cancels the active turn, **F2** opens the main menu to start a new conversation, and **Ctrl+Q** quits. Enter inserts newlines in the composer. Ctrl+N no longer creates a conversation.
@@ -426,4 +455,3 @@ Review upstream licenses, checksums, binary compatibility and extracted size
 before updating these assets. The editor needs glibc 2.34+, `libgcc_s.so.1`,
 and executable temporary storage. Keep it within the sandbox's existing
 256 MiB tmpfs with room for swaps/recovery. Run the editor tests after changes.
-

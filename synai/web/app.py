@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -24,6 +26,13 @@ from synai.web.auth import (
 )
 from synai.web.config import WebConfig
 from synai.web.database import MetadataDatabase
+from synai.web.distributed import (
+    DevicePrincipal,
+    DistributedError,
+    DistributedRegistry,
+    Enrollment,
+    SUPPORTED_PROTOCOL_VERSIONS,
+)
 from synai.web.ownership import DataRootOwnership
 from synai.web.projects import (
     ProjectRegistry,
@@ -43,7 +52,31 @@ from synai.web.schemas import (
     ProjectRegistrationRequest,
     ProjectResponse,
     SessionResponse,
+    DeviceCredentialResponse,
+    DeviceCredentialRotationResponse,
+    DeviceEnrollmentRequest,
+    DeviceListResponse,
+    DeviceMetadataResponse,
+    ExecutionTargetStatusResponse,
+    LogicalProjectCreateRequest,
+    LogicalProjectListResponse,
+    LogicalProjectResponse,
+    MemoryAssociationPreviewRequest,
+    MemoryAssociationPreviewResponse,
+    PairingChallengeResponse,
+    SnapshotChunkResponse,
+    SnapshotListResponse,
+    SnapshotResponse,
+    SnapshotUploadBeginRequest,
+    SnapshotUploadResponse,
+    SnapshotUploadStatusResponse,
+    TaskContractResponse,
+    TaskListResponse,
+    WorkspaceBindingCreateRequest,
+    WorkspaceBindingListResponse,
+    WorkspaceBindingResponse,
 )
+from synai.web.snapshots import SnapshotStore
 
 
 _logger = logging.getLogger(__name__)
@@ -54,6 +87,17 @@ _session_cookie = APIKeyCookie(
 )
 _csrf_header = APIKeyHeader(
     name="X-CSRF-Token", scheme_name="CsrfToken", auto_error=False,
+)
+_device_credential = APIKeyHeader(
+    name="X-SynAI-Device-Credential", scheme_name="DeviceCredential", auto_error=False,
+)
+_device_id = APIKeyHeader(name="X-SynAI-Device-ID", scheme_name="DeviceID", auto_error=False)
+_device_timestamp = APIKeyHeader(
+    name="X-SynAI-Device-Timestamp", scheme_name="DeviceTimestamp", auto_error=False,
+)
+_device_nonce = APIKeyHeader(name="X-SynAI-Device-Nonce", scheme_name="DeviceNonce", auto_error=False)
+_device_signature = APIKeyHeader(
+    name="X-SynAI-Device-Signature", scheme_name="DeviceSignature", auto_error=False,
 )
 
 
@@ -66,6 +110,9 @@ class WebServices:
     owns_provider: bool = False
     auth: AuthenticationService | None = None
     projects: ProjectRegistry | None = None
+    distributed: DistributedRegistry | None = None
+    snapshots: SnapshotStore | None = None
+    snapshot_cleanup_task: asyncio.Task[None] | None = None
     ready: bool = False
 
     async def start(self) -> None:
@@ -78,19 +125,39 @@ class WebServices:
             )
             self.auth.initialize(self.config.initial_password)
             self.projects = ProjectRegistry(self.database, self.config)
+            self.distributed = DistributedRegistry(self.database)
+            self.snapshots = SnapshotStore(self.database, self.distributed)
+            self.snapshots.initialize()
             self.ready = True
+            self.snapshot_cleanup_task = asyncio.create_task(self._snapshot_cleanup_loop())
         except BaseException:
             self.ownership.release()
             raise
 
     async def close(self) -> None:
         self.ready = False
+        if self.snapshot_cleanup_task is not None:
+            self.snapshot_cleanup_task.cancel()
+            try:
+                await self.snapshot_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self.snapshot_cleanup_task = None
         self.ownership.release()
         close = getattr(self.provider, "close", None)
         if callable(close):
             result = close()
             if asyncio.iscoroutine(result):
                 await result
+
+    async def _snapshot_cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            assert self.snapshots is not None
+            try:
+                await asyncio.to_thread(self.snapshots.cleanup)
+            except (OSError, sqlite3.Error, ValueError):
+                _logger.exception("Distributed snapshot cleanup failed")
 
 
 class RequestLimitsMiddleware:
@@ -201,7 +268,10 @@ def create_app(
     app = FastAPI(
         title="SynAI Web API",
         version="1.0.0",
-        description="Read-only, single-user web foundation for SynAI.",
+        description=(
+            "Single-operator orchestration metadata API with bounded immutable source uploads; "
+            "distributed task execution and host workspace mutation are disabled."
+        ),
         openapi_url="/api/openapi.json",
         docs_url="/api/docs",
         redoc_url=None,
@@ -215,6 +285,7 @@ def create_app(
     )
     app.add_exception_handler(AuthenticationError, _authentication_error)
     app.add_exception_handler(ProjectRegistryError, _project_error)
+    app.add_exception_handler(DistributedError, _distributed_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(HTTPException, _http_error)
     app.add_exception_handler(Exception, _internal_error)
@@ -233,6 +304,21 @@ def create_app(
     ) -> AuthenticatedSession:
         assert current.auth is not None
         return current.auth.session(raw_token)
+
+    async def current_device(
+        request: Request,
+        credential: str | None = Depends(_device_credential),
+        device_id: str | None = Depends(_device_id),
+        timestamp: str | None = Depends(_device_timestamp),
+        nonce: str | None = Depends(_device_nonce),
+        signature: str | None = Depends(_device_signature),
+        current: WebServices = Depends(services_from),
+    ) -> DevicePrincipal:
+        assert current.distributed is not None
+        return current.distributed.authenticate_device(
+            credential, device_id, timestamp, nonce, signature,
+            request.method, request.url.path, await request.body(),
+        )
 
     def require_origin(request: Request) -> None:
         if request.headers.get("origin") != _normalized_origin(selected_config.public_origin):
@@ -429,6 +515,391 @@ def create_app(
         assert current.projects is not None
         return _project_response(current.projects.inspect(project_id))
 
+    @router.post(
+        "/api/v1/devices/pairing-challenges",
+        response_model=PairingChallengeResponse,
+        status_code=201,
+    )
+    async def create_pairing_challenge(
+        request: Request,
+        response: Response,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> PairingChallengeResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        challenge = current.distributed.create_pairing_challenge()
+        response.headers["Cache-Control"] = "no-store"
+        return PairingChallengeResponse(
+            challenge_id=challenge.challenge_id,
+            challenge_secret=challenge.secret,
+            expires_at=challenge.expires_at,
+            protocol_versions=list(challenge.protocol_versions),
+        )
+
+    @router.post(
+        "/api/v1/device-enrollments",
+        response_model=DeviceCredentialResponse,
+        status_code=201,
+        responses={401: {"model": ErrorResponse}, 410: {"model": ErrorResponse}},
+    )
+    async def enroll_device(
+        body: DeviceEnrollmentRequest,
+        response: Response,
+        current: WebServices = Depends(services_from),
+    ) -> DeviceCredentialResponse:
+        assert current.distributed is not None
+        result = current.distributed.enroll(
+            Enrollment(**body.model_dump()),
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return DeviceCredentialResponse(
+            device_id=result.device_id,
+            credential=result.credential,
+            credential_expires_at=result.credential_expires_at,
+            state=result.state,
+        )
+
+    @router.get("/api/v1/devices", response_model=DeviceListResponse)
+    async def list_devices(
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> DeviceListResponse:
+        assert current.distributed is not None
+        return DeviceListResponse(devices=[
+            DeviceMetadataResponse(**entry) for entry in current.distributed.list_devices()
+        ])
+
+    @router.get(
+        "/api/v1/devices/{device_id}/capabilities",
+        response_model=DeviceMetadataResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def device_capabilities(
+        device_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> DeviceMetadataResponse:
+        assert current.distributed is not None
+        return DeviceMetadataResponse(**current.distributed.device_metadata(device_id))
+
+    @router.post(
+        "/api/v1/devices/{device_id}/authorize",
+        response_model=DeviceMetadataResponse,
+        responses={403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    async def authorize_device(
+        device_id: str,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> DeviceMetadataResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        return DeviceMetadataResponse(**current.distributed.authorize_device(device_id))
+
+    @router.delete(
+        "/api/v1/devices/{device_id}",
+        status_code=204,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    async def revoke_device(
+        device_id: str,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> Response:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        current.distributed.revoke_device(device_id)
+        return Response(status_code=204)
+
+    @router.post(
+        "/api/v1/logical-projects",
+        response_model=LogicalProjectResponse,
+        status_code=201,
+    )
+    async def create_logical_project(
+        body: LogicalProjectCreateRequest,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> LogicalProjectResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        project = current.distributed.create_project(body.name, body.registration_key)
+        return _logical_project_response(project)
+
+    @router.get("/api/v1/logical-projects", response_model=LogicalProjectListResponse)
+    async def list_logical_projects(
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> LogicalProjectListResponse:
+        assert current.distributed is not None
+        return LogicalProjectListResponse(projects=[
+            _logical_project_response(project) for project in current.distributed.list_projects()
+        ])
+
+    @router.get(
+        "/api/v1/logical-projects/{project_id}",
+        response_model=LogicalProjectResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def inspect_logical_project(
+        project_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> LogicalProjectResponse:
+        assert current.distributed is not None
+        return _logical_project_response(current.distributed.get_project(project_id))
+
+    @router.post(
+        "/api/v1/logical-projects/{project_id}/bindings",
+        response_model=WorkspaceBindingResponse,
+        status_code=201,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    async def create_binding(
+        project_id: str,
+        body: WorkspaceBindingCreateRequest,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> WorkspaceBindingResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        binding = current.distributed.create_binding(
+            project_id, body.device_id, body.name, expires_at=body.expires_at,
+        )
+        return _binding_response(binding)
+
+    @router.get(
+        "/api/v1/logical-projects/{project_id}/bindings",
+        response_model=WorkspaceBindingListResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def list_bindings(
+        project_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> WorkspaceBindingListResponse:
+        assert current.distributed is not None
+        return WorkspaceBindingListResponse(bindings=[
+            _binding_response(item) for item in current.distributed.list_bindings(project_id)
+        ])
+
+    @router.delete(
+        "/api/v1/logical-projects/{project_id}/bindings/{binding_id}",
+        status_code=204,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    async def revoke_binding(
+        project_id: str,
+        binding_id: str,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> Response:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        current.distributed.revoke_binding(project_id, binding_id)
+        return Response(status_code=204)
+
+    @router.post(
+        "/api/v1/device/{device_id}/credential/rotate",
+        response_model=DeviceCredentialRotationResponse,
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def rotate_device_credential(
+        device_id: str,
+        principal: DevicePrincipal = Depends(current_device),
+        current: WebServices = Depends(services_from),
+    ) -> DeviceCredentialRotationResponse:
+        _require_path_device(device_id, principal)
+        assert current.distributed is not None
+        credential = current.distributed.rotate_device_credential(principal)
+        return DeviceCredentialRotationResponse(
+            credential=credential.credential,
+            credential_expires_at=credential.credential_expires_at,
+        )
+
+    @router.post(
+        "/api/v1/device/{device_id}/snapshot-uploads",
+        response_model=SnapshotUploadResponse,
+        status_code=201,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
+    )
+    async def begin_snapshot_upload(
+        device_id: str,
+        body: SnapshotUploadBeginRequest,
+        principal: DevicePrincipal = Depends(current_device),
+        current: WebServices = Depends(services_from),
+    ) -> SnapshotUploadResponse:
+        _require_path_device(device_id, principal)
+        assert current.snapshots is not None
+        result = current.snapshots.begin(
+            principal, body.project_id, body.binding_id,
+            [item.model_dump() for item in body.files],
+            idempotency_key=body.idempotency_key,
+        )
+        return SnapshotUploadResponse(**result)
+
+    @router.get(
+        "/api/v1/device/{device_id}/snapshot-uploads/{upload_id}",
+        response_model=SnapshotUploadStatusResponse,
+        responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 410: {"model": ErrorResponse}},
+    )
+    async def inspect_snapshot_upload(
+        device_id: str,
+        upload_id: str,
+        principal: DevicePrincipal = Depends(current_device),
+        current: WebServices = Depends(services_from),
+    ) -> SnapshotUploadStatusResponse:
+        _require_path_device(device_id, principal)
+        assert current.snapshots is not None
+        return SnapshotUploadStatusResponse(**current.snapshots.upload_status(principal, upload_id))
+
+    @router.put(
+        "/api/v1/device/{device_id}/snapshot-uploads/{upload_id}/files/{file_index}/chunks/{chunk_index}",
+        response_model=SnapshotChunkResponse,
+        responses={401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 413: {"model": ErrorResponse}},
+    )
+    async def accept_snapshot_chunk(
+        device_id: str,
+        upload_id: str,
+        file_index: int,
+        chunk_index: int,
+        request: Request,
+        principal: DevicePrincipal = Depends(current_device),
+        current: WebServices = Depends(services_from),
+    ) -> SnapshotChunkResponse:
+        _require_path_device(device_id, principal)
+        assert current.snapshots is not None
+        result = current.snapshots.accept_chunk(
+            principal, upload_id, file_index, chunk_index, await request.body(),
+        )
+        return SnapshotChunkResponse(**result)
+
+    @router.post(
+        "/api/v1/device/{device_id}/snapshot-uploads/{upload_id}/commit",
+        response_model=SnapshotResponse,
+        responses={401: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 410: {"model": ErrorResponse}},
+    )
+    async def commit_snapshot_upload(
+        device_id: str,
+        upload_id: str,
+        principal: DevicePrincipal = Depends(current_device),
+        current: WebServices = Depends(services_from),
+    ) -> SnapshotResponse:
+        _require_path_device(device_id, principal)
+        assert current.snapshots is not None
+        return SnapshotResponse(**current.snapshots.commit(principal, upload_id))
+
+    @router.get(
+        "/api/v1/logical-projects/{project_id}/snapshots",
+        response_model=SnapshotListResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def list_project_snapshots(
+        project_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> SnapshotListResponse:
+        assert current.distributed is not None and current.snapshots is not None
+        current.distributed.get_project(project_id)
+        return SnapshotListResponse(snapshots=list(current.snapshots.list_snapshots(project_id)))
+
+    @router.get(
+        "/api/v1/logical-projects/{project_id}/snapshots/{snapshot_id}",
+        response_model=SnapshotResponse,
+        responses={404: {"model": ErrorResponse}, 410: {"model": ErrorResponse}},
+    )
+    async def inspect_snapshot(
+        project_id: str,
+        snapshot_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> SnapshotResponse:
+        assert current.snapshots is not None
+        return SnapshotResponse(**current.snapshots.snapshot_status(project_id, snapshot_id))
+
+    @router.get(
+        "/api/v1/logical-projects/{project_id}/tasks",
+        response_model=TaskListResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def list_distributed_tasks(
+        project_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> TaskListResponse:
+        assert current.distributed is not None
+        current.distributed.get_project(project_id)
+        with current.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM distributed_tasks WHERE project_id = ? "
+                "ORDER BY created_at DESC LIMIT 256",
+                (project_id,),
+            ).fetchall()
+        tasks = [
+            TaskContractResponse(
+                schema_version=row["schema_version"],
+                task_id=row["task_id"],
+                project_id=row["project_id"],
+                source_snapshot_id=row["snapshot_id"],
+                source_device_id=row["device_id"],
+                workspace_binding_id=row["binding_id"],
+                selected_execution_target=row["execution_target"] or None,
+                required_capabilities=json.loads(row["required_capabilities_json"]),
+                state=row["state"],
+                execution_claim=row["execution_claim"],
+                lease_generation=row["fencing_generation"],
+                approval_reference=row["approval_reference"],
+                result_reference=row["result_reference"],
+                error_reference=row["error_reference"],
+            )
+            for row in rows
+        ]
+        return TaskListResponse(tasks=tasks, execution_available=False)
+
+    @router.get(
+        "/api/v1/execution-targets",
+        response_model=ExecutionTargetStatusResponse,
+    )
+    async def list_execution_targets(
+        _: AuthenticatedSession = Depends(current_session),
+    ) -> ExecutionTargetStatusResponse:
+        return ExecutionTargetStatusResponse(
+            targets=[], execution_available=False, broker_available=False,
+        )
+
+    @router.post(
+        "/api/v1/logical-projects/{project_id}/memory-association-previews",
+        response_model=MemoryAssociationPreviewResponse,
+        status_code=200,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    async def preview_memory_association(
+        project_id: str,
+        body: MemoryAssociationPreviewRequest,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> MemoryAssociationPreviewResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None
+        result = current.distributed.authorize_memory_association_preview(
+            body.legacy_identity, project_id, body.provenance,
+        )
+        return MemoryAssociationPreviewResponse(**result)
+
     app.include_router(router)
     return app
 
@@ -440,6 +911,34 @@ def _project_response(project: RegisteredProject) -> ProjectResponse:
         status=project.status,
         access="read_only",
     )
+
+
+def _logical_project_response(project: object) -> LogicalProjectResponse:
+    return LogicalProjectResponse(
+        id=str(project.project_id),
+        schema_version=project.schema_version,
+        name=project.display_name,
+        status=project.status,
+        created_at=project.created_at,
+    )
+
+
+def _binding_response(binding: object) -> WorkspaceBindingResponse:
+    return WorkspaceBindingResponse(
+        id=str(binding.binding_id),
+        schema_version=binding.schema_version,
+        project_id=str(binding.project_id),
+        device_id=str(binding.device_id),
+        name=binding.display_name,
+        status=binding.status,
+        created_at=binding.created_at,
+        expires_at=binding.expires_at,
+    )
+
+
+def _require_path_device(device_id: str, principal: DevicePrincipal) -> None:
+    if device_id != str(principal.device_id):
+        raise DistributedError("device_identity_mismatch", "Authenticated device does not match the route.", 403)
 
 
 def _normalized_origin(value: str) -> str:
@@ -465,6 +964,10 @@ async def _authentication_error(_: Request, exc: AuthenticationError) -> JSONRes
 
 
 async def _project_error(_: Request, exc: ProjectRegistryError) -> JSONResponse:
+    return _error_response(exc.status_code, exc.code, exc.public_message)
+
+
+async def _distributed_error(_: Request, exc: DistributedError) -> JSONResponse:
     return _error_response(exc.status_code, exc.code, exc.public_message)
 
 

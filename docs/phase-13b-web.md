@@ -230,20 +230,29 @@ canonical workspace path. A host path and a container mount path can therefore
 produce different namespaces even when they refer to the same bind-mounted
 directory. The required real bind-mount test is present as
 `tests/test_web_container_memory_identity.py`; it uses only a disposable
-workspace and a copied database and requires an actual configured service
-image. Docker and Podman were unavailable in this environment, so no
-host/container identity, UID, inode, retrieval, or database-mutation result
-was obtained. Container compatibility is unverified; do not claim memory
-compatibility or cut over memory-enabled operation based on host-only results.
+workspace and a copied database. Post-migration validation on Ubuntu 26.04.1
+ran the harness through Docker using the service UID and a disposable
+dependency-only Python image because no intended SynAI service image was
+configured. The real bind mount preserved UID, device, and inode, but the host
+temporary path and `/workspace` mount path produced different project-memory
+IDs. Retrieval correctly returned `memory_not_found` for that namespace
+mismatch, and the copied database was unchanged. The probe also exposed and
+fixed read-only database access attempting writable storage initialization.
 
-If a future real test confirms a mismatch, leave the original database and
-namespace untouched. Propose a separate operator-reviewed reassociation
-operation for later design: show old/new path and identity tuples, enumerate
-records in the copied database, require an explicit backup and confirmation,
-write only into a new namespace in a transaction, preserve original record
-payload/provenance and an auditable mapping, and provide a dry-run plus
-rollback path. No automatic merge, rewrite, or silent namespace alias is
-authorized by this phase.
+No migrated Phase 12 database was found under the active `~/.synai` data root
+or checkout, so the previous computer's stored identity and compatibility
+remain unknown. The disposable-image result is not validation of a deployed
+SynAI image, nor evidence of memory compatibility. Do not enable memory-backed
+container operation until the intended service image and any existing database
+identity have been explicitly checked.
+
+For any confirmed identity mismatch, leave the original database and namespace
+untouched. Any reassociation requires a separate operator-reviewed proposal:
+show old/new path and identity tuples, enumerate records in a copied database,
+require an explicit backup and confirmation, write only into a new namespace
+in a transaction, preserve original record payload/provenance and an auditable
+mapping, and provide a dry-run plus rollback path. No automatic merge,
+rewrite, or silent namespace alias is authorized by this phase.
 
 ## Frontend scope
 

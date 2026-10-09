@@ -148,6 +148,30 @@ class ProjectMemoryStorageTests(ProjectMemoryFixture, unittest.TestCase):
             reopened.get_memory(self.workspace, record.memory_id)
         self.assertEqual(raised.exception.code, MemoryErrorCode.NOT_FOUND)
 
+    def test_get_memory_reads_read_only_database_without_modifying_it(self) -> None:
+        record = self.store.add_memory(
+            self.workspace,
+            category=MemoryCategory.DECISION,
+            title="Read-only memory lookup",
+            content="Memory lookup must not require a writable database.",
+            user_authorized=True,
+        )
+        original_hash = hashlib.sha256(self.store.path.read_bytes()).digest()
+        directory_mode = self.store.directory.stat().st_mode & 0o777
+        database_mode = self.store.path.stat().st_mode & 0o777
+        self.store.directory.chmod(0o500)
+        self.store.path.chmod(0o400)
+        try:
+            readonly = ProjectMemoryStore(self.data, self.config)
+            self.assertEqual(
+                readonly.get_memory(self.workspace, record.memory_id),
+                record,
+            )
+        finally:
+            self.store.path.chmod(database_mode)
+            self.store.directory.chmod(directory_mode)
+        self.assertEqual(hashlib.sha256(self.store.path.read_bytes()).digest(), original_hash)
+
     def test_project_namespace_isolated_for_duplicate_basenames_and_workspace_replacement(self) -> None:
         second = self.base / "other-parent" / self.workspace.name
         second.mkdir(parents=True)
@@ -1315,6 +1339,7 @@ class ProjectMemoryRuntimeTests(ProjectMemoryFixture, unittest.TestCase):
                 self.workspace, "client retry", RepositoryIndex(self.workspace),
             )
         self.assertEqual(raised.exception.code, MemoryErrorCode.STORE_UNAVAILABLE)
+        self.assertFalse((self.base / "missing").exists())
         disabled = ProjectMemoryStore(
             self.base / "disabled", ProjectMemoryConfig(enabled=False),
         )

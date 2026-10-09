@@ -763,3 +763,16 @@ lock. Workspace lease/fencing primitives are future-writer contracts and are
 not connected to web mutation routes. The detailed API, deployment,
 authentication, runner boundary, recovery, and Phase 12 compatibility
 constraints are documented in [phase-13b-web.md](./phase-13b-web.md).
+
+## Distributed architecture foundation (Phase 13C)
+
+Phase 13C adds separate server-owned logical project/device/binding identities,
+operator-authorized device enrollment contracts, bounded immutable source
+snapshot ingestion, and read-only Phase 2/3 access to verified snapshot
+contents. The path-based Phase 13B registry, TUI storage ownership, Phase 12
+memory identity, `CodingAgentRuntime`, approval system, and existing execution
+backends remain authoritative in their existing scope. Phase 13C does not
+include a production Client Agent, Sandbox Broker, distributed task execution,
+or project mutation. See [phase-13c-distributed.md](./phase-13c-distributed.md)
+for protocol versions, storage bounds, privacy rules, API contracts, and
+deferred decisions.
