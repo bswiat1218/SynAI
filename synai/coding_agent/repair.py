@@ -189,6 +189,8 @@ class RepairController:
                 repair_stage_id = f"repair-{attempt_number}"
                 repair_model = task.selected_model or ""
                 if task.routing is not None or self.runtime.routing_config.mode == RoutingMode.ROUTED:
+                    from synai.coding_agent.runtime import _RuntimeStop
+
                     complexity = estimate_complexity(
                         task.goal,
                         context=request.context,
@@ -198,11 +200,20 @@ class RepairController:
                             item.path for item in task.change_evidence
                         }),
                     )
-                    decision = await self.runtime._assign_stage(
-                        task, request.session, ModelRole.REPAIR, repair_stage_id,
-                        repair_model, complexity, require_tools=True,
-                        cancellation=request.cancellation, checkpoint=request.checkpoint,
-                    )
+                    try:
+                        decision = await self.runtime._assign_stage(
+                            task, request.session, ModelRole.REPAIR, repair_stage_id,
+                            repair_model, complexity, require_tools=True,
+                            cancellation=request.cancellation, checkpoint=request.checkpoint,
+                            event_sink=request.event_sink,
+                        )
+                    except _RuntimeStop as exc:
+                        if exc.code.value == "cancelled":
+                            raise asyncio.CancelledError from exc
+                        raise _RepairStop(
+                            RepairOutcome.REPAIR_PROVIDER_ERROR,
+                            f"{exc.code.value}: {exc.message[:1024]}",
+                        ) from exc
                     repair_model = decision.selected_model
                 attempt = RepairAttempt(
                     attempt=attempt_number,
@@ -358,7 +369,9 @@ class RepairController:
                                 request, attempt, "Repair cancelled between repair tool groups.",
                             )
                         await self._await_attempt(
-                            self._revalidate_execution(request), request, attempt_deadline,
+                            self._revalidate_execution(
+                                request, revalidate_provider=False,
+                            ), request, attempt_deadline,
                             "Repair revalidation exceeded its time limit.",
                         )
                         self.runtime._validate_step(
@@ -655,7 +668,12 @@ class RepairController:
             return None
         return latest
 
-    async def _revalidate_execution(self, request: RepairRequest) -> Path:
+    async def _revalidate_execution(
+        self,
+        request: RepairRequest,
+        *,
+        revalidate_provider: bool = True,
+    ) -> Path:
         task = request.task
         if task.status != AgentStatus.REPAIRING or task.plan is None:
             raise ValueError("Task left REPAIRING before a repair action")
@@ -670,10 +688,22 @@ class RepairController:
             task, request.session, request.repository, root, model,
             allow_completed_steps=True, stage_role=ModelRole.REPAIR, stage_id=stage_id,
         )
-        await self.runtime._validate_provider_for_execution(
-            model, task, session=request.session,
-            role=ModelRole.REPAIR, stage_id=stage_id,
-        )
+        from synai.coding_agent.runtime import _RuntimeStop
+
+        try:
+            await self.runtime._validate_provider_for_execution(
+                model, task, session=request.session,
+                role=ModelRole.REPAIR, stage_id=stage_id,
+                cancellation=request.cancellation,
+                revalidate=revalidate_provider,
+            )
+        except _RuntimeStop as exc:
+            if exc.code.value == "cancelled":
+                raise asyncio.CancelledError from exc
+            raise _RepairStop(
+                RepairOutcome.REPAIR_PROVIDER_ERROR,
+                f"{exc.code.value}: {exc.message[:1024]}",
+            ) from exc
         if request.cancellation and request.cancellation.is_set():
             raise asyncio.CancelledError
         return root

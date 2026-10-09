@@ -22,7 +22,7 @@ from synai.agent import Agent
 from synai.config import Settings
 from synai.history import History, HistoryError
 from synai.models import Activity, ChatEvent, Message, ModelInfo, Session
-from synai.providers.base import ProviderError
+from synai.providers.base import ModelUnavailableError, ProviderError
 from synai.providers.ollama import OllamaProvider
 from synai.sandbox import Sandbox, SandboxError
 from synai.sandbox_helper import ToolFailure, workspace_path
@@ -59,6 +59,74 @@ class FakeProvider:
 
 
 class ProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capabilities_distinguish_completion_embedding_and_unknown(self) -> None:
+        provider = OllamaProvider("http://localhost:11434")
+        capabilities_by_model = {
+            "chat": ["completion"],
+            "chat-tools": ["completion", "tools"],
+            "embedding": ["embedding"],
+            "thinking-only": ["thinking"],
+            "missing": None,
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.assertEqual(request.url.path, "/api/show")
+            model = json.loads(request.content)["model"]
+            capabilities = capabilities_by_model[model]
+            body = {} if capabilities is None else {"capabilities": capabilities}
+            return httpx.Response(200, json=body)
+
+        await provider.client.aclose()
+        provider.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            self.assertIs((await provider.capabilities("chat")).chat, True)
+            self.assertIs((await provider.capabilities("chat-tools")).chat, True)
+            self.assertTrue((await provider.capabilities("chat-tools")).tools)
+            self.assertIs((await provider.capabilities("embedding")).chat, False)
+            self.assertIsNone((await provider.capabilities("thinking-only")).chat)
+            self.assertTrue((await provider.capabilities("thinking-only")).thinking)
+            self.assertIsNone((await provider.capabilities("missing")).chat)
+        finally:
+            await provider.close()
+
+    async def test_malformed_capability_metadata_is_reported_as_unknown(self) -> None:
+        provider = OllamaProvider("http://localhost:11434")
+        await provider.client.aclose()
+        provider.client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"capabilities": ["completion", 3]})
+        ))
+        try:
+            capability = await provider.capabilities("malformed")
+            self.assertIsNone(capability.chat)
+            self.assertIsNotNone(capability.capability_error)
+        finally:
+            await provider.close()
+
+    async def test_missing_model_from_show_is_candidate_scoped(self) -> None:
+        provider = OllamaProvider("http://localhost:11434")
+        await provider.client.aclose()
+        provider.client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(404, json={"error": "model not found"})
+        ))
+        try:
+            with self.assertRaises(ModelUnavailableError):
+                await provider.capabilities("removed")
+        finally:
+            await provider.close()
+
+    async def test_show_transport_failure_remains_provider_error(self) -> None:
+        provider = OllamaProvider("http://localhost:11434")
+        await provider.client.aclose()
+        provider.client = httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(503, json={"error": "unavailable"})
+        ))
+        try:
+            with self.assertRaises(ProviderError) as raised:
+                await provider.capabilities("model")
+            self.assertNotIsInstance(raised.exception, ModelUnavailableError)
+        finally:
+            await provider.close()
+
     async def test_stream_preserves_reasoning_answer_and_native_calls(self) -> None:
         provider = OllamaProvider("http://localhost:11434")
         events = [

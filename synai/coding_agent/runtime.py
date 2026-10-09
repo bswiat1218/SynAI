@@ -45,7 +45,6 @@ from synai.coding_agent.policies import (
 )
 from synai.coding_agent.routing import (
     ComplexityEstimate,
-    ComplexityTier,
     ModelRole,
     ModelRouter,
     RoutingConfig,
@@ -135,6 +134,11 @@ class RuntimeEvent:
     step_id: str | None = None
     tool_name: str | None = None
     message: str | None = None
+    model_role: str | None = None
+    selected_model: str | None = None
+    routing_strategy: str | None = None
+    selection_reason: str | None = None
+    fallback_used: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +423,7 @@ class CodingAgentRuntime:
                     task, session, ModelRole.PLANNING, "planning", model,
                     estimate_complexity(task_prompt, context=context),
                     require_tools=False, cancellation=cancellation, checkpoint=checkpoint,
+                    event_sink=event_sink,
                 )
                 planning_model = planning_decision.selected_model
             await self._checkpoint(task, checkpoint)
@@ -430,6 +435,7 @@ class CodingAgentRuntime:
                 await self._validate_provider_for_execution(
                     planning_model, task, session=session,
                     role=ModelRole.PLANNING, stage_id="planning",
+                    cancellation=cancellation,
                 )
                 planning_result = await planner.plan(
                     PlanningRequest(
@@ -453,6 +459,7 @@ class CodingAgentRuntime:
                 await self._validate_provider_for_execution(
                     planning_model, task, session=session,
                     role=ModelRole.PLANNING, stage_id="planning",
+                    cancellation=cancellation,
                 )
                 attach_validated_plan(task, planning_result)
             else:
@@ -507,6 +514,7 @@ class CodingAgentRuntime:
                 estimate_complexity(task_prompt, context=context, plan=task.plan),
                 require_tools=any(self._allowed_tools(step) for step in task.plan.steps),
                 cancellation=cancellation, checkpoint=checkpoint,
+                event_sink=event_sink,
             )
             implementation_model = implementation_decision.selected_model
             self._validate_plan_for_execution(
@@ -515,6 +523,7 @@ class CodingAgentRuntime:
             await self._validate_provider_for_execution(
                 implementation_model, task, session=session,
                 role=ModelRole.IMPLEMENTATION, stage_id="implementation",
+                cancellation=cancellation,
             )
             if cancellation and cancellation.is_set():
                 raise _RuntimeStop(RuntimeErrorCode.CANCELLED, "Task cancelled before implementation")
@@ -648,6 +657,7 @@ class CodingAgentRuntime:
                     estimate_complexity(task.goal, context=context, plan=task.plan),
                     require_tools=any(self._allowed_tools(step) for step in task.plan.steps),
                     cancellation=cancellation, checkpoint=checkpoint,
+                    event_sink=event_sink,
                 )
                 implementation_model = implementation_decision.selected_model
             self._validate_plan_for_execution(
@@ -656,6 +666,7 @@ class CodingAgentRuntime:
             await self._validate_provider_for_execution(
                 implementation_model, task, session=session,
                 role=ModelRole.IMPLEMENTATION, stage_id="implementation",
+                cancellation=cancellation,
             )
             if cancellation and cancellation.is_set():
                 raise _RuntimeStop(RuntimeErrorCode.CANCELLED, "Cancelled before implementation")
@@ -736,6 +747,8 @@ class CodingAgentRuntime:
             await self._validate_provider_for_execution(
                 model, task, session=session,
                 role=ModelRole.IMPLEMENTATION, stage_id="implementation",
+                cancellation=cancellation,
+                revalidate=task.routing is None,
             )
             self._validate_step(task, step, root, repository)
             unsupported = set(step.operations) & {PlanOperation.TEST, PlanOperation.VERIFY}
@@ -1813,12 +1826,22 @@ class CodingAgentRuntime:
         step_id: str | None = None,
         tool_name: str | None = None,
         message: str | None = None,
+        model_role: str | None = None,
+        selected_model: str | None = None,
+        routing_strategy: str | None = None,
+        selection_reason: str | None = None,
+        fallback_used: bool | None = None,
     ) -> None:
         if callback is not None:
             try:
                 await callback(RuntimeEvent(
                     kind, task.task_id, task.status, step_id, tool_name,
                     message[:4096] if message else None,
+                    model_role[:32] if model_role else None,
+                    selected_model[:512] if selected_model else None,
+                    routing_strategy[:32] if routing_strategy else None,
+                    selection_reason[:128] if selection_reason else None,
+                    fallback_used,
                 ))
             except Exception as exc:
                 _logger.warning(
@@ -1855,12 +1878,10 @@ class CodingAgentRuntime:
         require_tools: bool,
         cancellation: threading.Event | None,
         checkpoint: CheckpointHook | None,
+        event_sink: EventSink | None = None,
     ) -> RoutingDecision:
         try:
-            endpoint = endpoint_fingerprint(session.endpoint)
-            identity = provider_identity(self.provider)
             self.routing_config.validate()
-            config_fingerprint = self.routing_config.fingerprint()
             if task.routing is None:
                 raise RoutingFailure(
                     RoutingErrorCode.ROUTE_PROVENANCE_MISMATCH,
@@ -1891,7 +1912,13 @@ class CodingAgentRuntime:
             await self._emit(
                 task,
                 "model_route_selected",
-                None,
+                event_sink,
+                step_id=stage_id,
+                model_role=role.value,
+                selected_model=decision.selected_model,
+                routing_strategy=decision.strategy.value,
+                selection_reason=decision.reason_code,
+                fallback_used=decision.fallback_used,
                 message=(
                     f"{role.value} selected {decision.selected_model}: {decision.reason_code}; "
                     f"{decision.candidate_count} candidate(s), fallback="
@@ -1901,7 +1928,9 @@ class CodingAgentRuntime:
             return decision
         except RoutingFailure as exc:
             raise _RuntimeStop(
-                RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                RuntimeErrorCode.CANCELLED
+                if exc.code == RoutingErrorCode.CANCELLED
+                else RuntimeErrorCode.MODEL_ROUTING_ERROR,
                 f"{exc.code.value}: {str(exc)[:1800]}",
             ) from exc
 
@@ -1911,7 +1940,9 @@ class CodingAgentRuntime:
                 self._validate_route_context(task, session)
             except RoutingFailure as exc:
                 raise _RuntimeStop(
-                    RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                    RuntimeErrorCode.CANCELLED
+                    if exc.code == RoutingErrorCode.CANCELLED
+                    else RuntimeErrorCode.MODEL_ROUTING_ERROR,
                     f"{exc.code.value}: {str(exc)[:1800]}",
                 ) from exc
             return
@@ -2184,6 +2215,8 @@ class CodingAgentRuntime:
         session: Session | None = None,
         role: ModelRole = ModelRole.IMPLEMENTATION,
         stage_id: str = "implementation",
+        cancellation: threading.Event | None = None,
+        revalidate: bool = True,
     ) -> None:
         if task.routing is not None:
             if session is None:
@@ -2199,6 +2232,17 @@ class CodingAgentRuntime:
                 self._validate_assignment(
                     task, session, role, stage_id, model, require_tools=require_tools,
                 )
+                assignment = task.routing.assignment(role, stage_id)
+                if revalidate and assignment is not None:
+                    await self.model_router.validate_live_model(
+                        self.provider,
+                        model,
+                        assignment.required_capabilities,
+                        allow_unknown_chat=(
+                            assignment.reason_code == "conversation_model_preserved"
+                        ),
+                        cancellation=cancellation,
+                    )
             except RoutingFailure as exc:
                 raise _RuntimeStop(
                     RuntimeErrorCode.MODEL_ROUTING_ERROR,
@@ -2206,29 +2250,29 @@ class CodingAgentRuntime:
                 ) from exc
             return
         try:
-            models = await self.provider.list_models()
-            if not any(item.name == model for item in models):
-                raise _RuntimeStop(
-                    RuntimeErrorCode.MODEL_ERROR,
-                    "Selected model is no longer available from the configured provider",
-                )
-            capability = await self.provider.capabilities(model)
+            required = ()
+            if task.plan is not None and any(
+                self._allowed_tools(step) for step in task.plan.steps
+            ):
+                required = ("native_tools",)
+            await self.model_router.validate_live_model(
+                self.provider, model, required,
+                allow_unknown_chat=True, cancellation=cancellation,
+            )
         except _RuntimeStop:
             raise
+        except RoutingFailure as exc:
+            raise _RuntimeStop(
+                RuntimeErrorCode.CANCELLED
+                if exc.code == RoutingErrorCode.CANCELLED
+                else RuntimeErrorCode.MODEL_ERROR,
+                f"{exc.code.value}: {str(exc)[:1024]}",
+            ) from exc
         except Exception as exc:
             raise _RuntimeStop(
                 RuntimeErrorCode.MODEL_ERROR,
                 f"Could not revalidate selected provider/model: {str(exc)[:1024]}",
             ) from exc
-        if capability.name != model:
-            raise _RuntimeStop(RuntimeErrorCode.MODEL_ERROR, "Provider returned mismatched model capabilities")
-        if not capability.tools and task.plan is not None and any(
-            self._allowed_tools(step) for step in task.plan.steps
-        ):
-            raise _RuntimeStop(
-                RuntimeErrorCode.MODEL_ERROR,
-                "Selected model does not advertise native tool support required for execution",
-            )
 
     def _allowed_tools(self, step: Any, *, repair_mode: bool = False) -> frozenset[str]:
         operations = set(step.operations)

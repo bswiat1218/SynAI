@@ -69,7 +69,7 @@ class ReviewProvider:
         return [ModelInfo(name) for name in sorted(self.models)]
 
     async def capabilities(self, name: str) -> ModelInfo:
-        return ModelInfo(name, tools=self.models[name])
+        return ModelInfo(name, tools=self.models[name], chat=True)
 
     async def chat(
         self,
@@ -576,12 +576,27 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
             ), task.task_id)
         task.routing = routing
 
-        result = await self.runtime.run_review(task, self.session, self.repository)
+        events = []
+
+        async def event_sink(event) -> None:
+            events.append(event)
+
+        result = await self.runtime.run_review(
+            task, self.session, self.repository, event_sink=event_sink,
+        )
 
         self.assertEqual(result.outcome, ReviewOutcome.PASSED, result.error)
         self.assertEqual(self.provider.calls[-1][0], "reviewer-model")
         self.assertEqual(self.provider.calls[-1][2], [])
         self.assertEqual(task.review_record.model, "reviewer-model")
+        route_event = next(
+            event for event in events
+            if event.kind == "model_route_selected" and event.model_role == "review"
+        )
+        self.assertEqual(route_event.selected_model, "reviewer-model")
+        self.assertEqual(route_event.step_id, f"review-{task.verification_plan.run_id}")
+        self.assertEqual(route_event.routing_strategy, "capability_first")
+        self.assertFalse(route_event.fallback_used)
         self.assertEqual(
             task.routing.assignment(
                 ModelRole.REVIEW, f"review-{task.verification_plan.run_id}",

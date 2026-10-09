@@ -7,7 +7,11 @@ from typing import Any
 import httpx
 
 from synai.models import ChatEvent, Message, ModelInfo
-from synai.providers.base import ProviderError
+from synai.providers.base import (
+    ModelCapabilityMetadataError,
+    ModelUnavailableError,
+    ProviderError,
+)
 
 
 class OllamaProvider:
@@ -26,12 +30,36 @@ class OllamaProvider:
             )
             response.raise_for_status()
             value = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPStatusError as exc:
+            error_type = (
+                ModelUnavailableError
+                if path == "/api/show" and exc.response.status_code == 404
+                else ProviderError
+            )
+            raise error_type(f"Ollama {path}: {exc}") from exc
+        except httpx.HTTPError as exc:
             raise ProviderError(f"Ollama {path}: {exc}") from exc
+        except ValueError as exc:
+            error_type = (
+                ModelCapabilityMetadataError
+                if path == "/api/show"
+                else ProviderError
+            )
+            raise error_type(f"Ollama {path}: {exc}") from exc
         if not isinstance(value, dict):
-            raise ProviderError("Ollama response must be a JSON object")
+            error_type = (
+                ModelCapabilityMetadataError
+                if path == "/api/show"
+                else ProviderError
+            )
+            raise error_type("Ollama response must be a JSON object")
         if value.get("error"):
-            raise ProviderError(str(value["error"]))
+            error_type = (
+                ModelUnavailableError
+                if path == "/api/show"
+                else ProviderError
+            )
+            raise error_type(str(value["error"]))
         return value
 
     async def list_models(self) -> list[ModelInfo]:
@@ -48,10 +76,24 @@ class OllamaProvider:
 
     async def capabilities(self, name: str) -> ModelInfo:
         result = await self._request("/api/show", {"model": name})
-        capabilities = result.get("capabilities", [])
-        if not isinstance(capabilities, list):
-            raise ProviderError("Invalid model capability metadata")
-        return ModelInfo(name, tools="tools" in capabilities, thinking="thinking" in capabilities)
+        capabilities = result.get("capabilities")
+        if capabilities is None:
+            return ModelInfo(name)
+        if not isinstance(capabilities, list) or any(
+            not isinstance(item, str) for item in capabilities
+        ):
+            return ModelInfo(name, capability_error="invalid capability metadata")
+        chat = (
+            True if "completion" in capabilities
+            else False if "embedding" in capabilities
+            else None
+        )
+        return ModelInfo(
+            name,
+            tools="tools" in capabilities,
+            thinking="thinking" in capabilities,
+            chat=chat,
+        )
 
     async def chat(
         self, model: str, messages: list[Message], tools: list[dict[str, Any]],

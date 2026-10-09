@@ -65,10 +65,13 @@ class PlanProvider:
         self.repair_gate: asyncio.Event | None = None
 
     async def list_models(self) -> list[ModelInfo]:
-        return [ModelInfo(name, tools=tools) for name, tools in sorted(self.models.items())]
+        return [
+            ModelInfo(name, tools=tools, chat=True)
+            for name, tools in sorted(self.models.items())
+        ]
 
     async def capabilities(self, name: str) -> ModelInfo:
-        return ModelInfo(name, tools=self.models[name])
+        return ModelInfo(name, tools=self.models[name], chat=True)
 
     async def chat(
         self,
@@ -1136,10 +1139,25 @@ class VerifierFixture(unittest.IsolatedAsyncioTestCase):
             ), task.task_id)
         task.routing = routing
 
-        result = await self.runtime.run_repair(task, self.session, self.repository)
+        events = []
+
+        async def event_sink(event) -> None:
+            events.append(event)
+
+        result = await self.runtime.run_repair(
+            task, self.session, self.repository, event_sink=event_sink,
+        )
 
         self.assertEqual(result.outcome.value, "verification_passed", result.error)
         self.assertEqual(task.repair_attempts[0].model, repair_model)
+        route_event = next(
+            event for event in events
+            if event.kind == "model_route_selected" and event.model_role == "repair"
+        )
+        self.assertEqual(route_event.selected_model, repair_model)
+        self.assertEqual(route_event.step_id, "repair-1")
+        self.assertEqual(route_event.routing_strategy, "balanced")
+        self.assertFalse(route_event.fallback_used)
         self.assertIn(
             repair_model,
             [decision.selected_model for decision in task.routing.decisions

@@ -13,7 +13,10 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 if TYPE_CHECKING:
+    from synai.models import ModelInfo
     from synai.providers.base import ModelProvider
+
+from synai.providers.errors import ModelCapabilityMetadataError, ModelUnavailableError
 
 
 class RoutingMode(StrEnum):
@@ -381,6 +384,7 @@ class RoutingDecision:
     decision_id: str = field(default_factory=lambda: uuid4().hex)
     context_capacity_tokens: int | None = None
     context_capacity_status: str = "unknown"
+    candidate_rejections: tuple[str, ...] = ()
 
     def validate(self) -> None:
         for value, label, maximum in (
@@ -409,8 +413,29 @@ class RoutingDecision:
                 or len(set(values)) != len(values)
             ):
                 raise ValueError(f"Invalid {label}")
-        if not set(self.required_capabilities).issubset(self.validated_capabilities):
+        missing_capabilities = set(self.required_capabilities) - set(self.validated_capabilities)
+        if missing_capabilities and not (
+            missing_capabilities == {"chat"}
+            and self.reason_code == "conversation_model_preserved"
+        ):
             raise ValueError("Selected model lacks a required validated capability")
+        if not isinstance(self.candidate_rejections, tuple) or len(self.candidate_rejections) > _MAX_CANDIDATES:
+            raise ValueError("Invalid routing candidate limitations")
+        seen_rejections: set[str] = set()
+        rejection_codes = {
+            "not_installed", "role_restricted", "model_unavailable",
+            "capability_lookup_failed", "capability_metadata_invalid",
+            "chat_capability_unknown", "chat_capability_unknown_legacy_preserved",
+            "chat_unsupported", "native_tools_unsupported",
+        }
+        for item in self.candidate_rejections:
+            if not isinstance(item, str) or len(item) > 576 or item in seen_rejections:
+                raise ValueError("Invalid routing candidate limitation")
+            name, separator, reason = item.partition("=")
+            if not separator or reason not in rejection_codes:
+                raise ValueError("Invalid routing candidate limitation")
+            _model_name(name, "routing candidate limitation model")
+            seen_rejections.add(item)
         if type(self.candidate_count) is not int or not 1 <= self.candidate_count <= _MAX_CANDIDATES:
             raise ValueError("Invalid routing candidate count")
         if type(self.model_available) is not bool or type(self.fallback_used) is not bool:
@@ -453,6 +478,7 @@ class RoutingDecision:
             "decision_id": self.decision_id,
             "context_capacity_tokens": self.context_capacity_tokens,
             "context_capacity_status": self.context_capacity_status,
+            "candidate_rejections": list(self.candidate_rejections),
         }
 
     @classmethod
@@ -464,10 +490,14 @@ class RoutingDecision:
             "model_available", "fallback_used", "complexity", "created_at", "decision_id",
             "context_capacity_tokens", "context_capacity_status",
         }
+        current_keys = keys | {"candidate_rejections"}
         if (
-            not isinstance(value, dict) or set(value) != keys
+            not isinstance(value, dict)
+            or frozenset(value) not in {frozenset(keys), frozenset(current_keys)}
             or not isinstance(value["required_capabilities"], list)
             or not isinstance(value["validated_capabilities"], list)
+            or "candidate_rejections" in value
+            and not isinstance(value["candidate_rejections"], list)
         ):
             raise ValueError("Invalid routing decision fields")
         try:
@@ -486,6 +516,7 @@ class RoutingDecision:
                 created_at=value["created_at"], decision_id=value["decision_id"],
                 context_capacity_tokens=value["context_capacity_tokens"],
                 context_capacity_status=value["context_capacity_status"],
+                candidate_rejections=tuple(value.get("candidate_rejections", [])),
             )
             result.validate()
         except (TypeError, ValueError) as exc:
@@ -671,6 +702,119 @@ class ModelRouter:
                 await asyncio.gather(pending, return_exceptions=True)
             raise
 
+    async def validate_live_model(
+        self,
+        provider: ModelProvider,
+        model: str,
+        required_capabilities: tuple[str, ...],
+        *,
+        allow_unknown_chat: bool = False,
+        cancellation: threading.Event | None = None,
+    ) -> Any:
+        """Refresh model availability and required capability evidence at a stage boundary."""
+        try:
+            _model_name(model)
+        except ValueError as exc:
+            raise RoutingFailure(RoutingErrorCode.ROUTE_PROVENANCE_MISMATCH, str(exc)) from exc
+        if (
+            not isinstance(required_capabilities, tuple)
+            or any(item not in {"chat", "native_tools"} for item in required_capabilities)
+            or len(set(required_capabilities)) != len(required_capabilities)
+            or type(allow_unknown_chat) is not bool
+        ):
+            raise RoutingFailure(
+                RoutingErrorCode.INVALID_ROUTING_CONFIGURATION,
+                "Invalid stage capability requirement.",
+            )
+        if cancellation and cancellation.is_set():
+            raise RoutingFailure(RoutingErrorCode.CANCELLED, "Stage model validation was cancelled.")
+
+        deadline = asyncio.get_running_loop().time() + _DISCOVERY_TIMEOUT
+        try:
+            inventory = await self._discover(provider.list_models(), cancellation, deadline)
+        except TimeoutError as exc:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_DISCOVERY_TIMEOUT,
+                "Stage model availability validation timed out.",
+            ) from exc
+        except RoutingFailure:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RoutingFailure(
+                RoutingErrorCode.PROVIDER_UNAVAILABLE,
+                f"Configured provider is unavailable: {str(exc)[:1024]}",
+            ) from exc
+        if cancellation and cancellation.is_set():
+            raise RoutingFailure(RoutingErrorCode.CANCELLED, "Stage model validation was cancelled.")
+        if not isinstance(inventory, list) or any(
+            not isinstance(getattr(item, "name", None), str) for item in inventory
+        ):
+            raise RoutingFailure(
+                RoutingErrorCode.PROVIDER_UNAVAILABLE,
+                "Provider returned invalid model inventory.",
+            )
+        if model not in {item.name for item in inventory}:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_UNAVAILABLE_DURING_STAGE,
+                "The locked stage model is no longer installed.",
+            )
+        try:
+            info = await self._discover(
+                provider.capabilities(model), cancellation, deadline,
+            )
+        except TimeoutError as exc:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_DISCOVERY_TIMEOUT,
+                "Stage capability validation timed out.",
+            ) from exc
+        except RoutingFailure:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except ModelUnavailableError as exc:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_UNAVAILABLE_DURING_STAGE,
+                "The locked stage model is no longer available.",
+            ) from exc
+        except ModelCapabilityMetadataError as exc:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_CAPABILITY_UNAVAILABLE,
+                "The locked stage model returned malformed capability metadata.",
+            ) from exc
+        except Exception as exc:
+            raise RoutingFailure(
+                RoutingErrorCode.PROVIDER_UNAVAILABLE,
+                f"Configured provider capability check failed: {str(exc)[:1024]}",
+            ) from exc
+
+        chat = getattr(info, "chat", None)
+        if (
+            getattr(info, "name", None) != model
+            or type(getattr(info, "tools", None)) is not bool
+            or type(getattr(info, "thinking", None)) is not bool
+            or chat is not None and type(chat) is not bool
+            or getattr(info, "capability_error", None) is not None
+            and not isinstance(getattr(info, "capability_error", None), str)
+            or getattr(info, "capability_error", None)
+        ):
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_CAPABILITY_UNAVAILABLE,
+                "The locked stage model returned invalid capability metadata.",
+            )
+        if chat is False or chat is None and not allow_unknown_chat:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_CAPABILITY_UNAVAILABLE,
+                "The locked stage model lacks verified conversational-generation capability.",
+            )
+        if "native_tools" in required_capabilities and not info.tools:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_CAPABILITY_UNAVAILABLE,
+                "The locked stage model no longer advertises native-tool capability.",
+            )
+        return info
+
     async def select(
         self,
         provider: ModelProvider,
@@ -761,54 +905,105 @@ class ModelRouter:
             installed_names.add(item.name)
 
         eligible: dict[str, ModelInfo] = {}
+        candidate_rejections: list[str] = []
         unavailable: set[str] = set()
         restricted: set[str] = set()
-        for name in candidates:
-            if cancellation and cancellation.is_set():
-                raise RoutingFailure(RoutingErrorCode.CANCELLED, "Model routing was cancelled.")
-            if name not in installed_names:
-                unavailable.add(name)
-                continue
-            profile = config.profile(name)
-            if profile is not None and (
-                not profile.enabled or profile.roles and role not in profile.roles
-            ):
-                restricted.add(name)
-                continue
-            try:
-                info = await self._discover(
-                    provider.capabilities(name), cancellation, discovery_deadline,
-                )
-            except TimeoutError as exc:
-                raise RoutingFailure(
-                    RoutingErrorCode.MODEL_DISCOVERY_TIMEOUT,
-                    f"Capability discovery timed out for {name}.",
-                ) from exc
-            except RoutingFailure:
-                raise
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                raise RoutingFailure(
-                    RoutingErrorCode.PROVIDER_UNAVAILABLE,
-                    f"Capability discovery failed for {name}: {str(exc)[:1024]}",
-                ) from exc
-            if (
-                getattr(info, "name", None) != name
-                or type(getattr(info, "tools", None)) is not bool
-                or type(getattr(info, "thinking", None)) is not bool
-                or getattr(info, "capability_error", None) is not None
-                and not isinstance(getattr(info, "capability_error", None), str)
-            ):
-                continue
-            if not info.capability_error and (not require_tools or info.tools):
-                eligible[name] = info
+        capability_failures: set[str] = set()
+        completed_capability_lookups = 0
 
-        primary_eligible = [name for name in candidate_groups[0] if name in eligible]
-        fallback_eligible = [name for name in candidate_groups[1] if name in eligible]
+        async def inspect_group(names: tuple[str, ...], *, first_only: bool = False) -> None:
+            nonlocal completed_capability_lookups
+            for name in names:
+                if cancellation and cancellation.is_set():
+                    raise RoutingFailure(RoutingErrorCode.CANCELLED, "Model routing was cancelled.")
+                if name not in installed_names:
+                    unavailable.add(name)
+                    candidate_rejections.append(f"{name}=not_installed")
+                    continue
+                profile = config.profile(name)
+                if profile is not None and (
+                    not profile.enabled or profile.roles and role not in profile.roles
+                ):
+                    restricted.add(name)
+                    candidate_rejections.append(f"{name}=role_restricted")
+                    continue
+                try:
+                    info = await self._discover(
+                        provider.capabilities(name), cancellation, discovery_deadline,
+                    )
+                except TimeoutError as exc:
+                    raise RoutingFailure(
+                        RoutingErrorCode.MODEL_DISCOVERY_TIMEOUT,
+                        f"Capability discovery timed out for {name}.",
+                    ) from exc
+                except RoutingFailure:
+                    raise
+                except asyncio.CancelledError:
+                    raise
+                except ModelUnavailableError:
+                    unavailable.add(name)
+                    candidate_rejections.append(f"{name}=model_unavailable")
+                    continue
+                except ModelCapabilityMetadataError:
+                    completed_capability_lookups += 1
+                    candidate_rejections.append(f"{name}=capability_metadata_invalid")
+                    continue
+                except Exception:
+                    capability_failures.add(name)
+                    candidate_rejections.append(f"{name}=capability_lookup_failed")
+                    continue
+                completed_capability_lookups += 1
+                chat = getattr(info, "chat", None)
+                if (
+                    getattr(info, "name", None) != name
+                    or type(getattr(info, "tools", None)) is not bool
+                    or type(getattr(info, "thinking", None)) is not bool
+                    or chat is not None and type(chat) is not bool
+                    or getattr(info, "capability_error", None) is not None
+                    and not isinstance(getattr(info, "capability_error", None), str)
+                ):
+                    candidate_rejections.append(f"{name}=capability_metadata_invalid")
+                    continue
+                if info.capability_error:
+                    candidate_rejections.append(f"{name}=capability_metadata_invalid")
+                    continue
+                if chat is False:
+                    candidate_rejections.append(f"{name}=chat_unsupported")
+                    continue
+                if chat is None and config.mode != RoutingMode.SINGLE_MODEL:
+                    candidate_rejections.append(f"{name}=chat_capability_unknown")
+                    continue
+                if require_tools and not info.tools:
+                    candidate_rejections.append(f"{name}=native_tools_unsupported")
+                    continue
+                eligible[name] = info
+                if chat is None:
+                    candidate_rejections.append(
+                        f"{name}=chat_capability_unknown_legacy_preserved",
+                    )
+                if first_only:
+                    break
+
+        primary_names = candidate_groups[0]
+        if config.strategy == RoutingStrategy.PINNED:
+            primary_names = primary_names[:1]
+        await inspect_group(primary_names)
+        primary_eligible = [name for name in primary_names if name in eligible]
+        fallback_names = candidate_groups[1]
+        if not primary_eligible and fallback_names:
+            await inspect_group(
+                fallback_names,
+                first_only=config.strategy == RoutingStrategy.PINNED,
+            )
+        fallback_eligible = [name for name in fallback_names if name in eligible]
         used_fallback = not primary_eligible
         pool = fallback_eligible if used_fallback else primary_eligible
         if not pool:
+            if capability_failures and completed_capability_lookups == 0:
+                raise RoutingFailure(
+                    RoutingErrorCode.PROVIDER_UNAVAILABLE,
+                    "Capability discovery failed for every available routing candidate.",
+                )
             code = (
                 RoutingErrorCode.MODEL_NOT_INSTALLED
                 if all(name in unavailable for name in candidates)
@@ -841,7 +1036,12 @@ class ModelRouter:
             )
             if used_fallback:
                 reason = "configured_fallback"
-        validated = ("chat", "native_tools") if eligible[selected].tools else ("chat",)
+        validated_items = []
+        if eligible[selected].chat is True:
+            validated_items.append("chat")
+        if eligible[selected].tools:
+            validated_items.append("native_tools")
+        validated = tuple(validated_items)
         decision = RoutingDecision(
             task_id=task_id,
             role=role,
@@ -868,6 +1068,7 @@ class ModelRouter:
                 and config.profile(selected).context_capacity is not None
                 else "unknown"
             ),
+            candidate_rejections=tuple(candidate_rejections),
         )
         decision.validate()
         return decision

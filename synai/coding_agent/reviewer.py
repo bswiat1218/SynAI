@@ -47,7 +47,6 @@ from synai.coding_agent.state import (
 )
 from synai.coding_agent.routing import (
     ModelRole,
-    RoutingErrorCode,
     RoutingFailure,
     RoutingMode,
     estimate_complexity,
@@ -340,6 +339,24 @@ class ReviewEngine:
                 limitations.extend(review_request.limitations)
                 await self._emit(request, task, "review_context_prepared")
                 self._check_cancelled(request)
+                from synai.coding_agent.runtime import _RuntimeStop
+
+                try:
+                    await self.runtime._validate_provider_for_execution(
+                        review_request.model,
+                        task,
+                        session=request.session,
+                        role=ModelRole.REVIEW,
+                        stage_id=f"review-{review_request.verification_plan.run_id}",
+                        cancellation=request.cancellation,
+                    )
+                except _RuntimeStop as exc:
+                    if exc.code.value == "cancelled":
+                        raise asyncio.CancelledError from exc
+                    raise _ReviewStop(
+                        ReviewOutcome.BLOCKED,
+                        f"{exc.code.value}: {exc.message[:1024]}",
+                    ) from exc
                 await self._emit(request, task, "review_model_requested")
                 summary, findings = await self._review_model(
                     request, review_request, deadline,
@@ -807,6 +824,8 @@ class ReviewEngine:
         if task.routing is not None or self.runtime.routing_config.mode == RoutingMode.ROUTED:
             if task.verification_plan is None:
                 raise _ReviewStop(ReviewOutcome.BLOCKED, "Review requires a current verification plan.")
+            from synai.coding_agent.runtime import _RuntimeStop
+
             try:
                 decision = await self.runtime._assign_stage(
                     task,
@@ -824,7 +843,15 @@ class ReviewEngine:
                     require_tools=False,
                     cancellation=request.cancellation,
                     checkpoint=request.checkpoint,
+                    event_sink=request.event_sink,
                 )
+            except _RuntimeStop as exc:
+                if exc.code.value == "cancelled":
+                    raise asyncio.CancelledError from exc
+                raise _ReviewStop(
+                    ReviewOutcome.BLOCKED,
+                    f"{exc.code.value}: {exc.message[:1024]}",
+                ) from exc
             except RoutingFailure as exc:
                 raise _ReviewStop(
                     ReviewOutcome.BLOCKED,

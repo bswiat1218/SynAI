@@ -19,6 +19,7 @@ class ModelInfo:
     tools: bool = False
     thinking: bool = False
     capability_error: str | None = None
+    chat: bool | None = None
 
 
 @dataclass

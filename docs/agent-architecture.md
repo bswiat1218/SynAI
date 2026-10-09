@@ -600,13 +600,26 @@ The default `SINGLE_MODEL` mode preserves the conversation-selected model and
 does not substitute another model. Explicit `ROUTED` mode supports
 `PINNED`, `BALANCED`, and `CAPABILITY_FIRST` deterministic ranking. The
 application selects each role model only when that stage is ready. A
-candidate must advertise every required capability; implementation and
-repair require native tools where the plan exposes them, while planner and
-review requests use empty tool lists. Fallback is only from explicitly
-configured per-role fallback candidates and only before a stage assignment
-has been committed. A missing/incompatible pool, unavailable provider,
-endpoint change, or malformed configuration returns a typed routing failure.
-There is no mid-stage model replacement.
+candidate must advertise conversational generation; implementation and
+repair also require native tools where the plan exposes them, while planner
+and review requests use empty tool lists. Ollama's advertised `completion`
+capability establishes conversational eligibility, and an explicitly
+embedding-only model is rejected. Missing capability metadata remains
+unknown, not verified. The legacy `SINGLE_MODEL` mode preserves the exact
+selected model when chat metadata is unknown, but does not record chat as a
+validated capability; known unsupported chat or required native-tool support
+still fails closed.
+
+An individual unavailable model or invalid/inaccessible candidate capability
+record is isolated and recorded as a bounded candidate limitation. Global
+inventory errors, discovery deadline exhaustion, cancellation, and provider
+outages remain typed failures. The router does not inspect configured
+fallbacks after a usable preferred pool has been established; `PINNED`
+selection stops at the first eligible configured candidate. Fallback is only
+from explicitly configured per-role fallback candidates and only before a
+stage assignment has been committed. A missing/incompatible pool, unavailable
+provider, endpoint change, or malformed configuration returns a typed routing
+failure. There is no mid-stage model replacement.
 
 Profiles contain only user-declared enabled state, eligible roles, relative
 capability/resource/latency tiers, optional context capacity, and bounded
@@ -619,11 +632,16 @@ as unverified and never proves prompt fit.
 Each task checkpoint stores a configuration fingerprint, provider class,
 endpoint fingerprint, immutable role/stage decisions, required and validated
 capabilities, complexity reason, selection reason, candidate count, and
-fallback outcome, bound to the conversation session. Model inventory and
-capability discovery share a bounded deadline. It does not store inventories,
-prompts, source, or credentials. Execution records identify the model that
-generated each tool request; repair attempts and review records retain their
-actual model.
+fallback outcome, candidate limitations, and bounded stage-selection events,
+bound to the conversation session. Model inventory and capability discovery
+share a bounded deadline. Before planning, implementation, repair, and review
+begin, the locked model's installed state and mandatory capabilities are
+revalidated under a fresh bounded discovery deadline. Per-step routed execution
+checks retain the lock/provenance but do not repeat provider discovery. A
+failed revalidation stops the stage; the committed assignment is not silently
+replaced. It does not store inventories, prompts, source, or credentials.
+Execution records identify the model that generated each tool request; repair
+attempts and review records retain their actual model.
 `AgentTask.selected_model` remains the conversation-selected model, and the
 validated plan continues to identify its actual planner. Routed execution
 validates the separate implementation assignment rather than equating these
@@ -637,4 +655,7 @@ requests. Route changes while an approval is pending fail the dispatch guard;
 provider failure after a stage begins preserves execution and pending-mutation
 records and never causes an automatic retry through another model. The
 existing `Tools` dispatcher and Phase 10 autonomy policy remain the sole
-authorities for tool exposure and execution.
+authorities for tool exposure and execution. A routing-selection event is sent
+only after the stage assignment checkpoint succeeds. It contains bounded task,
+stage, role, model, strategy, reason, and fallback metadata; observer failures
+are logged and do not change persisted task state.

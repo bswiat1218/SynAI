@@ -4,10 +4,18 @@ from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
 from synai.models import ChatEvent, Message, ModelInfo
+from synai.providers.errors import (
+    ModelCapabilityMetadataError,
+    ModelUnavailableError,
+    ProviderError,
+)
 
-
-class ProviderError(Exception):
-    pass
+__all__ = [
+    "ModelCapabilityMetadataError",
+    "ModelProvider",
+    "ModelUnavailableError",
+    "ProviderError",
+]
 
 
 class ModelProvider(Protocol):
