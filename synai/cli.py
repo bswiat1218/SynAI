@@ -32,24 +32,32 @@ def main(argv: Sequence[str] | None = None) -> None:
     from synai.config import Settings
     from synai.preferences import PreferencesStore, resolve_connection
     from synai.tui.application import CodingApp
+    from synai.web.ownership import DataRootOwnership, OwnershipConflict
 
+    ownership: DataRootOwnership | None = None
     try:
         settings = replace(
             Settings(ollama_url="http://localhost:11434", request_timeout=1200),
             **{key: value for key, value in vars(args).items() if value is not None},
         )
+        settings.validate()
+        ownership = DataRootOwnership(settings.history_dir, "tui")
+        ownership.acquire()
         saved = PreferencesStore(settings.history_dir).load()
         settings, sources = resolve_connection(
             settings, saved, cli_url=args.ollama_url, cli_timeout=args.request_timeout,
         )
         settings.validate()
-    except (ValueError, OSError) as exc:
+        application = CodingApp(settings, preferences=saved, connection_sources=sources)
+    except (ValueError, OSError, OwnershipConflict) as exc:
+        if ownership is not None:
+            ownership.release()
         parser.error(str(exc))
     try:
-        application = CodingApp(settings, preferences=saved, connection_sources=sources)
-    except (ValueError, OSError) as exc:
-        parser.error(str(exc))
-    application.run()
+        application.run()
+    finally:
+        assert ownership is not None
+        ownership.release()
 
 
 if __name__ == "__main__":

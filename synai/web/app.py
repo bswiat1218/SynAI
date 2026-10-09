@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import AsyncIterator
+
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyCookie, APIKeyHeader
+from starlette.types import ASGIApp, Receive, Scope, Send
+from urllib.parse import urlsplit
+
+from synai.providers.base import ModelProvider, ProviderError
+from synai.providers.ollama import OllamaProvider
+from synai.web.auth import (
+    AuthenticatedSession,
+    AuthenticationError,
+    AuthenticationService,
+)
+from synai.web.config import WebConfig
+from synai.web.database import MetadataDatabase
+from synai.web.ownership import DataRootOwnership
+from synai.web.projects import (
+    ProjectRegistry,
+    ProjectRegistryError,
+    RegisteredProject,
+)
+from synai.web.schemas import (
+    CsrfResponse,
+    ErrorResponse,
+    HealthResponse,
+    LoginRequest,
+    LoginResponse,
+    ModelListResponse,
+    ModelResponse,
+    PasswordChangeRequest,
+    ProjectListResponse,
+    ProjectRegistrationRequest,
+    ProjectResponse,
+    SessionResponse,
+)
+
+
+_logger = logging.getLogger(__name__)
+_SESSION_COOKIE = "synai_session"
+_CSRF_HEADER = "x-csrf-token"
+_session_cookie = APIKeyCookie(
+    name=_SESSION_COOKIE, scheme_name="SessionCookie", auto_error=False,
+)
+_csrf_header = APIKeyHeader(
+    name="X-CSRF-Token", scheme_name="CsrfToken", auto_error=False,
+)
+
+
+@dataclass
+class WebServices:
+    config: WebConfig
+    provider: ModelProvider
+    database: MetadataDatabase
+    ownership: DataRootOwnership
+    owns_provider: bool = False
+    auth: AuthenticationService | None = None
+    projects: ProjectRegistry | None = None
+    ready: bool = False
+
+    async def start(self) -> None:
+        self.config.validate()
+        self.ownership.acquire()
+        try:
+            self.database.initialize()
+            self.auth = AuthenticationService(
+                self.database, self.config.session_lifetime_seconds,
+            )
+            self.auth.initialize(self.config.initial_password)
+            self.projects = ProjectRegistry(self.database, self.config)
+            self.ready = True
+        except BaseException:
+            self.ownership.release()
+            raise
+
+    async def close(self) -> None:
+        self.ready = False
+        self.ownership.release()
+        close = getattr(self.provider, "close", None)
+        if callable(close):
+            result = close()
+            if asyncio.iscoroutine(result):
+                await result
+
+
+class RequestLimitsMiddleware:
+    def __init__(self, app: ASGIApp, max_body_bytes: int, max_concurrent: int) -> None:
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        state = scope.setdefault("state", {})
+        state["request_id"] = uuid.uuid4().hex
+        content_length = _content_length(scope)
+        if content_length == -1:
+            await self._error(scope, send, 400, "invalid_request", "Invalid request.")
+            return
+        if content_length is not None and content_length > self.max_body_bytes:
+            await self._error(scope, send, 413, "request_too_large", "Request body exceeds the configured limit.")
+            return
+        try:
+            await asyncio.wait_for(self.semaphore.acquire(), timeout=1)
+        except TimeoutError:
+            await self._error(scope, send, 503, "server_busy", "Server is temporarily busy.")
+            return
+        try:
+            messages: list[dict[str, object]] = []
+            size = 0
+            while True:
+                message = await receive()
+                if message["type"] != "http.request":
+                    if message["type"] == "http.disconnect":
+                        return
+                    continue
+                chunk = message.get("body", b"")
+                if not isinstance(chunk, bytes):
+                    await self._error(scope, send, 400, "invalid_request", "Invalid request.")
+                    return
+                size += len(chunk)
+                if size > self.max_body_bytes:
+                    await self._error(scope, send, 413, "request_too_large", "Request body exceeds the configured limit.")
+                    return
+                messages.append(message)
+                if not message.get("more_body", False):
+                    break
+            cursor = 0
+
+            async def replay() -> dict[str, object]:
+                nonlocal cursor
+                if cursor < len(messages):
+                    current = messages[cursor]
+                    cursor += 1
+                    return current
+                return {"type": "http.disconnect"}
+
+            await self.app(scope, replay, send)
+        finally:
+            self.semaphore.release()
+
+    @staticmethod
+    async def _error(
+        scope: Scope, send: Send, status: int, code: str, message: str,
+    ) -> None:
+        request_id = scope.get("state", {}).get("request_id", uuid.uuid4().hex)
+        response = JSONResponse(
+            status_code=status,
+            content={"error": {"code": code, "message": message, "request_id": request_id}},
+        )
+        await response(scope, _unused_receive, send)
+
+
+async def _unused_receive() -> dict[str, object]:
+    return {"type": "http.disconnect"}
+
+
+def create_app(
+    config: WebConfig | None = None,
+    *,
+    provider: ModelProvider | None = None,
+    services: WebServices | None = None,
+) -> FastAPI:
+    selected_config = config or WebConfig.from_env()
+    selected_config.validate()
+    if services is not None:
+        if config is not None and services.config != config:
+            raise ValueError("Injected service configuration does not match the app configuration")
+        service = services
+    else:
+        active_provider = provider or OllamaProvider(selected_config.ollama_url)
+        database = MetadataDatabase(selected_config.data_root)
+        service = WebServices(
+            selected_config,
+            active_provider,
+            database,
+            DataRootOwnership(selected_config.data_root, "web"),
+            owns_provider=provider is None,
+        )
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            await service.start()
+            yield
+        finally:
+            await service.close()
+
+    app = FastAPI(
+        title="SynAI Web API",
+        version="1.0.0",
+        description="Read-only, single-user web foundation for SynAI.",
+        openapi_url="/api/openapi.json",
+        docs_url="/api/docs",
+        redoc_url=None,
+        lifespan=lifespan,
+    )
+    app.state.services = service
+    app.add_middleware(
+        RequestLimitsMiddleware,
+        max_body_bytes=selected_config.request_limit_bytes,
+        max_concurrent=selected_config.concurrent_request_limit,
+    )
+    app.add_exception_handler(AuthenticationError, _authentication_error)
+    app.add_exception_handler(ProjectRegistryError, _project_error)
+    app.add_exception_handler(RequestValidationError, _validation_error)
+    app.add_exception_handler(HTTPException, _http_error)
+    app.add_exception_handler(Exception, _internal_error)
+
+    router = APIRouter()
+
+    def services_from(request: Request) -> WebServices:
+        current: WebServices = request.app.state.services
+        if not current.ready:
+            raise HTTPException(status_code=503, detail="not_ready")
+        return current
+
+    def current_session(
+        raw_token: str | None = Depends(_session_cookie),
+        current: WebServices = Depends(services_from),
+    ) -> AuthenticatedSession:
+        assert current.auth is not None
+        return current.auth.session(raw_token)
+
+    def require_origin(request: Request) -> None:
+        if request.headers.get("origin") != _normalized_origin(selected_config.public_origin):
+            raise AuthenticationError("origin_rejected", 403, "Request origin is not allowed.")
+
+    def require_csrf(
+        request: Request,
+        session: AuthenticatedSession,
+        current: WebServices,
+        csrf_token: str | None,
+    ) -> None:
+        require_origin(request)
+        assert current.auth is not None
+        if not current.auth.verify_csrf(session, csrf_token):
+            raise AuthenticationError("csrf_rejected", 403, "Request could not be verified.")
+
+    @router.get("/api/v1/health", response_model=HealthResponse)
+    async def health() -> HealthResponse:
+        return HealthResponse(status="alive")
+
+    @router.get("/api/v1/ready", response_model=HealthResponse)
+    async def ready(current: WebServices = Depends(services_from)) -> HealthResponse:
+        del current
+        return HealthResponse(status="ready")
+
+    @router.post(
+        "/api/v1/auth/login",
+        response_model=LoginResponse,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
+    )
+    async def login(body: LoginRequest, request: Request, response: Response,
+                    current: WebServices = Depends(services_from)) -> LoginResponse:
+        require_origin(request)
+        assert current.auth is not None
+        peer = request.client.host if request.client is not None else "unknown"
+        issued = await asyncio.to_thread(
+            current.auth.login, body.password, peer,
+        )
+        response.set_cookie(
+            _SESSION_COOKIE,
+            issued.token,
+            httponly=True,
+            secure=selected_config.secure_cookies,
+            samesite="strict",
+            path="/api/v1",
+            max_age=selected_config.session_lifetime_seconds,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return LoginResponse(
+            authenticated=True, csrf_token=issued.csrf_token, expires_at=issued.expires_at,
+        )
+
+    @router.get(
+        "/api/v1/auth/session",
+        response_model=SessionResponse,
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def session_status(
+        response: Response,
+        session: AuthenticatedSession = Depends(current_session),
+    ) -> SessionResponse:
+        response.headers["Cache-Control"] = "no-store"
+        return SessionResponse(authenticated=True, expires_at=session.expires_at)
+
+    @router.post(
+        "/api/v1/auth/csrf",
+        response_model=CsrfResponse,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+    )
+    async def csrf(
+        request: Request,
+        response: Response,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> CsrfResponse:
+        require_origin(request)
+        assert current.auth is not None
+        response.headers["Cache-Control"] = "no-store"
+        return CsrfResponse(csrf_token=current.auth.rotate_csrf(session))
+
+    @router.post(
+        "/api/v1/auth/logout",
+        response_model=SessionResponse,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+    )
+    async def logout(
+        request: Request,
+        response: Response,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> SessionResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.auth is not None
+        current.auth.logout(session)
+        response.headers["Cache-Control"] = "no-store"
+        response.delete_cookie(
+            _SESSION_COOKIE, path="/api/v1", secure=selected_config.secure_cookies,
+            httponly=True, samesite="strict",
+        )
+        return SessionResponse(authenticated=False, expires_at=int(time.time()))
+
+    @router.post(
+        "/api/v1/auth/password",
+        status_code=204,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+    )
+    async def change_password(
+        body: PasswordChangeRequest,
+        request: Request,
+        response: Response,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> Response:
+        require_csrf(request, session, current, csrf_token)
+        assert current.auth is not None
+        await asyncio.to_thread(
+            current.auth.change_password,
+            session,
+            body.current_password,
+            body.new_password,
+        )
+        response.delete_cookie(
+            _SESSION_COOKIE, path="/api/v1", secure=selected_config.secure_cookies,
+            httponly=True, samesite="strict",
+        )
+        response.headers["Cache-Control"] = "no-store"
+        response.status_code = 204
+        return response
+
+    @router.get(
+        "/api/v1/models",
+        response_model=ModelListResponse,
+        responses={401: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    )
+    async def models(
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> ModelListResponse:
+        try:
+            available = await current.provider.list_models()
+        except ProviderError as exc:
+            _logger.info("Ollama model discovery unavailable")
+            raise HTTPException(status_code=503, detail="provider_unavailable") from exc
+        if len(available) > 4096 or any(
+            not isinstance(item.name, str) or not item.name or len(item.name) > 256
+            for item in available
+        ):
+            raise HTTPException(status_code=503, detail="provider_unavailable")
+        return ModelListResponse(models=[ModelResponse(name=item.name) for item in available])
+
+    @router.get(
+        "/api/v1/projects",
+        response_model=ProjectListResponse,
+        responses={401: {"model": ErrorResponse}},
+    )
+    async def projects(
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> ProjectListResponse:
+        assert current.projects is not None
+        return ProjectListResponse(projects=[
+            _project_response(project) for project in current.projects.list_projects()
+        ])
+
+    @router.post(
+        "/api/v1/projects",
+        response_model=ProjectResponse,
+        status_code=201,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    async def register_project(
+        body: ProjectRegistrationRequest,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> ProjectResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.projects is not None
+        return _project_response(current.projects.register(body.workspace_key))
+
+    @router.get(
+        "/api/v1/projects/{project_id}",
+        response_model=ProjectResponse,
+        responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    async def inspect_project(
+        project_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> ProjectResponse:
+        assert current.projects is not None
+        return _project_response(current.projects.inspect(project_id))
+
+    app.include_router(router)
+    return app
+
+
+def _project_response(project: RegisteredProject) -> ProjectResponse:
+    return ProjectResponse(
+        id=project.project_id,
+        name=project.name,
+        status=project.status,
+        access="read_only",
+    )
+
+
+def _normalized_origin(value: str) -> str:
+    parsed = urlsplit(value)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _content_length(scope: Scope) -> int | None:
+    values = [value for name, value in scope.get("headers", []) if name.lower() == b"content-length"]
+    if not values:
+        return None
+    if len(values) != 1:
+        return -1
+    try:
+        parsed = int(values[0])
+    except ValueError:
+        return -1
+    return parsed if parsed >= 0 else -1
+
+
+async def _authentication_error(_: Request, exc: AuthenticationError) -> JSONResponse:
+    return _error_response(exc.status_code, exc.code, exc.public_message)
+
+
+async def _project_error(_: Request, exc: ProjectRegistryError) -> JSONResponse:
+    return _error_response(exc.status_code, exc.code, exc.public_message)
+
+
+async def _validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
+    return _error_response(422, "invalid_request", "Request does not match the required schema.")
+
+
+async def _http_error(_: Request, exc: HTTPException) -> JSONResponse:
+    known = {
+        (503, "not_ready"): (503, "not_ready", "Service is not ready."),
+        (503, "provider_unavailable"): (503, "provider_unavailable", "Model provider is unavailable."),
+    }
+    status, code, message = known.get(
+        (exc.status_code, exc.detail),
+        (exc.status_code, "request_rejected", "Request could not be completed."),
+    )
+    return _error_response(status, code, message)
+
+
+async def _internal_error(request: Request, _: Exception) -> JSONResponse:
+    request_id = getattr(request.state, "request_id", uuid.uuid4().hex)
+    _logger.error("Unhandled API error request_id=%s", request_id)
+    return _error_response(500, "internal_error", "An internal error occurred.", request_id)
+
+
+def _error_response(
+    status: int,
+    code: str,
+    message: str,
+    request_id: str | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        headers={"Cache-Control": "no-store"},
+        content={"error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id or uuid.uuid4().hex,
+        }},
+    )

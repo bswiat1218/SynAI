@@ -1,0 +1,838 @@
+{
+  "components": {
+    "schemas": {
+      "CsrfResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "csrf_token": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Csrf Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "csrf_token"
+        ],
+        "title": "CsrfResponse",
+        "type": "object"
+      },
+      "ErrorDetail": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Message",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 64,
+            "minLength": 16,
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "title": "ErrorDetail",
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "ErrorResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "LoginRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "password": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "password"
+        ],
+        "title": "LoginRequest",
+        "type": "object"
+      },
+      "LoginResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authenticated": {
+            "title": "Authenticated",
+            "type": "boolean"
+          },
+          "csrf_token": {
+            "maxLength": 128,
+            "minLength": 32,
+            "title": "Csrf Token",
+            "type": "string"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authenticated",
+          "csrf_token",
+          "expires_at"
+        ],
+        "title": "LoginResponse",
+        "type": "object"
+      },
+      "ModelListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelResponse"
+            },
+            "maxItems": 4096,
+            "title": "Models",
+            "type": "array"
+          }
+        },
+        "required": [
+          "models"
+        ],
+        "title": "ModelListResponse",
+        "type": "object"
+      },
+      "ModelResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "ModelResponse",
+        "type": "object"
+      },
+      "PasswordChangeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "current_password": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "new_password": {
+            "maxLength": 1024,
+            "minLength": 12,
+            "title": "New Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password",
+          "new_password"
+        ],
+        "title": "PasswordChangeRequest",
+        "type": "object"
+      },
+      "ProjectListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectResponse"
+            },
+            "maxItems": 256,
+            "title": "Projects",
+            "type": "array"
+          }
+        },
+        "required": [
+          "projects"
+        ],
+        "title": "ProjectListResponse",
+        "type": "object"
+      },
+      "ProjectRegistrationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "workspace_key": {
+            "maxLength": 32,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9_-]*$",
+            "title": "Workspace Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "workspace_key"
+        ],
+        "title": "ProjectRegistrationRequest",
+        "type": "object"
+      },
+      "ProjectResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "access": {
+            "default": "read_only",
+            "title": "Access",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[a-f0-9]{32}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "status"
+        ],
+        "title": "ProjectResponse",
+        "type": "object"
+      },
+      "SessionResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "authenticated": {
+            "title": "Authenticated",
+            "type": "boolean"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "authenticated",
+          "expires_at"
+        ],
+        "title": "SessionResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "CsrfToken": {
+        "in": "header",
+        "name": "X-CSRF-Token",
+        "type": "apiKey"
+      },
+      "SessionCookie": {
+        "in": "cookie",
+        "name": "synai_session",
+        "type": "apiKey"
+      }
+    }
+  },
+  "info": {
+    "description": "Read-only, single-user web foundation for SynAI.",
+    "title": "SynAI Web API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/auth/csrf": {
+      "post": {
+        "operationId": "csrf_api_v1_auth_csrf_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CsrfResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Csrf"
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "operationId": "login_api_v1_auth_login_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoginResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          }
+        },
+        "summary": "Login"
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "operationId": "logout_api_v1_auth_logout_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "CsrfToken": []
+          }
+        ],
+        "summary": "Logout"
+      }
+    },
+    "/api/v1/auth/password": {
+      "post": {
+        "operationId": "change_password_api_v1_auth_password_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasswordChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "CsrfToken": []
+          }
+        ],
+        "summary": "Change Password"
+      }
+    },
+    "/api/v1/auth/session": {
+      "get": {
+        "operationId": "session_status_api_v1_auth_session_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Session Status"
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health"
+      }
+    },
+    "/api/v1/models": {
+      "get": {
+        "operationId": "models_api_v1_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Models"
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "operationId": "projects_api_v1_projects_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Projects"
+      },
+      "post": {
+        "operationId": "register_project_api_v1_projects_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectRegistrationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "CsrfToken": []
+          }
+        ],
+        "summary": "Register Project"
+      }
+    },
+    "/api/v1/projects/{project_id}": {
+      "get": {
+        "operationId": "inspect_project_api_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Inspect Project"
+      }
+    },
+    "/api/v1/ready": {
+      "get": {
+        "operationId": "ready_api_v1_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ready"
+      }
+    }
+  }
+}

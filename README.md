@@ -427,9 +427,3 @@ before updating these assets. The editor needs glibc 2.34+, `libgcc_s.so.1`,
 and executable temporary storage. Keep it within the sandbox's existing
 256 MiB tmpfs with room for swaps/recovery. Run the editor tests after changes.
 
-## License
-
-SynAI is licensed under [Apache-2.0](LICENSE), copyright SynAI contributors.
-See [NOTICE](NOTICE) for component boundaries. Bundled Neovim and mini.nvim
-retain their upstream licenses and redistribution notices. GTK/VTE, Ollama,
-and container runtimes are not bundled.

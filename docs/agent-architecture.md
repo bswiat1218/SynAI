@@ -750,3 +750,16 @@ scope and approvals, Phase 6 verification, Phase 8 review, Phase 10 policy,
 and Phase 11 routing remain authoritative. Capture runs only after review has
 persisted task completion; a memory-write error emits a separate failure
 event and does not roll back the task, replay mutations, or rerun checks.
+
+## Web foundation (Phase 13B)
+
+The opt-in browser foundation is additive; the TUI, existing history/task
+formats, Phase 0–12 authorization flow, `Tools` dispatcher, and Phase 12
+memory identity remain authoritative. The FastAPI API is versioned and
+read-only for projects, model discovery, and authentication; it does not run
+chat turns, dispatch tools, execute commands, or mutate project files. Web
+service and TUI startup share an OS-backed application-data-root ownership
+lock. Workspace lease/fencing primitives are future-writer contracts and are
+not connected to web mutation routes. The detailed API, deployment,
+authentication, runner boundary, recovery, and Phase 12 compatibility
+constraints are documented in [phase-13b-web.md](./phase-13b-web.md).
