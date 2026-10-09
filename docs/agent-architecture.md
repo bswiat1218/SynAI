@@ -694,24 +694,51 @@ old checkpoint cannot silently recreate it.
 
 The private store is SQLite at
 `<application storage>/project-memory/memory.sqlite3`, outside source
-repositories and conversation checkpoints. Schema version 1 is initialized
-transactionally; unknown future or corrupt databases fail explicitly and are
-never reset. Parent directories and the database are owner-only, database
-access uses parameterized statements and bounded transactions, and SQLite
-busy handling serializes concurrent writers. Record count, byte size, content,
-evidence-path, retrieval, and tombstone limits are validated. At capacity,
-writes fail explicitly rather than evicting pinned memories or task history.
+repositories and conversation checkpoints. Database schema version 2 adds a
+transactionally maintained normalized-token/path/symbol candidate index;
+existing Phase 12 schema-version-1 databases are transactionally indexed
+without changing record payloads or project ownership. Unknown future or
+corrupt databases fail explicitly and are never reset. Parent directories and
+the database are owner-only, database access uses parameterized statements
+and bounded transactions, and SQLite busy handling serializes concurrent
+writers. Record count, byte size, content, evidence-path, retrieval, and
+tombstone limits are validated. At capacity, writes fail explicitly rather
+than evicting pinned memories or task history.
 
-Retrieval is deterministic lexical/path/symbol matching, bounded to a
-configured number of records, characters, and duration, with stable
-tie-breaking. It has no Ollama, embedding, vector, or external-search calls.
+Retrieval first requires an exact workspace-relative evidence path/filename,
+exact evidence symbol, or normalized meaningful-token overlap. Verified
+provenance, user-pinned status, and source-evidence quality only affect ranking
+after this eligibility gate. Indexed candidate discovery is project- and
+active-status-scoped across the full supported namespace (up to 4,096 records),
+then deterministic relevance ranking uses specificity, provenance, freshness,
+recency, and memory ID tie-breaking. Query work is bounded by the validated
+query shape (64 distinct normalized terms; oversized queries fail explicitly),
+indexed candidate ceiling, configured deadline, cancellation, result count,
+character budget, and selected-source byte budget. No arbitrary recent-record
+window can hide an older indexed match. There are no Ollama,
+embedding, vector, or external-search calls; lexical matching may miss
+semantic paraphrases. Empty eligible candidate sets remain empty.
+
 Selected source-linked memories are checked against current workspace-relative
 fingerprints through `RepositoryIndex.read_file_bytes`, limited to selected
 paths and a bounded total byte budget; this avoids a repository-wide rescan.
-Changed or missing files mark the record stale and exclude it, while evidence
-that cannot safely be read is unavailable and excluded. User-pinned notes
-without source links are explicitly labeled unverified. Lexical matching may
-miss semantic paraphrases.
+Changed source marks an active record stale and excludes it; missing or unsafe
+evidence is unavailable and excluded. An explicitly authorized correction
+may promote an active or stale record to an active user-confirmed note,
+preserving its historical task identifiers while removing obsolete source
+fingerprint claims. Archived, superseded, and deleted records cannot be
+revived through correction. Unlinked user-pinned/corrected notes remain
+explicitly unverified. Manual text search returns active indexed matches but
+has no repository reader argument and therefore does not independently
+fingerprint source; it is separate from task-context retrieval.
+
+Manual replacement and automatic freshness/status updates use conditional
+record-JSON compare-and-swap writes. Freshness reads happen before their
+single-statement conditional write; a concurrent edit, archive, supersession,
+or deletion makes the compare fail, so the old snapshot is not persisted or
+returned as current context. Manual update/archive/delete operations and
+automatic capture/index changes are transactional; every store operation
+opens its own SQLite connection rather than sharing one across threads.
 
 Relevant records enter only the existing Phase 3 `ContextPackage` as
 `ContextKind.MEMORY`, after repository evidence has been selected. Memory can

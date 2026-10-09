@@ -1091,10 +1091,15 @@ class ContextEngine:
     def _memory_item(memory: RetrievedMemory) -> ContextItem:
         record = memory.record
         evidence = ", ".join(record.evidence_paths) or "no current source paths"
-        provenance = (
-            f"task {record.source_task_id}"
-            if record.source_task_id else "explicit user-pinned note"
-        )
+        if record.user_pinned and record.source_task_id:
+            provenance = (
+                "explicit user-confirmed correction; historical origin task "
+                f"{record.source_task_id}"
+            )
+        elif record.user_pinned:
+            provenance = "explicit user-pinned note"
+        else:
+            provenance = f"task {record.source_task_id}"
         status = (
             "current source fingerprint"
             if memory.freshness == EvidenceFreshness.CURRENT else
