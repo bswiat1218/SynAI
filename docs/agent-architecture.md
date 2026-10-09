@@ -583,3 +583,58 @@ they do not contain tool arguments or file contents.
 Policy metadata is additive in Agent Task state. Checkpoints without the new
 fields remain readable and are treated conservatively as SUPERVISED when
 authorization context is needed; no legacy task becomes AUTONOMOUS.
+
+## Deterministic model routing (Phase 11)
+
+`synai.coding_agent.routing.ModelRouter` selects models for PLANNING,
+IMPLEMENTATION, REPAIR, and REVIEW using only the active `ModelProvider`.
+The optional `Preferences.model_routing` object is private, trusted
+application configuration; repository files, plan content, model responses,
+and project memory cannot change it. Its version-1 schema strictly bounds
+model profiles and per-role preferred/fallback lists. Model names are exact,
+wildcards and duplicate profiles are rejected, and models must be present in
+the currently configured provider inventory. Nothing pulls or downloads a
+model.
+
+The default `SINGLE_MODEL` mode preserves the conversation-selected model and
+does not substitute another model. Explicit `ROUTED` mode supports
+`PINNED`, `BALANCED`, and `CAPABILITY_FIRST` deterministic ranking. The
+application selects each role model only when that stage is ready. A
+candidate must advertise every required capability; implementation and
+repair require native tools where the plan exposes them, while planner and
+review requests use empty tool lists. Fallback is only from explicitly
+configured per-role fallback candidates and only before a stage assignment
+has been committed. A missing/incompatible pool, unavailable provider,
+endpoint change, or malformed configuration returns a typed routing failure.
+There is no mid-stage model replacement.
+
+Profiles contain only user-declared enabled state, eligible roles, relative
+capability/resource/latency tiers, optional context capacity, and bounded
+priority. These are preferences, not benchmark claims. Complexity estimates
+use bounded task/context/plan/repair evidence and cannot change plan scope,
+tool policy, approvals, verification, autonomy, or repair limits. Since
+character budgets are not token counts, declared context capacity is recorded
+as unverified and never proves prompt fit.
+
+Each task checkpoint stores a configuration fingerprint, provider class,
+endpoint fingerprint, immutable role/stage decisions, required and validated
+capabilities, complexity reason, selection reason, candidate count, and
+fallback outcome, bound to the conversation session. Model inventory and
+capability discovery share a bounded deadline. It does not store inventories,
+prompts, source, or credentials. Execution records identify the model that
+generated each tool request; repair attempts and review records retain their
+actual model.
+`AgentTask.selected_model` remains the conversation-selected model, and the
+validated plan continues to identify its actual planner. Routed execution
+validates the separate implementation assignment rather than equating these
+models. Phase 6 remains deterministic and checks the plan, implementation,
+repair, provider, endpoint, and source provenance without asking a verifier
+model.
+
+An interrupted task with no routing metadata remains a legacy single-model
+task. History loading does not infer stage assignments or resume model
+requests. Route changes while an approval is pending fail the dispatch guard;
+provider failure after a stage begins preserves execution and pending-mutation
+records and never causes an automatic retry through another model. The
+existing `Tools` dispatcher and Phase 10 autonomy policy remain the sole
+authorities for tool exposure and execution.

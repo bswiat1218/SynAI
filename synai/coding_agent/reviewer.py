@@ -45,6 +45,13 @@ from synai.coding_agent.state import (
     VerificationResult,
     VerificationStatus,
 )
+from synai.coding_agent.routing import (
+    ModelRole,
+    RoutingErrorCode,
+    RoutingFailure,
+    RoutingMode,
+    estimate_complexity,
+)
 from synai.intelligence import RepositoryIndex
 from synai.models import ChatEvent, Message, Session
 
@@ -503,10 +510,20 @@ class ReviewEngine:
                     ReviewOutcome.BLOCKED,
                     "A required verification result is missing, failed, or no longer matches its plan.",
                 )
-        if not task.selected_model or task.selected_model != task.plan.planner_model:
+        routed = task.routing is not None and task.routing.mode == RoutingMode.ROUTED
+        planner_assignment = (
+            task.routing.assignment(ModelRole.PLANNING, "planning")
+            if task.routing is not None else None
+        )
+        planner_matches = (
+            planner_assignment.selected_model == task.plan.planner_model
+            if planner_assignment is not None
+            else routed or task.selected_model == task.plan.planner_model
+        )
+        if not task.selected_model or not planner_matches or not task.plan.planner_model:
             raise _ReviewStop(
                 ReviewOutcome.BLOCKED,
-                "Selected model differs from the model that produced the validated plan.",
+                "Validated plan producer provenance does not match the task routing record.",
             )
         if type(self.runtime.provider).__name__[:128] != task.plan.planner_provider:
             raise _ReviewStop(
@@ -527,6 +544,13 @@ class ReviewEngine:
                 ReviewOutcome.BLOCKED,
                 "Conversation model differs from the selected task model.",
             )
+        try:
+            self.runtime._validate_route_context(task, request.session)
+        except RoutingFailure as exc:
+            raise _ReviewStop(
+                ReviewOutcome.BLOCKED,
+                f"{exc.code.value}: {str(exc)[:1024]}",
+            ) from exc
 
     @staticmethod
     def _touched_paths(task: AgentTask) -> tuple[str, ...]:
@@ -780,6 +804,33 @@ class ReviewEngine:
         model = task.selected_model
         if model is None:
             raise _ReviewStop(ReviewOutcome.BLOCKED, "Selected model is unavailable.")
+        if task.routing is not None or self.runtime.routing_config.mode == RoutingMode.ROUTED:
+            if task.verification_plan is None:
+                raise _ReviewStop(ReviewOutcome.BLOCKED, "Review requires a current verification plan.")
+            try:
+                decision = await self.runtime._assign_stage(
+                    task,
+                    request.session,
+                    ModelRole.REVIEW,
+                    f"review-{task.verification_plan.run_id}",
+                    model,
+                    estimate_complexity(
+                        task.goal,
+                        context=context,
+                        plan=task.plan,
+                        repair_attempts=len(task.repair_attempts),
+                        changed_files=len(touched),
+                    ),
+                    require_tools=False,
+                    cancellation=request.cancellation,
+                    checkpoint=request.checkpoint,
+                )
+            except RoutingFailure as exc:
+                raise _ReviewStop(
+                    ReviewOutcome.BLOCKED,
+                    f"{exc.code.value}: {str(exc)[:1024]}",
+                ) from exc
+            model = decision.selected_model
         backend = self.runtime.tools.sandbox
         backend_identity = str(backend.settings.execution_mode)[:128]
         root = self.runtime._validate_runtime_workspace(request.session, request.repository)

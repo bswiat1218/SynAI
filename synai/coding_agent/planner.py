@@ -24,6 +24,7 @@ from synai.coding_agent.state import (
     StepStatus,
     VerificationIntent,
 )
+from synai.coding_agent.routing import RoutingMode
 from synai.intelligence.index import RepositoryIndex
 
 if TYPE_CHECKING:
@@ -1059,7 +1060,8 @@ def attach_validated_plan(task: AgentTask, result: PlanningResult) -> None:
     if result.plan.goal != task.goal:
         raise ValueError("Plan goal does not match the Phase 1 task")
     task.plan = result.plan
-    task.selected_model = result.model
+    if task.routing is None or task.routing.mode == RoutingMode.SINGLE_MODEL:
+        task.selected_model = result.model
     task.validate()
 
 

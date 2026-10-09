@@ -26,7 +26,17 @@ from synai.coding_agent import (
     StepStatus,
     VerificationIntent,
     VerificationOutcome,
+    ModelProfile,
+    ModelRole,
+    ModelRouter,
+    RoleCandidates,
+    RoutingConfig,
+    RoutingMode,
+    RoutingStrategy,
+    TaskRouting,
+    estimate_complexity,
 )
+from synai.coding_agent.routing import endpoint_fingerprint, session_fingerprint
 from synai.coding_agent.context import (
     ContextConfidence,
     ContextItem,
@@ -53,12 +63,13 @@ class ReviewProvider:
     def __init__(self, responses: list[Any] | None = None) -> None:
         self.responses = list(responses or [empty_review()])
         self.calls: list[tuple[str, list[Any], list[dict[str, Any]]]] = []
+        self.models = {MODEL: True, "reviewer-model": True}
 
     async def list_models(self) -> list[ModelInfo]:
-        return [ModelInfo(MODEL, tools=True)]
+        return [ModelInfo(name) for name in sorted(self.models)]
 
     async def capabilities(self, name: str) -> ModelInfo:
-        return ModelInfo(name, tools=True)
+        return ModelInfo(name, tools=self.models[name])
 
     async def chat(
         self,
@@ -529,6 +540,54 @@ class CodingAgentReviewerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.outcome, ReviewOutcome.BLOCKED)
         self.assertEqual(self.provider.calls, [])
+
+    async def test_routed_review_uses_independent_model_with_no_tools(self) -> None:
+        task = await self.verified_task()
+        config = RoutingConfig(
+            enabled=True,
+            mode=RoutingMode.ROUTED,
+            strategy=RoutingStrategy.CAPABILITY_FIRST,
+            profiles=(
+                ModelProfile(MODEL, roles=(ModelRole.PLANNING, ModelRole.IMPLEMENTATION)),
+                ModelProfile("reviewer-model", roles=(ModelRole.REVIEW,)),
+            ),
+            roles=(
+                RoleCandidates(ModelRole.PLANNING, (MODEL,)),
+                RoleCandidates(ModelRole.IMPLEMENTATION, (MODEL,)),
+                RoleCandidates(ModelRole.REVIEW, ("reviewer-model",)),
+            ),
+        )
+        self.runtime.routing_config = config
+        routing = TaskRouting(
+            RoutingMode.ROUTED, config.fingerprint(), type(self.provider).__name__,
+            endpoint_fingerprint(self.session.endpoint),
+            session_fingerprint(self.session.session_id),
+        )
+        router = ModelRouter()
+        for role, stage, model, require_tools in (
+            (ModelRole.PLANNING, "planning", MODEL, False),
+            (ModelRole.IMPLEMENTATION, "implementation", MODEL, True),
+        ):
+            routing.append(await router.select(
+                self.provider, config, task_id=task.task_id, role=role,
+                stage_id=stage, requested_model=MODEL, endpoint=self.session.endpoint,
+                complexity=estimate_complexity(task.goal, plan=task.plan),
+                require_tools=require_tools,
+            ), task.task_id)
+        task.routing = routing
+
+        result = await self.runtime.run_review(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome, ReviewOutcome.PASSED, result.error)
+        self.assertEqual(self.provider.calls[-1][0], "reviewer-model")
+        self.assertEqual(self.provider.calls[-1][2], [])
+        self.assertEqual(task.review_record.model, "reviewer-model")
+        self.assertEqual(
+            task.routing.assignment(
+                ModelRole.REVIEW, f"review-{task.verification_plan.run_id}",
+            ).selected_model,
+            "reviewer-model",
+        )
 
     async def test_uncertain_pending_execution_blocks_review(self) -> None:
         task = await self.verified_task()

@@ -42,6 +42,12 @@ from synai.coding_agent.policies import (
     PolicyDecisionType,
     workspace_fingerprint,
 )
+from synai.coding_agent.routing import (
+    ModelRole,
+    RoutingMode,
+    endpoint_fingerprint,
+    session_fingerprint,
+)
 
 from synai.execution_backend import validate_workspace
 from synai.intelligence import RepositoryIndex
@@ -138,6 +144,8 @@ class VerificationRequest:
     context: ContextPackage | None = None
     cancellation: threading.Event | None = None
     provider_name: str | None = None
+    provider_endpoint: str | None = None
+    routing_configuration_fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -487,10 +495,50 @@ class VerificationEngine:
         if task.status not in allowed_states or task.plan is None:
             raise ValueError("Verification requires a task in VERIFYING with a validated plan")
         task.plan.validate()
-        if task.plan.planner_model is not None and task.selected_model != task.plan.planner_model:
-            raise ValueError("Selected model differs from the validated plan provenance")
         if not task.plan.planner_model or not task.plan.planner_provider:
             raise ValueError("Verification requires provider/model provenance from a validated plan")
+        planner_assignment = (
+            task.routing.assignment(ModelRole.PLANNING, "planning")
+            if task.routing is not None else None
+        )
+        if task.routing is None or task.routing.mode == RoutingMode.SINGLE_MODEL:
+            if task.selected_model != task.plan.planner_model:
+                raise ValueError("Selected model differs from the validated plan provenance")
+        elif planner_assignment is not None and planner_assignment.selected_model != task.plan.planner_model:
+            raise ValueError("Planner model differs from the locked planning assignment")
+        if task.routing is not None:
+            task.routing.validate(task.task_id)
+            if (
+                task.routing.provider_identity != request.provider_name
+                or task.routing.endpoint_fingerprint != endpoint_fingerprint(session.endpoint)
+                or task.routing.session_fingerprint != session_fingerprint(session.session_id)
+            ):
+                raise ValueError("Routing provider/session/endpoint provenance differs from the active conversation")
+            if request.provider_endpoint is not None and (
+                task.routing.endpoint_fingerprint != endpoint_fingerprint(request.provider_endpoint)
+            ):
+                raise ValueError("Configured provider endpoint differs from the locked route")
+            if (
+                request.routing_configuration_fingerprint is not None
+                and task.routing.configuration_fingerprint != request.routing_configuration_fingerprint
+            ):
+                raise ValueError("Routing configuration changed after stage assignment")
+            implementation = task.routing.assignment(ModelRole.IMPLEMENTATION, "implementation")
+            if implementation is None:
+                raise ValueError("Verification requires a locked implementation assignment")
+            for execution in task.executions:
+                if (
+                    execution.model is not None
+                    and execution.status == ExecutionStatus.SUCCEEDED
+                    and execution.operation in _MUTATIONS
+                    and execution.model != implementation.selected_model
+                    and not any(
+                        execution.execution_id in attempt.execution_ids
+                        and attempt.model == execution.model
+                        for attempt in task.repair_attempts
+                    )
+                ):
+                    raise ValueError("Mutation model provenance does not match an implementation or repair assignment")
         if request.provider_name is not None and (
             not isinstance(request.provider_name, str)
             or request.provider_name[:128] != task.plan.planner_provider

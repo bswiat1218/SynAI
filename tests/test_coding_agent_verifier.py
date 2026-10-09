@@ -31,7 +31,18 @@ from synai.coding_agent import (
     VerificationOutcome,
     VerificationRequest,
     VerificationStatus,
+    ModelProfile,
+    ModelRole,
+    ModelRouter,
+    PreferenceTier,
+    RoleCandidates,
+    RoutingConfig,
+    RoutingMode,
+    RoutingStrategy,
+    TaskRouting,
+    estimate_complexity,
 )
+from synai.coding_agent.routing import endpoint_fingerprint, session_fingerprint
 from synai.coding_agent.repair import RepairController
 from synai.config import ConversationEnvironment, Settings
 from synai.intelligence import RepositoryIndex
@@ -46,16 +57,18 @@ GOAL = "Implement bounded retry handling and update tests."
 class PlanProvider:
     def __init__(self) -> None:
         self.calls = 0
+        self.models = {MODEL: True}
+        self.called_models: list[str] = []
         self.repair_script: list[tuple[str, list[dict[str, Any]]]] = []
         self.requests: list[tuple[list[Any], list[dict[str, Any]]]] = []
         self.repair_started = asyncio.Event()
         self.repair_gate: asyncio.Event | None = None
 
     async def list_models(self) -> list[ModelInfo]:
-        return [ModelInfo(MODEL, tools=True)]
+        return [ModelInfo(name, tools=tools) for name, tools in sorted(self.models.items())]
 
     async def capabilities(self, name: str) -> ModelInfo:
-        return ModelInfo(name, tools=True)
+        return ModelInfo(name, tools=self.models[name])
 
     async def chat(
         self,
@@ -63,7 +76,7 @@ class PlanProvider:
         _messages: list[Any],
         _tools: list[dict[str, Any]],
     ) -> AsyncIterator[ChatEvent]:
-        del _model
+        self.called_models.append(_model)
         self.calls += 1
         self.requests.append((list(_messages), list(_tools)))
         if self.repair_script:
@@ -1074,6 +1087,69 @@ class VerifierFixture(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.provider.calls, 3)
         self.assertIn("no markdown or chain-of-thought", self.provider.requests[0][0][0].content)
         self.assertIn("repair_allowed_mutation_paths", self.provider.requests[1][0][-1].content)
+
+    async def test_routed_repair_uses_separate_locked_model_and_reverifies(self) -> None:
+        self.backend.outcomes = [
+            self._verification_result(False),
+            self._verification_result(True),
+        ]
+        task = self.make_task([VerificationIntent.TARGETED_TESTS])
+        initial = await self.verify(task)
+        self.assertEqual(initial.outcome, VerificationOutcome.CODE_FAILURE)
+        self._repair_script(["app/client.py"], "return True", "return False")
+        repair_model = "repair-model"
+        self.provider.models[repair_model] = True
+        config = RoutingConfig(
+            enabled=True,
+            mode=RoutingMode.ROUTED,
+            strategy=RoutingStrategy.BALANCED,
+            profiles=(
+                ModelProfile(MODEL, roles=(ModelRole.PLANNING, ModelRole.IMPLEMENTATION)),
+                ModelProfile(
+                    repair_model, roles=(ModelRole.REPAIR,),
+                    capability_tier=PreferenceTier.MEDIUM,
+                ),
+            ),
+            roles=(
+                RoleCandidates(ModelRole.PLANNING, (MODEL,)),
+                RoleCandidates(ModelRole.IMPLEMENTATION, (MODEL,)),
+                RoleCandidates(ModelRole.REPAIR, (repair_model,)),
+            ),
+        )
+        self.runtime.routing_config = config
+        routing = TaskRouting(
+            RoutingMode.ROUTED,
+            config.fingerprint(),
+            type(self.provider).__name__,
+            endpoint_fingerprint(self.session.endpoint),
+            session_fingerprint(self.session.session_id),
+        )
+        router = ModelRouter()
+        for role, stage, model, needs_tools in (
+            (ModelRole.PLANNING, "planning", MODEL, False),
+            (ModelRole.IMPLEMENTATION, "implementation", MODEL, True),
+        ):
+            routing.append(await router.select(
+                self.provider, config, task_id=task.task_id, role=role,
+                stage_id=stage, requested_model=MODEL, endpoint=self.session.endpoint,
+                complexity=estimate_complexity(task.goal), require_tools=needs_tools,
+            ), task.task_id)
+        task.routing = routing
+
+        result = await self.runtime.run_repair(task, self.session, self.repository)
+
+        self.assertEqual(result.outcome.value, "verification_passed", result.error)
+        self.assertEqual(task.repair_attempts[0].model, repair_model)
+        self.assertIn(
+            repair_model,
+            [decision.selected_model for decision in task.routing.decisions
+             if decision.role == ModelRole.REPAIR],
+        )
+        self.assertEqual(self.provider.called_models, [repair_model, repair_model, repair_model])
+        self.assertEqual(
+            [item.status for item in task.verification_results],
+            [VerificationStatus.FAILED, VerificationStatus.PASSED],
+        )
 
     async def test_configuration_repair_is_allowed_only_for_declared_config_path(self) -> None:
         self.backend.outcomes = [

@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from synai.coding_agent.changes import ChangeBaseline, MutationEvidence
 from synai.coding_agent.policies import PolicyAuditRecord, PolicyTaskContext
+from synai.coding_agent.routing import TaskRouting
 
 
 def _now() -> str:
@@ -751,6 +752,7 @@ class AgentExecution:
     target_path: str | None = None
     approval_state: ApprovalStatus = ApprovalStatus.NOT_REQUIRED
     output_truncated: bool = False
+    model: str | None = None
 
     def validate(self) -> None:
         _text(self.execution_id, "execution ID", limit=128)
@@ -760,6 +762,7 @@ class AgentExecution:
         if self.completed_at is not None:
             _timestamp(self.completed_at, "execution completion timestamp")
         _text(self.result_summary, "execution result summary", optional=True, limit=4096)
+        _text(self.model, "execution model", optional=True, limit=512)
         if self.error_type is not None and not isinstance(self.error_type, AgentErrorType):
             raise ValueError("Invalid agent execution error type")
         if not isinstance(self.status, ExecutionStatus):
@@ -783,6 +786,8 @@ class AgentExecution:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         result = asdict(self)
+        if self.model is None:
+            result.pop("model")
         result["status"] = self.status.value
         result["error_type"] = self.error_type.value if self.error_type is not None else None
         result["operation"] = self.operation.value if self.operation is not None else None
@@ -796,7 +801,9 @@ class AgentExecution:
             "completed_at", "result_summary", "error_type",
         }
         keys = legacy_keys | {"operation", "target_path", "approval_state", "output_truncated"}
-        if not isinstance(value, dict) or set(value) not in {frozenset(legacy_keys), frozenset(keys)}:
+        if not isinstance(value, dict) or set(value) not in {
+            frozenset(legacy_keys), frozenset(keys), frozenset(keys | {"model"}),
+        }:
             raise ValueError("Invalid agent execution fields")
         data = value
         try:
@@ -814,6 +821,7 @@ class AgentExecution:
                     "approval_state", ApprovalStatus.NOT_REQUIRED.value,
                 )),
                 output_truncated=data.get("output_truncated", False),
+                model=data.get("model"),
             )
             result.validate()
         except (TypeError, ValueError) as exc:
@@ -1270,6 +1278,7 @@ class AgentTask:
     approval_resume_state: AgentStatus | None = None
     policy_context: PolicyTaskContext | None = None
     policy_audit: list[PolicyAuditRecord] = field(default_factory=list)
+    routing: TaskRouting | None = None
 
     def transition(self, status: AgentStatus) -> None:
         if not isinstance(status, AgentStatus):
@@ -1526,6 +1535,10 @@ class AgentTask:
             if not isinstance(self.policy_context, PolicyTaskContext):
                 raise ValueError("Invalid Agent Task policy context")
             self.policy_context.validate()
+        if self.routing is not None:
+            if not isinstance(self.routing, TaskRouting):
+                raise ValueError("Invalid task routing record")
+            self.routing.validate(self.task_id)
         if (
             not isinstance(self.policy_audit, list)
             or len(self.policy_audit) > 512
@@ -1539,7 +1552,7 @@ class AgentTask:
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
-        return {
+        result = {
             "task_id": self.task_id, "goal": self.goal, "status": self.status.value,
             "created_at": self.created_at, "updated_at": self.updated_at,
             "selected_model": self.selected_model,
@@ -1567,7 +1580,11 @@ class AgentTask:
                 self.policy_context.to_dict() if self.policy_context is not None else None
             ),
             "policy_audit": [item.to_dict() for item in self.policy_audit],
+            "routing": self.routing.to_dict() if self.routing is not None else None,
         }
+        if self.routing is None:
+            result.pop("routing")
+        return result
 
     @classmethod
     def from_dict(cls, value: object) -> AgentTask:
@@ -1583,9 +1600,11 @@ class AgentTask:
         review_keys = repair_keys | {"review_record"}
         change_keys = review_keys | {"change_baselines", "change_evidence"}
         policy_keys = change_keys | {"policy_context", "policy_audit"}
+        routing_keys = policy_keys | {"routing"}
         if not isinstance(value, dict) or set(value) not in {
             frozenset(legacy_keys), frozenset(extended_keys), frozenset(repair_keys),
             frozenset(review_keys), frozenset(change_keys), frozenset(policy_keys),
+            frozenset(routing_keys),
         }:
             raise ValueError("Invalid agent task fields")
         data = value
@@ -1642,6 +1661,10 @@ class AgentTask:
                     PolicyAuditRecord.from_dict(item)
                     for item in data.get("policy_audit", [])
                 ],
+                routing=(
+                    TaskRouting.from_dict(data["routing"], data["task_id"])
+                    if data.get("routing") is not None else None
+                ),
             )
             result.validate()
         except (TypeError, ValueError) as exc:

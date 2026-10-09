@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from synai.coding_agent.policies import AutonomyPolicyConfig
+from synai.coding_agent.routing import RoutingConfig
 from synai.config import Settings
 from synai.storage import ConversationStorage, checked_path, write_private_json
 
@@ -21,6 +22,7 @@ class Preferences:
     theme: str = DEFAULT_THEME
     schema_version: int = 1
     autonomy_policy: AutonomyPolicyConfig = field(default_factory=AutonomyPolicyConfig)
+    model_routing: RoutingConfig = field(default_factory=RoutingConfig)
 
     def validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
@@ -30,6 +32,9 @@ class Preferences:
         if not isinstance(self.autonomy_policy, AutonomyPolicyConfig):
             raise ValueError("Autonomy policy settings must be typed trusted configuration")
         self.autonomy_policy.validate()
+        if not isinstance(self.model_routing, RoutingConfig):
+            raise ValueError("Model routing settings must be typed trusted configuration")
+        self.model_routing.validate()
         Settings(ollama_url=self.ollama_url, request_timeout=self.request_timeout).validate()
 
 
@@ -51,13 +56,15 @@ class PreferencesStore:
             if not isinstance(value, dict):
                 raise ValueError("Application settings must be an object")
             legacy_keys = {"schema_version", "ollama_url", "request_timeout", "theme"}
-            current_keys = legacy_keys | {"autonomy_policy"}
-            if frozenset(value) not in {frozenset(legacy_keys), frozenset(current_keys)}:
+            optional_keys = {"autonomy_policy", "model_routing"}
+            if not legacy_keys.issubset(value) or not set(value).issubset(legacy_keys | optional_keys):
                 raise ValueError("Invalid application settings fields")
             if "autonomy_policy" in value:
                 value["autonomy_policy"] = AutonomyPolicyConfig.from_dict(
                     value["autonomy_policy"],
                 )
+            if "model_routing" in value:
+                value["model_routing"] = RoutingConfig.from_dict(value["model_routing"])
             result = Preferences(**value)
             result.validate()
             return result

@@ -27,6 +27,11 @@ from synai.coding_agent.state import (
     VerificationOutcome,
     VerificationStatus,
 )
+from synai.coding_agent.routing import (
+    ModelRole,
+    RoutingMode,
+    estimate_complexity,
+)
 from synai.intelligence import RepositoryIndex
 from synai.models import Message, Session
 
@@ -181,6 +186,24 @@ class RepairController:
                     return await self._exhaust(task, request)
                 attempt_number = len(task.repair_attempts) + 1
                 failed_index, failed = latest
+                repair_stage_id = f"repair-{attempt_number}"
+                repair_model = task.selected_model or ""
+                if task.routing is not None or self.runtime.routing_config.mode == RoutingMode.ROUTED:
+                    complexity = estimate_complexity(
+                        task.goal,
+                        context=request.context,
+                        plan=task.plan,
+                        repair_attempts=attempt_number,
+                        changed_files=len({
+                            item.path for item in task.change_evidence
+                        }),
+                    )
+                    decision = await self.runtime._assign_stage(
+                        task, request.session, ModelRole.REPAIR, repair_stage_id,
+                        repair_model, complexity, require_tools=True,
+                        cancellation=request.cancellation, checkpoint=request.checkpoint,
+                    )
+                    repair_model = decision.selected_model
                 attempt = RepairAttempt(
                     attempt=attempt_number,
                     diagnosis="Repair diagnosis pending.",
@@ -189,7 +212,7 @@ class RepairController:
                     triggering_run_id=failed.run_id,
                     triggering_check_id=failed.check_id,
                     provider=type(self.runtime.provider).__name__[:128],
-                    model=task.selected_model,
+                    model=repair_model,
                     repeated_failure=self._repeats_previous(task, failed),
                 )
                 task.repair_attempts.append(attempt)
@@ -367,7 +390,7 @@ class RepairController:
                                     repair_context,
                                     request.session,
                                     request.repository,
-                                    task.selected_model or "",
+                                    attempt.model or task.selected_model or "",
                                     request.cancellation,
                                     repair_checkpoint,
                                     request.event_sink,
@@ -580,10 +603,17 @@ class RepairController:
         task.validate()
         if task.status != AgentStatus.REPAIRING or task.plan is None:
             raise ValueError("Repair requires an Agent Task in REPAIRING with a validated plan")
-        if task.plan.goal != task.goal or task.selected_model != task.plan.planner_model:
+        routed = task.routing is not None and task.routing.mode == RoutingMode.ROUTED
+        if task.plan.goal != task.goal or (
+            not routed and task.selected_model != task.plan.planner_model
+        ):
             raise ValueError("Repair requires matching task and validated plan provenance")
-        if not task.plan.planner_provider or not task.selected_model:
+        if not task.plan.planner_provider or not task.plan.planner_model or not task.selected_model:
             raise ValueError("Repair requires the provider/model provenance from Phase 4")
+        if self.runtime.routing_config.mode == RoutingMode.ROUTED and task.routing is None:
+            raise ValueError("A legacy task cannot be migrated to routed repair")
+        if task.routing is not None:
+            self.runtime._validate_route_context(task, request.session)
         if type(request.cancellation) not in {type(None), threading.Event}:
             raise ValueError("Repair cancellation must be a threading.Event")
         if request.context is not None and (
@@ -630,16 +660,20 @@ class RepairController:
         if task.status != AgentStatus.REPAIRING or task.plan is None:
             raise ValueError("Task left REPAIRING before a repair action")
         task.plan.validate()
-        if task.selected_model != task.plan.planner_model:
-            raise ValueError("Selected model differs from the validated plan model")
         if type(self.runtime.provider).__name__[:128] != task.plan.planner_provider:
             raise ValueError("Provider differs from the validated plan provider")
         root = self.runtime._validate_runtime_workspace(request.session, request.repository)
+        attempt = task.repair_attempts[-1] if task.repair_attempts else None
+        model = attempt.model if attempt and attempt.model else task.selected_model or ""
+        stage_id = f"repair-{attempt.attempt}" if attempt else ""
         self.runtime._validate_plan_for_execution(
-            task, request.session, request.repository, root, task.selected_model or "",
-            allow_completed_steps=True,
+            task, request.session, request.repository, root, model,
+            allow_completed_steps=True, stage_role=ModelRole.REPAIR, stage_id=stage_id,
         )
-        await self.runtime._validate_provider_for_execution(task.selected_model or "", task)
+        await self.runtime._validate_provider_for_execution(
+            model, task, session=request.session,
+            role=ModelRole.REPAIR, stage_id=stage_id,
+        )
         if request.cancellation and request.cancellation.is_set():
             raise asyncio.CancelledError
         return root
@@ -701,15 +735,20 @@ class RepairController:
         if task.status != AgentStatus.REPAIRING or task.plan is None:
             raise ValueError("Task left REPAIRING before repair context construction")
         task.plan.validate()
-        if task.selected_model != task.plan.planner_model:
-            raise ValueError("Selected model differs from the validated plan model")
         if type(self.runtime.provider).__name__[:128] != task.plan.planner_provider:
             raise ValueError("Provider differs from the validated plan provider")
         root = self.runtime._validate_runtime_workspace(request.session, request.repository)
+        attempt = task.repair_attempts[-1] if task.repair_attempts else None
+        model = attempt.model if attempt and attempt.model else task.selected_model or ""
+        stage_id = f"repair-{attempt.attempt}" if attempt else ""
         self.runtime._validate_plan_for_execution(
-            task, request.session, request.repository, root, task.selected_model or "",
-            allow_completed_steps=True,
+            task, request.session, request.repository, root, model,
+            allow_completed_steps=True, stage_role=ModelRole.REPAIR, stage_id=stage_id,
         )
+        if task.routing is not None:
+            self.runtime._validate_assignment(
+                task, request.session, ModelRole.REPAIR, stage_id, model, require_tools=True,
+            )
         if request.cancellation and request.cancellation.is_set():
             raise InterruptedError("Repair context construction cancelled")
         return root
@@ -857,7 +896,11 @@ class RepairController:
             self._message("user", _bounded_json(payload, self.limits.max_context_characters + 12_000)),
         ]
         operation = asyncio.create_task(self.runtime._collect_response(
-            request.task.selected_model or "",
+            (
+                request.task.repair_attempts[-1].model
+                if request.task.repair_attempts and request.task.repair_attempts[-1].model
+                else request.task.selected_model or ""
+            ),
             messages,
             [],
             max_response_characters=self.limits.max_diagnosis_characters,

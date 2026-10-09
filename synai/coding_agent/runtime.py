@@ -43,6 +43,22 @@ from synai.coding_agent.policies import (
     PolicyRequest,
     workspace_fingerprint,
 )
+from synai.coding_agent.routing import (
+    ComplexityEstimate,
+    ComplexityTier,
+    ModelRole,
+    ModelRouter,
+    RoutingConfig,
+    RoutingDecision,
+    RoutingErrorCode,
+    RoutingFailure,
+    RoutingMode,
+    TaskRouting,
+    endpoint_fingerprint,
+    estimate_complexity,
+    provider_identity,
+    session_fingerprint,
+)
 from synai.coding_agent.state import (
     AgentCheckpoint,
     AgentErrorType,
@@ -100,6 +116,7 @@ class RuntimeErrorCode(StrEnum):
     REPAIR_MUTATION_NOT_PERFORMED = "repair_mutation_not_performed"
     REPAIR_RESOURCE_LIMIT = "repair_resource_limit"
     CHANGE_BASELINE_UNAVAILABLE = "change_baseline_unavailable"
+    MODEL_ROUTING_ERROR = "model_routing_error"
 
 
 @dataclass(frozen=True)
@@ -202,12 +219,16 @@ class CodingAgentRuntime:
         context_engine: ContextEngine | None = None,
         limits: RuntimeLimits | None = None,
         history: History | None = None,
+        routing_config: RoutingConfig | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.context_engine = context_engine or ContextEngine()
         self.limits = limits or RuntimeLimits()
         self.history = history
+        self.routing_config = routing_config or RoutingConfig()
+        self.routing_config.validate()
+        self.model_router = ModelRouter()
         self._change_trackers: dict[str, TaskChangeTracker] = {}
 
     async def run_verification(
@@ -245,6 +266,8 @@ class CodingAgentRuntime:
         request = VerificationRequest(
             task, session, repository, context, cancellation,
             type(self.provider).__name__[:128],
+            getattr(self.provider, "base_url", session.endpoint),
+            self.routing_config.fingerprint(),
         )
         if restart_interrupted:
             return await engine.restart_interrupted(request)
@@ -352,6 +375,7 @@ class CodingAgentRuntime:
                 raise ValueError("Task prompt must match the task goal")
             task.selected_model = model
             checkpoint = self._session_checkpoint(session, checkpoint)
+            self._start_task_routing(task, session)
             await self._checkpoint(task, checkpoint)
             await self._emit(task, "task_started", event_sink)
             task.transition(AgentStatus.UNDERSTANDING)
@@ -389,19 +413,31 @@ class CodingAgentRuntime:
             if cancellation and cancellation.is_set():
                 raise _RuntimeStop(RuntimeErrorCode.CANCELLED, "Task cancelled during context gathering")
             await self._emit(task, "context_gathering_completed", event_sink)
+            planning_model = model
+            if plan is None:
+                planning_decision = await self._assign_stage(
+                    task, session, ModelRole.PLANNING, "planning", model,
+                    estimate_complexity(task_prompt, context=context),
+                    require_tools=False, cancellation=cancellation, checkpoint=checkpoint,
+                )
+                planning_model = planning_decision.selected_model
             await self._checkpoint(task, checkpoint)
             task.transition(AgentStatus.PLANNING)
             await self._checkpoint(task, checkpoint)
             await self._emit(task, "planning_started", event_sink)
             if plan is None:
                 planner = planner or Planner(self.provider)
+                await self._validate_provider_for_execution(
+                    planning_model, task, session=session,
+                    role=ModelRole.PLANNING, stage_id="planning",
+                )
                 planning_result = await planner.plan(
                     PlanningRequest(
                         task_prompt,
                         context,
                         tuple(PlanOperation),
                         PlanningWorkspace(root, repository, session.title[:128] or None),
-                        model,
+                        planning_model,
                         task_metadata,
                     ),
                     cancellation,
@@ -414,6 +450,10 @@ class CodingAgentRuntime:
                         "; ".join(issue.message for issue in planning_result.errors)[:2048]
                         or "Planning did not produce a validated plan",
                     )
+                await self._validate_provider_for_execution(
+                    planning_model, task, session=session,
+                    role=ModelRole.PLANNING, stage_id="planning",
+                )
                 attach_validated_plan(task, planning_result)
             else:
                 try:
@@ -462,15 +502,27 @@ class CodingAgentRuntime:
                 task.resolve_approval(True)
                 await self._checkpoint(task, checkpoint)
                 await self._emit(task, "plan_approved", event_sink)
-            self._validate_plan_for_execution(task, session, repository, root, model)
-            await self._validate_provider_for_execution(model, task)
+            implementation_decision = await self._assign_stage(
+                task, session, ModelRole.IMPLEMENTATION, "implementation", model,
+                estimate_complexity(task_prompt, context=context, plan=task.plan),
+                require_tools=any(self._allowed_tools(step) for step in task.plan.steps),
+                cancellation=cancellation, checkpoint=checkpoint,
+            )
+            implementation_model = implementation_decision.selected_model
+            self._validate_plan_for_execution(
+                task, session, repository, root, implementation_model,
+            )
+            await self._validate_provider_for_execution(
+                implementation_model, task, session=session,
+                role=ModelRole.IMPLEMENTATION, stage_id="implementation",
+            )
             if cancellation and cancellation.is_set():
                 raise _RuntimeStop(RuntimeErrorCode.CANCELLED, "Task cancelled before implementation")
             task.transition(AgentStatus.IMPLEMENTING)
             await self._checkpoint(task, checkpoint)
             await self._emit(task, "implementation_started", event_sink)
             await self._execute_steps(
-                task, context, session, repository, model, cancellation,
+                task, context, session, repository, implementation_model, cancellation,
                 checkpoint, event_sink, started,
             )
             if self._has_modifying_intent(task.plan) or task.plan.verification_intent:
@@ -588,15 +640,30 @@ class CodingAgentRuntime:
             task.resolve_approval(True)
             await self._emit(task, "plan_approved", event_sink)
             root = self._validate_runtime_workspace(session, repository)
-            self._validate_plan_for_execution(task, session, repository, root, model)
-            await self._validate_provider_for_execution(model, task)
+            if task.routing is None and self.routing_config.mode == RoutingMode.SINGLE_MODEL:
+                implementation_model = model
+            else:
+                implementation_decision = await self._assign_stage(
+                    task, session, ModelRole.IMPLEMENTATION, "implementation", model,
+                    estimate_complexity(task.goal, context=context, plan=task.plan),
+                    require_tools=any(self._allowed_tools(step) for step in task.plan.steps),
+                    cancellation=cancellation, checkpoint=checkpoint,
+                )
+                implementation_model = implementation_decision.selected_model
+            self._validate_plan_for_execution(
+                task, session, repository, root, implementation_model,
+            )
+            await self._validate_provider_for_execution(
+                implementation_model, task, session=session,
+                role=ModelRole.IMPLEMENTATION, stage_id="implementation",
+            )
             if cancellation and cancellation.is_set():
                 raise _RuntimeStop(RuntimeErrorCode.CANCELLED, "Cancelled before implementation")
             task.transition(AgentStatus.IMPLEMENTING)
             await self._checkpoint(task, checkpoint)
             await self._emit(task, "implementation_started", event_sink)
             await self._execute_steps(
-                task, context, session, repository, model, cancellation,
+                task, context, session, repository, implementation_model, cancellation,
                 checkpoint, event_sink, time.monotonic(),
             )
             if self._has_modifying_intent(task.plan) or task.plan.verification_intent:
@@ -666,7 +733,10 @@ class CodingAgentRuntime:
                     step_id,
                 )
             root = self._validate_runtime_workspace(session, repository)
-            await self._validate_provider_for_execution(model, task)
+            await self._validate_provider_for_execution(
+                model, task, session=session,
+                role=ModelRole.IMPLEMENTATION, stage_id="implementation",
+            )
             self._validate_step(task, step, root, repository)
             unsupported = set(step.operations) & {PlanOperation.TEST, PlanOperation.VERIFY}
             if unsupported:
@@ -827,6 +897,22 @@ class CodingAgentRuntime:
                         step.step_id,
                     ) from exc
                 raise _RuntimeStop(RuntimeErrorCode.MODEL_ERROR, str(exc)[:2048], step.step_id) from exc
+            if task.routing is not None:
+                stage_role = ModelRole.REPAIR if repair_mode else ModelRole.IMPLEMENTATION
+                stage_id = (
+                    f"repair-{task.repair_attempts[-1].attempt}"
+                    if repair_mode and task.repair_attempts else "implementation"
+                )
+                try:
+                    self._validate_assignment(
+                        task, session, stage_role, stage_id, model, require_tools=True,
+                    )
+                except RoutingFailure as exc:
+                    raise _RuntimeStop(
+                        RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                        f"{exc.code.value}: {str(exc)[:1800]}",
+                        step.step_id,
+                    ) from exc
             if any(not isinstance(call, dict) for call in calls):
                 raise _RuntimeStop(
                     RuntimeErrorCode.MODEL_ERROR,
@@ -968,6 +1054,7 @@ class CodingAgentRuntime:
                     status=ExecutionStatus.PENDING,
                     operation=operation,
                     target_path=target_path,
+                    model=model,
                     approval_state=(
                         ApprovalStatus.PENDING if name not in {"read_file", "list_files"}
                         and name not in INTELLIGENCE_TOOLS else ApprovalStatus.NOT_REQUIRED
@@ -1078,8 +1165,14 @@ class CodingAgentRuntime:
                         operation,
                         target_path,
                         policy_request,
+                        model,
                         repair_mode=repair_mode,
                         repair_allowed_paths=repair_allowed_paths,
+                        stage_role=ModelRole.REPAIR if repair_mode else ModelRole.IMPLEMENTATION,
+                        stage_id=(
+                            f"repair-{task.repair_attempts[-1].attempt}"
+                            if repair_mode and task.repair_attempts else "implementation"
+                        ),
                     ),
                     mutation_observer=mutation_observer,
                     event_observer=self._tool_event_observer(
@@ -1583,9 +1676,12 @@ class CodingAgentRuntime:
         expected_operation: PlanOperation | None,
         expected_path: str | None,
         policy_request: PolicyRequest,
+        model: str,
         *,
         repair_mode: bool,
         repair_allowed_paths: frozenset[str],
+        stage_role: ModelRole,
+        stage_id: str,
     ) -> Callable[[], Awaitable[bool]]:
         async def can_dispatch() -> bool:
             if cancellation and cancellation.is_set():
@@ -1602,6 +1698,10 @@ class CodingAgentRuntime:
                 return False
             try:
                 root = self._validate_runtime_workspace(session, repository)
+                if task.routing is not None:
+                    self._validate_assignment(
+                        task, session, stage_role, stage_id, model, require_tools=True,
+                    )
                 operation, path = self._classify_and_check_call(
                     tool_name,
                     arguments,
@@ -1616,7 +1716,7 @@ class CodingAgentRuntime:
                         and execution.target_path is not None
                     ),
                 )
-            except (_RuntimeStop, OSError, ValueError):
+            except (RoutingFailure, _RuntimeStop, OSError, ValueError):
                 return False
             if operation != expected_operation or path != expected_path:
                 return False
@@ -1743,6 +1843,180 @@ class CodingAgentRuntime:
             raise _RuntimeStop(RuntimeErrorCode.WORKSPACE_CHANGED, "Workspace identity changed during the task")
         return root
 
+    async def _assign_stage(
+        self,
+        task: AgentTask,
+        session: Session,
+        role: ModelRole,
+        stage_id: str,
+        requested_model: str,
+        complexity: ComplexityEstimate,
+        *,
+        require_tools: bool,
+        cancellation: threading.Event | None,
+        checkpoint: CheckpointHook | None,
+    ) -> RoutingDecision:
+        try:
+            endpoint = endpoint_fingerprint(session.endpoint)
+            identity = provider_identity(self.provider)
+            self.routing_config.validate()
+            config_fingerprint = self.routing_config.fingerprint()
+            if task.routing is None:
+                raise RoutingFailure(
+                    RoutingErrorCode.ROUTE_PROVENANCE_MISMATCH,
+                    "An active or recovered task without routing metadata cannot be migrated.",
+                )
+            self._validate_route_context(task, session)
+            existing = task.routing.assignment(role, stage_id)
+            if existing is not None:
+                self._validate_assignment(
+                    task, session, role, stage_id, existing.selected_model,
+                    require_tools=require_tools,
+                )
+                return existing
+            decision = await self.model_router.select(
+                self.provider,
+                self.routing_config,
+                task_id=task.task_id,
+                role=role,
+                stage_id=stage_id,
+                requested_model=requested_model,
+                endpoint=session.endpoint,
+                complexity=complexity,
+                require_tools=require_tools,
+                cancellation=cancellation,
+            )
+            task.routing.append(decision, task.task_id)
+            await self._checkpoint(task, checkpoint)
+            await self._emit(
+                task,
+                "model_route_selected",
+                None,
+                message=(
+                    f"{role.value} selected {decision.selected_model}: {decision.reason_code}; "
+                    f"{decision.candidate_count} candidate(s), fallback="
+                    f"{'yes' if decision.fallback_used else 'no'}."
+                ),
+            )
+            return decision
+        except RoutingFailure as exc:
+            raise _RuntimeStop(
+                RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                f"{exc.code.value}: {str(exc)[:1800]}",
+            ) from exc
+
+    def _start_task_routing(self, task: AgentTask, session: Session) -> None:
+        if task.routing is not None:
+            try:
+                self._validate_route_context(task, session)
+            except RoutingFailure as exc:
+                raise _RuntimeStop(
+                    RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                    f"{exc.code.value}: {str(exc)[:1800]}",
+                ) from exc
+            return
+        try:
+            self.routing_config.validate()
+            endpoint = endpoint_fingerprint(session.endpoint)
+            actual_endpoint = endpoint_fingerprint(
+                getattr(self.provider, "base_url", session.endpoint),
+            )
+            if endpoint != actual_endpoint:
+                raise RoutingFailure(
+                    RoutingErrorCode.ENDPOINT_CHANGED,
+                    "Provider endpoint differs from the active conversation.",
+                )
+            task.routing = TaskRouting(
+                self.routing_config.mode,
+                self.routing_config.fingerprint(),
+                provider_identity(self.provider),
+                endpoint,
+                session_fingerprint(session.session_id),
+            )
+            task.routing.validate(task.task_id)
+        except RoutingFailure as exc:
+            raise _RuntimeStop(
+                RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                f"{exc.code.value}: {str(exc)[:1800]}",
+            ) from exc
+        except (TypeError, ValueError) as exc:
+            raise _RuntimeStop(
+                RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                f"{RoutingErrorCode.INVALID_ROUTING_CONFIGURATION.value}: {str(exc)[:1800]}",
+            ) from exc
+
+    def _validate_route_context(self, task: AgentTask, session: Session) -> None:
+        if task.routing is None:
+            if self.routing_config.mode == RoutingMode.ROUTED:
+                raise RoutingFailure(
+                    RoutingErrorCode.ROUTE_PROVENANCE_MISMATCH,
+                    "Task has no persisted routing provenance.",
+                )
+            return
+        task.routing.validate(task.task_id)
+        try:
+            current_endpoint = endpoint_fingerprint(session.endpoint)
+            actual_endpoint = endpoint_fingerprint(
+                getattr(self.provider, "base_url", session.endpoint),
+            )
+        except ValueError as exc:
+            raise RoutingFailure(RoutingErrorCode.ENDPOINT_CHANGED, str(exc)) from exc
+        if actual_endpoint != current_endpoint or task.routing.endpoint_fingerprint != current_endpoint:
+            raise RoutingFailure(
+                RoutingErrorCode.ENDPOINT_CHANGED,
+                "The configured provider endpoint changed during the task.",
+            )
+        if task.routing.session_fingerprint != session_fingerprint(session.session_id):
+            raise RoutingFailure(
+                RoutingErrorCode.ROUTE_PROVENANCE_MISMATCH,
+                "The conversation session changed during the task.",
+            )
+        identity = provider_identity(self.provider)
+        if task.routing.provider_identity != identity:
+            raise RoutingFailure(
+                RoutingErrorCode.PROVIDER_CHANGED,
+                "The configured provider changed during the task.",
+            )
+        if task.routing.configuration_fingerprint != self.routing_config.fingerprint():
+            raise RoutingFailure(
+                RoutingErrorCode.ROUTING_CONFIGURATION_CHANGED,
+                "Trusted routing configuration changed during the task.",
+            )
+        if task.routing.mode != self.routing_config.mode:
+            raise RoutingFailure(
+                RoutingErrorCode.ROUTING_CONFIGURATION_CHANGED,
+                "Task routing mode differs from current trusted configuration.",
+            )
+
+    def _validate_assignment(
+        self,
+        task: AgentTask,
+        session: Session,
+        role: ModelRole,
+        stage_id: str,
+        model: str,
+        *,
+        require_tools: bool,
+    ) -> RoutingDecision:
+        self._validate_route_context(task, session)
+        assignment = task.routing.assignment(role, stage_id) if task.routing else None
+        if assignment is None or assignment.selected_model != model:
+            raise RoutingFailure(
+                RoutingErrorCode.ROUTE_PROVENANCE_MISMATCH,
+                f"No matching locked {role.value} model assignment exists.",
+            )
+        if require_tools and "native_tools" not in assignment.validated_capabilities:
+            raise RoutingFailure(
+                RoutingErrorCode.MODEL_CAPABILITY_UNAVAILABLE,
+                f"The locked {role.value} model lacks validated native-tool capability.",
+            )
+        if assignment.provider_identity != provider_identity(self.provider):
+            raise RoutingFailure(
+                RoutingErrorCode.PROVIDER_CHANGED,
+                "Stage assignment belongs to another provider.",
+            )
+        return assignment
+
     def _validate_plan_for_execution(
         self,
         task: AgentTask,
@@ -1752,6 +2026,8 @@ class CodingAgentRuntime:
         model: str,
         *,
         allow_completed_steps: bool = False,
+        stage_role: ModelRole = ModelRole.IMPLEMENTATION,
+        stage_id: str = "implementation",
     ) -> None:
         if task.plan is None:
             raise _RuntimeStop(RuntimeErrorCode.PLAN_INVALID_AT_EXECUTION, "No validated plan is attached")
@@ -1762,19 +2038,41 @@ class CodingAgentRuntime:
                 task.plan.to_dict(), ensure_ascii=True, separators=(",", ":"),
             ).encode("utf-8"))
             expected = [step.step_id for step in task.plan.steps]
+            planner_assignment = (
+                task.routing.assignment(ModelRole.PLANNING, "planning")
+                if task.routing is not None else None
+            )
+            if task.routing is None or task.routing.mode == RoutingMode.SINGLE_MODEL:
+                planner_matches = task.selected_model == task.plan.planner_model
+            elif planner_assignment is not None:
+                planner_matches = planner_assignment.selected_model == task.plan.planner_model
+            else:
+                # Caller-supplied validated plans retain their actual producer provenance.
+                planner_matches = bool(task.plan.planner_model)
             if (
                 task.plan.schema_version != 2
                 or task.plan.planning_attempts < 1
                 or task.plan.context_hash is None
                 or task.plan.planner_provider != type(self.provider).__name__[:128]
-                or task.plan.planner_model != model
-                or task.selected_model != model
+                or not task.plan.planner_model
+                or not planner_matches
                 or plan_bytes > self.limits.max_plan_bytes
                 or len(task.plan.steps) > self.limits.max_steps
                 or len(task.plan.executable_order) != len(task.plan.steps)
                 or set(task.plan.executable_order) != set(expected)
             ):
                 raise ValueError("Plan is not a bounded, planner-validated schema-2 plan")
+            if task.routing is None:
+                if model != task.selected_model:
+                    raise ValueError("Implementation model differs from the legacy selected model")
+            else:
+                try:
+                    self._validate_assignment(
+                        task, session, stage_role, stage_id, model,
+                        require_tools=any(self._allowed_tools(step) for step in task.plan.steps),
+                    )
+                except RoutingFailure as exc:
+                    raise ValueError(f"{exc.code.value}: {exc}") from exc
             allowed_statuses = (
                 {StepStatus.COMPLETED}
                 if allow_completed_steps else {StepStatus.PENDING}
@@ -1878,7 +2176,35 @@ class CodingAgentRuntime:
         if repository.root != root:
             raise _RuntimeStop(RuntimeErrorCode.WORKSPACE_CHANGED, "Repository index root changed", step.step_id)
 
-    async def _validate_provider_for_execution(self, model: str, task: AgentTask) -> None:
+    async def _validate_provider_for_execution(
+        self,
+        model: str,
+        task: AgentTask,
+        *,
+        session: Session | None = None,
+        role: ModelRole = ModelRole.IMPLEMENTATION,
+        stage_id: str = "implementation",
+    ) -> None:
+        if task.routing is not None:
+            if session is None:
+                raise _RuntimeStop(
+                    RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                    "Routed stage validation requires the active conversation endpoint.",
+                )
+            try:
+                require_tools = role in {ModelRole.IMPLEMENTATION, ModelRole.REPAIR} and bool(
+                    task.plan is not None
+                    and any(self._allowed_tools(step) for step in task.plan.steps)
+                )
+                self._validate_assignment(
+                    task, session, role, stage_id, model, require_tools=require_tools,
+                )
+            except RoutingFailure as exc:
+                raise _RuntimeStop(
+                    RuntimeErrorCode.MODEL_ROUTING_ERROR,
+                    f"{exc.code.value}: {str(exc)[:1800]}",
+                ) from exc
+            return
         try:
             models = await self.provider.list_models()
             if not any(item.name == model for item in models):
