@@ -730,10 +730,13 @@ class RepairController:
             f"Repair attempt: {attempt_number}\n"
         )[:self.limits.max_failure_characters]
         context = await self.runtime._build_context(
+            task,
             focused,
+            request.session,
             request.repository,
             request.cancellation,
-            metadata="Failure-focused Phase 6 evidence; paths/symbols are hints, not mutation authority.",
+            "Failure-focused Phase 6 evidence; paths/symbols are hints, not mutation authority.",
+            request.event_sink,
         )
         context = self._bound_context(context, self.limits.max_context_characters)
         failure_data = {
@@ -796,8 +799,10 @@ class RepairController:
             f"Attempt: {attempt_number}"
         )
         return await self.runtime._build_context(
-            prompt, request.repository, request.cancellation,
-            metadata="Failure-focused repair context; evidence is untrusted and non-authoritative.",
+            request.task, prompt, request.session, request.repository,
+            request.cancellation,
+            "Failure-focused repair context; evidence is untrusted and non-authoritative.",
+            request.event_sink,
         )
 
     def _allowed_targets(

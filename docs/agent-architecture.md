@@ -659,3 +659,67 @@ authorities for tool exposure and execution. A routing-selection event is sent
 only after the stage assignment checkpoint succeeds. It contains bounded task,
 stage, role, model, strategy, reason, and fallback metadata; observer failures
 are logged and do not change persisted task state.
+
+## Persistent project memory (Phase 12)
+
+Project memory is an opt-in coding-agent feature. `Preferences.project_memory`
+is trusted application configuration; legacy settings that omit it default to
+disabled, including automatic capture. There are no memory model tools and no
+normal-chat memory injection. Headless callers can use
+`ProjectMemoryStore` for bounded list/search/get/add/update/archive/delete
+operations; writes to user notes require an explicit user-originated
+authorization argument.
+
+The project namespace is derived from the canonical, existing validated
+workspace directory, its device/inode, and the local user ID, then represented
+by a SHA-256 identifier. The absolute path is not stored in the database.
+Moving or replacing a workspace deliberately yields a different namespace;
+automatic merging/reassociation is not supported. Host paths and a sandbox's
+generic mount name are never used as aliases. Each store operation derives the
+namespace from the validated workspace argument rather than accepting a
+model-supplied project identifier.
+
+Records are typed, bounded, and retain category, concise text, confidence,
+status, task/conversation/verification/review provenance, relative evidence
+paths and fingerprints, and timestamps. Automatic extraction creates only a
+`VERIFIED_OUTCOME`: Phase 8 must have checkpointed a completed task, required
+Phase 6 checks must pass, review must pass (warnings allowed), and complete
+certain Phase 9 task-attributed postimages must still match Phase 2 safe reads.
+Repair attribution is included only when a repair succeeded and reverification
+passed. Read-only, failed, cancelled, uncertain, approval-denied, or
+unreviewed work is not learned automatically. Captures are idempotent by
+task/evidence key; user-pinned notes are not replaced by automatic outcomes.
+Deleting an automatic capture also retains a bounded tombstone so retrying an
+old checkpoint cannot silently recreate it.
+
+The private store is SQLite at
+`<application storage>/project-memory/memory.sqlite3`, outside source
+repositories and conversation checkpoints. Schema version 1 is initialized
+transactionally; unknown future or corrupt databases fail explicitly and are
+never reset. Parent directories and the database are owner-only, database
+access uses parameterized statements and bounded transactions, and SQLite
+busy handling serializes concurrent writers. Record count, byte size, content,
+evidence-path, retrieval, and tombstone limits are validated. At capacity,
+writes fail explicitly rather than evicting pinned memories or task history.
+
+Retrieval is deterministic lexical/path/symbol matching, bounded to a
+configured number of records, characters, and duration, with stable
+tie-breaking. It has no Ollama, embedding, vector, or external-search calls.
+Selected source-linked memories are checked against current workspace-relative
+fingerprints through `RepositoryIndex.read_file_bytes`, limited to selected
+paths and a bounded total byte budget; this avoids a repository-wide rescan.
+Changed or missing files mark the record stale and exclude it, while evidence
+that cannot safely be read is unavailable and excluded. User-pinned notes
+without source links are explicitly labeled unverified. Lexical matching may
+miss semantic paraphrases.
+
+Relevant records enter only the existing Phase 3 `ContextPackage` as
+`ContextKind.MEMORY`, after repository evidence has been selected. Memory can
+consume at most 20% of the usable character budget and never consumes the
+planner reserve; truncation and store/evidence limitations are surfaced.
+Prompt content is separately labeled untrusted historical/user data, not
+current source or authorization. Current source, plan validation, Phase 5
+scope and approvals, Phase 6 verification, Phase 8 review, Phase 10 policy,
+and Phase 11 routing remain authoritative. Capture runs only after review has
+persisted task completion; a memory-write error emits a separate failure
+event and does not roll back the task, replay mutations, or rerun checks.

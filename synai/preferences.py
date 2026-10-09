@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Mapping
 
 from synai.coding_agent.policies import AutonomyPolicyConfig
+from synai.coding_agent.memory import ProjectMemoryConfig
 from synai.coding_agent.routing import RoutingConfig
 from synai.config import Settings
 from synai.storage import ConversationStorage, checked_path, write_private_json
@@ -23,6 +24,7 @@ class Preferences:
     schema_version: int = 1
     autonomy_policy: AutonomyPolicyConfig = field(default_factory=AutonomyPolicyConfig)
     model_routing: RoutingConfig = field(default_factory=RoutingConfig)
+    project_memory: ProjectMemoryConfig = field(default_factory=ProjectMemoryConfig)
 
     def validate(self) -> None:
         if type(self.schema_version) is not int or self.schema_version != 1:
@@ -35,6 +37,9 @@ class Preferences:
         if not isinstance(self.model_routing, RoutingConfig):
             raise ValueError("Model routing settings must be typed trusted configuration")
         self.model_routing.validate()
+        if not isinstance(self.project_memory, ProjectMemoryConfig):
+            raise ValueError("Project-memory settings must be typed trusted configuration")
+        self.project_memory.validate()
         Settings(ollama_url=self.ollama_url, request_timeout=self.request_timeout).validate()
 
 
@@ -56,7 +61,7 @@ class PreferencesStore:
             if not isinstance(value, dict):
                 raise ValueError("Application settings must be an object")
             legacy_keys = {"schema_version", "ollama_url", "request_timeout", "theme"}
-            optional_keys = {"autonomy_policy", "model_routing"}
+            optional_keys = {"autonomy_policy", "model_routing", "project_memory"}
             if not legacy_keys.issubset(value) or not set(value).issubset(legacy_keys | optional_keys):
                 raise ValueError("Invalid application settings fields")
             if "autonomy_policy" in value:
@@ -65,6 +70,8 @@ class PreferencesStore:
                 )
             if "model_routing" in value:
                 value["model_routing"] = RoutingConfig.from_dict(value["model_routing"])
+            if "project_memory" in value:
+                value["project_memory"] = ProjectMemoryConfig.from_dict(value["project_memory"])
             result = Preferences(**value)
             result.validate()
             return result

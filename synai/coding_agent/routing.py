@@ -640,14 +640,23 @@ def estimate_complexity(
         score += 1
         signals.append("moderate task text")
     if context is not None:
-        items = len(getattr(context, "items", ()))
+        context_items = tuple(getattr(context, "items", ()))
+        items = sum(
+            getattr(getattr(item, "kind", None), "value", None) != "memory"
+            for item in context_items
+        )
         if items >= 12:
             score += 2
             signals.append("many selected context items")
         elif items >= 5:
             score += 1
             signals.append("several selected context items")
-        if getattr(context, "truncated", False):
+        truncation_reasons = tuple(getattr(context, "truncation_reasons", ()))
+        memory_only_truncation = bool(truncation_reasons) and all(
+            isinstance(reason, str) and reason.startswith("project_memory_")
+            for reason in truncation_reasons
+        )
+        if getattr(context, "truncated", False) and not memory_only_truncation:
             score += 1
             signals.append("truncated context")
     if plan is not None:

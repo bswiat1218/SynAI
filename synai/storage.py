@@ -59,7 +59,13 @@ class ConversationStorage:
                 if not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
                     raise ValueError(f"Storage must be a private directory owned by your user: {path}")
             else:
-                path.mkdir(mode=0o700)
+                try:
+                    path.mkdir(mode=0o700)
+                except FileExistsError:
+                    checked_path(path)
+                    info = path.stat()
+                    if not path.is_dir() or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                        raise ValueError(f"Storage must be a private directory owned by your user: {path}")
 
     def folder(self, identifier: str) -> Path:
         if not isinstance(identifier, str) or not re.fullmatch(r"[a-f0-9]{32}", identifier):

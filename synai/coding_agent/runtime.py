@@ -18,6 +18,12 @@ from synai.coding_agent.context import (
     ContextEngine,
     ContextPackage,
     ContextRequest,
+    parse_task,
+)
+from synai.coding_agent.memory import (
+    ProjectMemoryConfig,
+    ProjectMemoryError,
+    ProjectMemoryStore,
 )
 from synai.coding_agent.changes import BaselineCaptureError, TaskChangeTracker
 from synai.coding_agent.checkpoints import CheckpointManager
@@ -224,12 +230,28 @@ class CodingAgentRuntime:
         limits: RuntimeLimits | None = None,
         history: History | None = None,
         routing_config: RoutingConfig | None = None,
+        project_memory_config: ProjectMemoryConfig | None = None,
+        project_memory_store: ProjectMemoryStore | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.context_engine = context_engine or ContextEngine()
         self.limits = limits or RuntimeLimits()
         self.history = history
+        self.project_memory_config = (
+            project_memory_config
+            or (project_memory_store.config if project_memory_store is not None else ProjectMemoryConfig())
+        )
+        self.project_memory_config.validate()
+        if project_memory_store is not None and project_memory_store.config != self.project_memory_config:
+            raise ValueError("Project-memory store and trusted runtime configuration must match")
+        if project_memory_store is None and self.project_memory_config.enabled:
+            storage = getattr(history, "storage", None)
+            if storage is not None and isinstance(getattr(storage, "root", None), Path):
+                project_memory_store = ProjectMemoryStore(
+                    storage.root, self.project_memory_config,
+                )
+        self.project_memory_store = project_memory_store
         self.routing_config = routing_config or RoutingConfig()
         self.routing_config.validate()
         self.model_router = ModelRouter()
@@ -327,7 +349,7 @@ class CodingAgentRuntime:
         if limits is not None and not isinstance(limits, ReviewLimits):
             raise TypeError("Review limits must be a ReviewLimits value")
         engine = ReviewEngine(self, limits=limits)
-        return await engine.run(ReviewInput(
+        result = await engine.run(ReviewInput(
             task=task,
             session=session,
             repository=repository,
@@ -336,6 +358,16 @@ class CodingAgentRuntime:
             checkpoint=self._session_checkpoint(session, checkpoint),
             event_sink=event_sink,
         ))
+        if (
+            result.outcome.value in {"passed", "passed_with_warnings"}
+            and task.status == AgentStatus.COMPLETED
+            and self.project_memory_config.enabled
+            and self.project_memory_config.automatic_capture
+        ):
+            await self._capture_project_memory(
+                task, session, repository, event_sink,
+            )
+        return result
 
     async def run_task(
         self,
@@ -411,7 +443,8 @@ class CodingAgentRuntime:
             )
             if context is None:
                 context = await self._build_context(
-                    task_prompt, repository, cancellation, task_metadata,
+                    task, task_prompt, session, repository, cancellation, task_metadata,
+                    event_sink,
                 )
             self._validate_context(context, task_prompt)
             if cancellation and cancellation.is_set():
@@ -1742,14 +1775,72 @@ class CodingAgentRuntime:
 
     async def _build_context(
         self,
+        task_state: AgentTask,
         task: str,
+        session: Session,
         repository: RepositoryIndex,
         cancellation: threading.Event | None,
         metadata: str | None,
+        event_sink: EventSink | None,
     ) -> ContextPackage:
+        memory_args: dict[str, Any] = {}
+        if self.project_memory_config.enabled:
+            await self._emit(task_state, "memory_retrieval_started", event_sink)
+            if self.project_memory_store is None:
+                memory_args["memory_limitations"] = (
+                    "Project memory is enabled but its private application store is unavailable.",
+                )
+                await self._emit(
+                    task_state, "memory_unavailable", event_sink,
+                    message=memory_args["memory_limitations"][0],
+                )
+            else:
+                try:
+                    root = self._validate_runtime_workspace(
+                        session,
+                        repository,
+                    )
+                    terms = parse_task(task)
+                    retrieval = await self._await_cancellable(asyncio.create_task(
+                        asyncio.to_thread(
+                            self.project_memory_store.retrieve,
+                            root,
+                            task,
+                            repository,
+                            relevant_paths=tuple(dict.fromkeys(
+                                (*terms.paths, *terms.filenames),
+                            ))[:32],
+                            relevant_symbols=terms.qualified_symbols[:32],
+                            cancellation=cancellation,
+                        ),
+                    ), cancellation)
+                    memory_args = {
+                        "memories": retrieval.memories,
+                        "memory_limitations": retrieval.limitations,
+                        "memory_truncated": retrieval.truncated,
+                    }
+                    await self._emit(
+                        task_state,
+                        "memory_retrieval_completed",
+                        event_sink,
+                        message=f"Selected {len(retrieval.memories)} bounded project memory record(s).",
+                    )
+                    if retrieval.limitations:
+                        await self._emit(
+                            task_state, "memory_evidence_stale", event_sink,
+                            message="; ".join(retrieval.limitations)[:1024],
+                        )
+                except (ProjectMemoryError, OSError, ValueError, _RuntimeStop) as exc:
+                    code = exc.code.value if isinstance(exc, ProjectMemoryError) else "memory_read_failed"
+                    limitation = f"Project memory unavailable ({code}): {str(exc)[:512]}"
+                    memory_args = {"memory_limitations": (limitation,)}
+                    await self._emit(
+                        task_state, "memory_unavailable", event_sink,
+                        message=limitation,
+                    )
         worker = asyncio.create_task(asyncio.to_thread(
             self.context_engine.build,
-            ContextRequest(task, repository, task_metadata=metadata),
+            ContextRequest(task, repository, task_metadata=metadata, **memory_args),
             cancellation,
         ))
         try:
@@ -1763,6 +1854,46 @@ class CodingAgentRuntime:
                 RuntimeErrorCode.CONTEXT_FAILED,
                 f"Context gathering was interrupted: {str(exc)[:1024]}",
             ) from exc
+
+    async def _capture_project_memory(
+        self,
+        task: AgentTask,
+        session: Session,
+        repository: RepositoryIndex,
+        event_sink: EventSink | None,
+    ) -> None:
+        if self.project_memory_store is None:
+            await self._emit(
+                task,
+                "memory_capture_failed",
+                event_sink,
+                message="Project memory capture failed: private memory store is unavailable.",
+            )
+            return
+        try:
+            root = self._validate_runtime_workspace(session, repository)
+            record = await asyncio.to_thread(
+                self.project_memory_store.capture_verified_task,
+                root,
+                task,
+                session.session_id,
+                repository,
+            )
+        except (ProjectMemoryError, OSError, ValueError, _RuntimeStop) as exc:
+            code = exc.code.value if isinstance(exc, ProjectMemoryError) else "memory_write_failed"
+            await self._emit(
+                task,
+                "memory_capture_failed",
+                event_sink,
+                message=f"Project memory capture failed ({code}): {str(exc)[:512]}",
+            )
+            return
+        await self._emit(
+            task,
+            "memory_capture_succeeded",
+            event_sink,
+            message=f"Captured verified outcome memory {record.memory_id}.",
+        )
 
     @staticmethod
     def _validate_context(context: ContextPackage, task: str) -> None:

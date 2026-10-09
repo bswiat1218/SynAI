@@ -77,3 +77,18 @@ class PreferencesTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Symlink"):
                 store.save(Preferences())
             self.assertEqual(outside.read_text(), "{}")
+
+    def test_legacy_preferences_keep_project_memory_opted_out(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = PreferencesStore(Path(directory))
+            store.storage.initialize()
+            store.path.write_text(json.dumps({
+                "schema_version": 1,
+                "ollama_url": "http://localhost:11434",
+                "request_timeout": 1200,
+                "theme": "synai-cyberpunk",
+            }))
+            store.path.chmod(0o600)
+            loaded = store.load()
+            self.assertFalse(loaded.project_memory.enabled)
+            self.assertFalse(loaded.project_memory.automatic_capture)
