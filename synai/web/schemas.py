@@ -114,6 +114,26 @@ class ChatEventEnvelope(StrictSchema):
     payload: dict[str, str | int | bool | None] = Field(max_length=8)
 
 
+class ProjectActivityEventResponse(StrictSchema):
+    schema_version: Literal[1] = 1
+    event_id: StrictInt = Field(ge=0)
+    project_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    type: Literal[
+        "project_snapshot", "resynchronization_required", "project_created",
+        "workspace_binding_created", "workspace_binding_revoked", "device_revoked",
+        "snapshot_committed", "snapshot_expired",
+    ]
+    created_at: StrictInt = Field(ge=0)
+    payload: dict[str, str | int | bool | None] = Field(max_length=8)
+
+
+class ProjectActivityListResponse(StrictSchema):
+    schema_version: Literal[1] = 1
+    project_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    cursor: StrictInt = Field(ge=0)
+    events: list[ProjectActivityEventResponse] = Field(max_length=256)
+
+
 class ProjectRegistrationRequest(StrictSchema):
     workspace_key: str = Field(min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
 

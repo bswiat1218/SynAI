@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -247,6 +248,120 @@ class WebChatApiTests(unittest.TestCase):
             self.assertEqual(snapshot["type"], "session_snapshot")
             self.assertEqual(snapshot["schema_version"], 1)
             self.assertIn("event_id", snapshot)
+
+    def test_sqlite_failures_return_structured_errors_and_remove_only_new_history(self) -> None:
+        service = self.app.state.services.chat
+        self.assertIsNotNone(service)
+        unrelated = service.storage.root / "conversations" / "unrelated.json"
+        unrelated.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        unrelated.write_text("preserve", encoding="utf-8")
+        with self.app.state.services.database.connect() as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_web_conversation_insert BEFORE INSERT ON web_conversations "
+                "BEGIN SELECT RAISE(FAIL, 'injected create failure'); END",
+            )
+        response = self.client.post(
+            "/api/v1/chat/sessions", json={},
+            headers={"Origin": ORIGIN, "X-CSRF-Token": self.csrf},
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "conversation_persistence_failed")
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "preserve")
+        self.assertEqual(
+            sorted(path.name for path in service.storage.root.joinpath("conversations").iterdir()),
+            ["unrelated.json"],
+        )
+
+    def test_sqlite_failures_during_update_event_and_recovery_are_typed(self) -> None:
+        service = self.app.state.services.chat
+        conversation = self.create()
+        stored = service._load(conversation["id"])
+        with self.app.state.services.database.connect() as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_web_conversation_update BEFORE UPDATE ON web_conversations "
+                "BEGIN SELECT RAISE(FAIL, 'injected update failure'); END",
+            )
+        with self.assertRaises(Exception) as update_error:
+            service._persist(stored)
+        self.assertEqual(getattr(update_error.exception, "code", None), "conversation_persistence_failed")
+        self.assertIsInstance(update_error.exception.__cause__, sqlite3.IntegrityError)
+        restored = service.history.load(service.history.path_for(conversation["id"]))
+        self.assertEqual(restored.state, stored.state)
+        with self.app.state.services.database.connect() as connection:
+            connection.execute("DROP TRIGGER fail_web_conversation_update")
+            connection.execute(
+                "CREATE TRIGGER fail_web_chat_event BEFORE INSERT ON web_chat_events "
+                "BEGIN SELECT RAISE(FAIL, 'injected event failure'); END",
+            )
+        with self.assertRaises(Exception) as event_error:
+            service._emit(conversation["id"], "turn_started", {"model": "test-model"})
+        self.assertEqual(getattr(event_error.exception, "code", None), "event_persistence_failed")
+        with self.app.state.services.database.connect() as connection:
+            connection.execute("DROP TRIGGER fail_web_chat_event")
+        stored.state = "running"
+        service._persist(stored)
+        with self.app.state.services.database.connect() as connection:
+            connection.execute(
+                "CREATE TRIGGER fail_recovery_update BEFORE UPDATE ON web_conversations "
+                "BEGIN SELECT RAISE(FAIL, 'injected recovery failure'); END",
+            )
+        response = self.client.get(f"/api/v1/chat/sessions/{conversation['id']}")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "conversation_persistence_failed")
+        history = service.history.load(service.history.path_for(conversation["id"]))
+        self.assertEqual(history.state, "running")
+        with self.app.state.services.database.connect() as connection:
+            metadata = connection.execute(
+                "SELECT state FROM web_conversations WHERE conversation_id = ?",
+                (conversation["id"],),
+            ).fetchone()
+        self.assertEqual(metadata["state"], "running")
+
+    def test_project_activity_websocket_is_durable_scoped_and_resynchronizes(self) -> None:
+        project = self.client.post(
+            "/api/v1/logical-projects",
+            json={"name": "Activity project", "registration_key": "activity-project-key-123"},
+            headers=self.headers(),
+        )
+        self.assertEqual(project.status_code, 201, project.text)
+        project_id = project.json()["id"]
+        activity = self.client.get(f"/api/v1/logical-projects/{project_id}/activity")
+        self.assertEqual(activity.status_code, 200, activity.text)
+        self.assertEqual(activity.json()["events"][0]["type"], "project_created")
+        self.assertEqual(activity.json()["events"][0]["event_id"], 1)
+        path = f"/api/v1/events/v1/projects/{project_id}"
+        with self.client.websocket_connect(path, headers={"Origin": ORIGIN}) as websocket:
+            snapshot = websocket.receive_json()
+            self.assertEqual(snapshot["type"], "project_snapshot")
+            self.assertEqual(snapshot["project_id"], project_id)
+            self.assertEqual(snapshot["event_id"], 1)
+        with self.client.websocket_connect(
+            f"{path}?after=0", headers={"Origin": ORIGIN},
+        ) as websocket:
+            self.assertEqual(websocket.receive_json()["type"], "project_created")
+        with self.assertRaises(Exception):
+            with self.client.websocket_connect(
+                f"/api/v1/events/v1/projects/{'f' * 32}",
+                headers={"Origin": ORIGIN},
+            ):
+                pass
+        with self.assertRaises(Exception):
+            with self.client.websocket_connect(path, headers={"Origin": "https://attacker.example"}):
+                pass
+
+    def test_project_activity_rejects_unauthenticated_websocket(self) -> None:
+        project = self.client.post(
+            "/api/v1/logical-projects",
+            json={"name": "Auth project", "registration_key": "activity-auth-key-12345"},
+            headers=self.headers(),
+        ).json()
+        unauthenticated = TestClient(self.app)
+        with self.assertRaises(Exception):
+            with unauthenticated.websocket_connect(
+                f"/api/v1/events/v1/projects/{project['id']}",
+                headers={"Origin": ORIGIN},
+            ):
+                pass
 
 
 if __name__ == "__main__":

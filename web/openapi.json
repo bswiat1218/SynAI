@@ -992,6 +992,116 @@
         "title": "PasswordChangeRequest",
         "type": "object"
       },
+      "ProjectActivityEventResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "minimum": 0.0,
+            "title": "Created At",
+            "type": "integer"
+          },
+          "event_id": {
+            "minimum": 0.0,
+            "title": "Event Id",
+            "type": "integer"
+          },
+          "payload": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "maxProperties": 8,
+            "title": "Payload",
+            "type": "object"
+          },
+          "project_id": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[a-f0-9]{32}$",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "type": {
+            "enum": [
+              "project_snapshot",
+              "resynchronization_required",
+              "project_created",
+              "workspace_binding_created",
+              "workspace_binding_revoked",
+              "device_revoked",
+              "snapshot_committed",
+              "snapshot_expired"
+            ],
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "project_id",
+          "type",
+          "created_at",
+          "payload"
+        ],
+        "title": "ProjectActivityEventResponse",
+        "type": "object"
+      },
+      "ProjectActivityListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "minimum": 0.0,
+            "title": "Cursor",
+            "type": "integer"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectActivityEventResponse"
+            },
+            "maxItems": 256,
+            "title": "Events",
+            "type": "array"
+          },
+          "project_id": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[a-f0-9]{32}$",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": 1,
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "cursor",
+          "events"
+        ],
+        "title": "ProjectActivityListResponse",
+        "type": "object"
+      },
       "ProjectListResponse": {
         "additionalProperties": false,
         "properties": {
@@ -3251,6 +3361,62 @@
           }
         ],
         "summary": "Inspect Logical Project"
+      }
+    },
+    "/api/v1/logical-projects/{project_id}/activity": {
+      "get": {
+        "operationId": "project_activity_api_v1_logical_projects__project_id__activity_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 256,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectActivityListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          }
+        ],
+        "summary": "Project Activity"
       }
     },
     "/api/v1/logical-projects/{project_id}/bindings": {

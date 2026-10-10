@@ -17,6 +17,7 @@ from fastapi.security import APIKeyCookie, APIKeyHeader
 from starlette.types import ASGIApp, Receive, Scope, Send
 from urllib.parse import urlsplit
 
+from synai.web.activity import ProjectActivityStore
 from synai.providers.base import ModelProvider, ProviderError
 from synai.providers.ollama import OllamaProvider
 from synai.web.chat import WebChatError, WebChatService
@@ -71,6 +72,8 @@ from synai.web.schemas import (
     MemoryAssociationPreviewRequest,
     MemoryAssociationPreviewResponse,
     PairingChallengeResponse,
+    ProjectActivityListResponse,
+    ProjectActivityEventResponse,
     SnapshotChunkResponse,
     SnapshotListResponse,
     SnapshotResponse,
@@ -120,6 +123,7 @@ class WebServices:
     distributed: DistributedRegistry | None = None
     snapshots: SnapshotStore | None = None
     chat: WebChatService | None = None
+    activity: ProjectActivityStore | None = None
     snapshot_cleanup_task: asyncio.Task[None] | None = None
     ready: bool = False
 
@@ -134,6 +138,7 @@ class WebServices:
             self.auth.initialize(self.config.initial_password)
             self.projects = ProjectRegistry(self.database, self.config)
             self.distributed = DistributedRegistry(self.database)
+            self.activity = ProjectActivityStore(self.database)
             self.snapshots = SnapshotStore(self.database, self.distributed)
             self.snapshots.initialize()
             self.chat = WebChatService(
@@ -648,6 +653,109 @@ def create_app(
             if not reader.done():
                 reader.cancel()
             await asyncio.gather(reader, return_exceptions=True)
+
+    @router.get(
+        "/api/v1/logical-projects/{project_id}/activity",
+        response_model=ProjectActivityListResponse,
+    )
+    async def project_activity(
+        project_id: str,
+        limit: int = Query(default=100, ge=1, le=256),
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> ProjectActivityListResponse:
+        assert current.distributed is not None and current.activity is not None
+        try:
+            current.distributed.get_project(project_id)
+        except DistributedError:
+            raise
+        events, cursor = current.activity.list_recent(project_id, limit)
+        return ProjectActivityListResponse(
+            project_id=project_id,
+            cursor=cursor,
+            events=[ProjectActivityEventResponse(**event) for event in events],
+        )
+
+    @router.websocket("/api/v1/events/v1/projects/{project_id}")
+    async def project_event_stream(
+        websocket: WebSocket,
+        project_id: str,
+        after: int | None = Query(default=None, ge=0),
+    ) -> None:
+        current: WebServices = websocket.app.state.services
+        if not current.ready or current.activity is None or current.distributed is None or current.auth is None:
+            await websocket.close(code=1013)
+            return
+        if websocket.headers.get("origin") != _normalized_origin(selected_config.public_origin):
+            await websocket.close(code=4403)
+            return
+        raw_token = websocket.cookies.get(_SESSION_COOKIE)
+        try:
+            current.auth.session(raw_token)
+            project = current.distributed.get_project(project_id)
+        except AuthenticationError:
+            await websocket.close(code=4401)
+            return
+        except DistributedError:
+            await websocket.close(code=4404)
+            return
+        if not current.activity.acquire(project_id):
+            await websocket.close(code=4409)
+            return
+        try:
+            await websocket.accept()
+            reader = asyncio.create_task(_reject_websocket_input(websocket))
+
+            async def send_event(event: dict[str, object]) -> None:
+                current.auth.session(raw_token)
+                await asyncio.wait_for(websocket.send_json(event), timeout=10)
+
+            cursor = 0 if after is None else after
+            try:
+                events, current_cursor, gap = current.activity.read_after(project_id, cursor)
+                if after is None:
+                    cursor = current_cursor
+                    await send_event(current.activity.snapshot_event(
+                        project_id, cursor, project.display_name, project.status,
+                    ))
+                elif gap:
+                    cursor = current_cursor
+                    await send_event(current.activity.resync_event(project_id, cursor))
+                    await send_event(current.activity.snapshot_event(
+                        project_id, cursor, project.display_name, project.status,
+                    ))
+                else:
+                    for event in events:
+                        await send_event(event)
+                        cursor = int(event["event_id"])
+                while not reader.done():
+                    await asyncio.sleep(current.activity.POLL_INTERVAL_SECONDS)
+                    current.auth.session(raw_token)
+                    events, current_cursor, gap = current.activity.read_after(project_id, cursor)
+                    if gap:
+                        cursor = current_cursor
+                        await send_event(current.activity.resync_event(project_id, cursor))
+                        project = current.distributed.get_project(project_id)
+                        await send_event(current.activity.snapshot_event(
+                            project_id, cursor, project.display_name, project.status,
+                        ))
+                        continue
+                    for event in events:
+                        await send_event(event)
+                        cursor = int(event["event_id"])
+            except AuthenticationError:
+                await websocket.close(code=4401)
+            except (TimeoutError, sqlite3.Error, ValueError):
+                _logger.exception("Project activity stream failed project_id=%s", project_id)
+                await websocket.close(code=1013)
+            except WebSocketDisconnect:
+                pass
+            finally:
+                if not reader.done():
+                    reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
+        finally:
+            current.activity.release(project_id)
 
     @router.get(
         "/api/v1/projects",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import re
+import sqlite3
 import time
 from pathlib import Path
 from synai.agent import Agent
@@ -119,6 +121,7 @@ class WebChatService:
                 raise WebChatError("model_invalid", 422, "A valid model name is required.")
             await self._require_available_model(model)
         session = Session(model or "", self.endpoint, "", schema_version=1)
+        history_created = False
         try:
             with self.database.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -127,7 +130,16 @@ class WebChatService:
                 ).fetchone()[0]
                 if count >= self.MAX_SESSIONS:
                     raise WebChatError("session_capacity", 429, "Conversation capacity is full.")
+                if (
+                    self.history.path_for(session.session_id).exists()
+                    or self.storage.folder(session.session_id).exists()
+                ):
+                    raise WebChatError(
+                        "conversation_id_collision", 409,
+                        "A conversation with the generated identifier already exists.",
+                    )
                 self.history.save(session)
+                history_created = True
                 connection.execute(
                     "INSERT INTO web_conversations"
                     "(conversation_id, schema_version, project_id, title, model, state, "
@@ -139,9 +151,13 @@ class WebChatService:
                 )
                 connection.commit()
         except WebChatError:
+            if history_created:
+                self._remove_new_history(session.session_id)
             raise
         except (HistoryError, OSError, sqlite3.Error) as exc:
-            raise WebChatError("conversation_persistence_failed", 500, "Conversation could not be saved.") from exc
+            if history_created:
+                self._remove_new_history(session.session_id)
+            raise WebChatError("conversation_persistence_failed", 503, "Conversation could not be saved.") from exc
         return self._response(session, project_id)
 
     def list_sessions(
@@ -182,9 +198,9 @@ class WebChatService:
             raise WebChatError("conversation_not_found", 404, "Conversation was not found.")
         try:
             session = self.history.load(self.history.path_for(conversation_id))
-        except (HistoryError, OSError) as exc:
+        except (HistoryError, OSError, sqlite3.Error) as exc:
             raise WebChatError(
-                "conversation_unavailable", 500, "Saved conversation could not be loaded.",
+                "conversation_unavailable", 503, "Saved conversation could not be loaded.",
             ) from exc
         if session.session_id != conversation_id:
             raise WebChatError("conversation_unavailable", 500, "Saved conversation identity is invalid.")
@@ -259,10 +275,17 @@ class WebChatService:
     async def _run_turn(self, session: Session, prompt: str) -> None:
         conversation_id = session.session_id
         offsets: dict[int, tuple[int, int]] = {}
+        last_persist = 0.0
 
         async def update() -> None:
+            nonlocal last_persist
+            now = time.monotonic()
+            terminal = session.state != "running"
+            if not terminal and now - last_persist < 0.2:
+                return
             self._check_transcript_size(session)
             self._persist(session)
+            last_persist = now
             assistant = next(
                 (message for message in reversed(session.messages) if message.role == "assistant"),
                 None,
@@ -288,12 +311,21 @@ class WebChatService:
             await agent.turn(session, model_info, prompt)
             self._persist(session)
             if session.state == "idle":
-                self._emit(conversation_id, "turn_completed", {"state": "complete"})
+                try:
+                    self._emit(conversation_id, "turn_completed", {"state": "complete"})
+                except WebChatError:
+                    _logger.exception(
+                        "Could not persist terminal chat event conversation_id=%s",
+                        conversation_id,
+                    )
             else:
-                self._emit(conversation_id, "turn_failed", {"state": "error"})
+                self._emit_terminal(conversation_id, "turn_failed", {"state": "error"})
         except asyncio.CancelledError:
-            self._persist(session)
-            self._emit(conversation_id, "turn_cancelled", {"state": "cancelled"})
+            try:
+                self._persist(session)
+            except WebChatError:
+                _logger.exception("Could not persist cancelled chat state conversation_id=%s", conversation_id)
+            self._emit_terminal(conversation_id, "turn_cancelled", {"state": "cancelled"})
             raise
         except (HistoryError, OSError, ProviderError, TimeoutError, ValueError, sqlite3.Error, WebChatError):
             _logger.exception("Browser chat turn failed conversation_id=%s", conversation_id)
@@ -302,11 +334,22 @@ class WebChatService:
                 self._persist(session)
             except (HistoryError, OSError, sqlite3.Error, WebChatError):
                 _logger.exception("Could not persist failed browser chat turn")
-            self._emit(conversation_id, "turn_failed", {"state": "error"})
+            self._emit_terminal(conversation_id, "turn_failed", {"state": "error"})
         finally:
             async with self._turn_lock:
                 if self._turns.get(conversation_id) is asyncio.current_task():
                     del self._turns[conversation_id]
+
+    def _emit_terminal(
+        self, conversation_id: str, event_type: str, payload: dict[str, object],
+    ) -> None:
+        try:
+            self._emit(conversation_id, event_type, payload)
+        except WebChatError:
+            _logger.exception(
+                "Could not persist terminal chat event type=%s conversation_id=%s",
+                event_type, conversation_id,
+            )
 
     async def _emit_chunks(self, conversation_id: str, event_type: str, text: str) -> None:
         for offset in range(0, len(text), self.EVENT_DELTA_CHARS):
@@ -341,10 +384,13 @@ class WebChatService:
         return row
 
     def _persist(self, session: Session) -> None:
+        path = self.history.path_for(session.session_id)
+        previous: Session | None = None
         try:
+            previous = self.history.load(path)
             self.history.save(session)
             with self.database.connect() as connection:
-                connection.execute(
+                cursor = connection.execute(
                     "UPDATE web_conversations SET title = ?, model = ?, state = ?, updated_at = ? "
                     "WHERE conversation_id = ?",
                     (
@@ -352,10 +398,39 @@ class WebChatService:
                         session.session_id,
                     ),
                 )
-        except (HistoryError, OSError) as exc:
+                if cursor.rowcount != 1:
+                    raise WebChatError(
+                        "conversation_not_found", 404,
+                        "Conversation metadata was not found.",
+                    )
+        except (HistoryError, OSError, sqlite3.Error, ValueError, WebChatError) as exc:
+            if previous is not None:
+                try:
+                    self.history.save(previous)
+                except (HistoryError, OSError, sqlite3.Error):
+                    _logger.exception(
+                        "Could not restore browser chat history after persistence failure "
+                        "conversation_id=%s",
+                        session.session_id,
+                    )
+                session.__dict__.clear()
+                session.__dict__.update(copy.deepcopy(previous.__dict__))
+            if isinstance(exc, WebChatError):
+                raise
             raise WebChatError(
-                "conversation_persistence_failed", 500, "Conversation could not be saved.",
+                "conversation_persistence_failed", 503, "Conversation could not be saved.",
             ) from exc
+
+    def _remove_new_history(self, conversation_id: str) -> None:
+        try:
+            path = self.history.path_for(conversation_id)
+            if path.exists():
+                self.history.delete(path)
+        except (HistoryError, OSError, ValueError):
+            _logger.exception(
+                "Could not roll back new browser chat history conversation_id=%s",
+                conversation_id,
+            )
 
     @staticmethod
     def _check_transcript_size(session: Session) -> None:

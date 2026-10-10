@@ -601,7 +601,15 @@ class DistributedFoundationTests(unittest.TestCase):
         os.chmod(path, 0o600)
         legacy_database.initialize()
         with legacy_database.connect() as migrated:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertIn(
+                "project_activity_events",
+                {
+                    row["name"] for row in migrated.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'",
+                    ).fetchall()
+                },
+            )
             self.assertEqual(migrated.execute("SELECT project_id FROM projects").fetchone()[0], "legacy-project")
             self.assertEqual(migrated.execute("SELECT token_hash FROM sessions").fetchone()[0], "session-hash")
             self.assertEqual(migrated.execute("SELECT count(*) FROM logical_projects").fetchone()[0], 0)

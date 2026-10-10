@@ -57,10 +57,14 @@ ssh -t home-server 'cd ~/synai && .venv/bin/synai'
 
 The TUI needs an interactive terminal but not a desktop. Its separate GTK editor
 still requires a usable graphical display; ordinary headless SSH is insufficient.
-The browser application is a separate, currently read-only foundation, not a web
-chat replacement. See [web deployment and shared-data ownership](docs/phase-13b-web.md)
-before hosting it; remote access requires HTTPS, and the web service and TUI
-cannot own the same data root concurrently.
+The browser application now provides authenticated Ollama chat, persistent
+conversation history, a Slate Dark Project Command Center, project metadata and
+activity views, and device/sandbox status. Chat remains tool-disabled and does
+not access source files, execute tasks, or apply patches. The original Phase
+13B read-only foundation is described in [web deployment and shared-data
+ownership](docs/phase-13b-web.md); see [Phase 13D browser chat](docs/phase-13d-web-chat.md)
+for current capabilities and limitations. Remote access requires HTTPS, and
+the web service and TUI cannot own the same data root concurrently.
 
 SynAI opens on its main menu. Set your Ollama server in **CONNECTION SETTINGS** if needed, then choose **NEW CONVERSATION**, review its environment, choose **NEXT**, select a model from the shared connection, and choose **CREATE CONVERSATION**. Use **CONVERSATIONS** to reopen or delete saved chats. Highlight a row with the arrows and press **Enter** or **OPEN** to restore its execution environment. Launching, configuring drafts, refreshing models, and browsing the menu do not create empty histories.
 

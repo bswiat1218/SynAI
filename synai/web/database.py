@@ -13,7 +13,7 @@ from synai.storage import ConversationStorage, checked_path
 class MetadataDatabase:
     """Private, versioned browser-service metadata, separate from conversation history."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(self, data_root: Path) -> None:
         self.storage = ConversationStorage(data_root)
@@ -110,6 +110,9 @@ class MetadataDatabase:
                 current_version = connection.execute("PRAGMA user_version").fetchone()[0]
             if current_version == 3:
                 self._migrate_to_web_chat_v4(connection)
+                current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if current_version == 4:
+                self._migrate_to_project_activity_v5(connection)
             elif current_version != self.SCHEMA_VERSION:
                 raise ValueError("Web metadata migration did not reach the current schema version")
         os.chmod(self.path, 0o600)
@@ -283,6 +286,33 @@ class MetadataDatabase:
                     PRIMARY KEY(conversation_id, sequence)
                 );
                 PRAGMA user_version = 4;
+                COMMIT;
+                """
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_to_project_activity_v5(connection: sqlite3.Connection) -> None:
+        try:
+            connection.executescript(
+                """
+                BEGIN EXCLUSIVE;
+                CREATE TABLE project_activity_cursors (
+                    project_id TEXT PRIMARY KEY
+                        REFERENCES logical_projects(project_id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL CHECK(sequence >= 0)
+                );
+                CREATE TABLE project_activity_events (
+                    project_id TEXT NOT NULL
+                        REFERENCES logical_projects(project_id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL CHECK(sequence > 0),
+                    created_at INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY(project_id, sequence)
+                );
+                PRAGMA user_version = 5;
                 COMMIT;
                 """
             )

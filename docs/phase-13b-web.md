@@ -1,8 +1,10 @@
 # Phase 13B web foundation
 
-Phase 13B adds a read-only browser/API foundation alongside the existing
-Textual/GTK application. It does not replace the TUI, run chat turns, dispatch
-tools, execute commands, edit project files, or start a task runner. The
+Phase 13B introduced a read-only browser/API foundation alongside the existing
+Textual/GTK application. Phase 13D has since added authenticated browser chat
+and project activity streaming; those later capabilities are documented in
+[Phase 13D browser chat](phase-13d-web-chat.md). Neither phase replaces the TUI,
+dispatches tools, executes commands, edits project files, or starts a task runner. The
 approved revised Phase 13A plan was not present in the checked-out repository
 when this work was implemented; the detailed Phase 13B requirements are the
 implementation scope. The web foundation is not authorization to skip any
@@ -22,6 +24,12 @@ Configuration is read from the process environment:
 | `SYNAI_BIND_HOST` | Listener address. Defaults to `127.0.0.1`; non-loopback binds require an HTTPS public origin. |
 | `SYNAI_PORT` | Listener port; defaults to `8765`. |
 | `OLLAMA_URL` / `OLLAMA_HOST` | Existing Ollama provider endpoint. Provider unavailability does not prevent service startup. |
+
+For frontend development, run the API service separately and use `cd web &&
+npm run dev`; Vite forwards `/api` requests to `http://127.0.0.1:8765` unless
+`SYNAI_API_TARGET` is set. Run `npm test`, `npm run typecheck`, and `npm run
+build` from `web/`. Browser acceptance tests use a mocked API and WebSocket
+(`npm run test:e2e`) and never contact the configured Ollama service.
 
 Do not place credentials in frontend assets, source control, command-line
 arguments, or ordinary logs. Supply the initial password through a protected

@@ -414,6 +414,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/logical-projects/{project_id}/activity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Project Activity */
+        get: operations["project_activity_api_v1_logical_projects__project_id__activity_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/logical-projects/{project_id}/bindings": {
         parameters: {
             query?: never;
@@ -928,6 +945,45 @@ export interface components {
             current_password: string;
             /** New Password */
             new_password: string;
+        };
+        /** ProjectActivityEventResponse */
+        ProjectActivityEventResponse: {
+            /** Created At */
+            created_at: number;
+            /** Event Id */
+            event_id: number;
+            /** Payload */
+            payload: {
+                [key: string]: string | number | boolean | null;
+            };
+            /** Project Id */
+            project_id: string;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
+            /**
+             * Type
+             * @enum {string}
+             */
+            type: "project_snapshot" | "resynchronization_required" | "project_created" | "workspace_binding_created" | "workspace_binding_revoked" | "device_revoked" | "snapshot_committed" | "snapshot_expired";
+        };
+        /** ProjectActivityListResponse */
+        ProjectActivityListResponse: {
+            /** Cursor */
+            cursor: number;
+            /** Events */
+            events: components["schemas"]["ProjectActivityEventResponse"][];
+            /** Project Id */
+            project_id: string;
+            /**
+             * Schema Version
+             * @default 1
+             * @constant
+             */
+            schema_version: 1;
         };
         /** ProjectListResponse */
         ProjectListResponse: {
@@ -2253,6 +2309,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    project_activity_api_v1_logical_projects__project_id__activity_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectActivityListResponse"];
                 };
             };
             /** @description Validation Error */

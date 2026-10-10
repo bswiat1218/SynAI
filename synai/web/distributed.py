@@ -16,6 +16,7 @@ from urllib.parse import quote
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from synai.web.activity import append_project_activity
 from synai.web.database import MetadataDatabase
 
 
@@ -343,6 +344,11 @@ class DistributedRegistry:
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                projects = connection.execute(
+                    "SELECT DISTINCT project_id FROM workspace_bindings "
+                    "WHERE device_id = ? AND state != 'revoked' ORDER BY project_id",
+                    (device_id,),
+                ).fetchall()
                 cursor = connection.execute(
                     "UPDATE paired_devices SET state = 'revoked', revoked_at = ? "
                     "WHERE device_id = ? AND state != 'revoked'",
@@ -355,6 +361,11 @@ class DistributedRegistry:
                     "WHERE device_id = ? AND state != 'revoked'",
                     (timestamp, device_id),
                 )
+                for row in projects:
+                    append_project_activity(
+                        connection, row["project_id"], "device_revoked",
+                        {"device_id": device_id}, timestamp,
+                    )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -548,6 +559,10 @@ class DistributedRegistry:
                 row = connection.execute(
                     "SELECT * FROM logical_projects WHERE project_id = ?", (project_id,),
                 ).fetchone()
+                append_project_activity(
+                    connection, project_id, "project_created",
+                    {"project_name": name, "project_status": "active"}, timestamp,
+                )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -617,6 +632,11 @@ class DistributedRegistry:
                 row = connection.execute(
                     "SELECT * FROM workspace_bindings WHERE binding_id = ?", (binding_id,),
                 ).fetchone()
+                append_project_activity(
+                    connection, project_id, "workspace_binding_created",
+                    {"binding_id": binding_id, "device_id": device_id, "name": name},
+                    timestamp,
+                )
                 connection.commit()
             except sqlite3.IntegrityError as exc:
                 connection.rollback()
@@ -671,13 +691,30 @@ class DistributedRegistry:
         self.get_project(project_id)
         _require_id(binding_id, "binding_not_found")
         with self.database.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE workspace_bindings SET state = 'revoked', revoked_at = ? "
-                "WHERE binding_id = ? AND project_id = ? AND state != 'revoked'",
-                (timestamp, binding_id, project_id),
-            )
-        if cursor.rowcount != 1:
-            raise DistributedError("binding_not_found", "Workspace binding was not found.", 404)
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT display_name FROM workspace_bindings "
+                    "WHERE binding_id = ? AND project_id = ? AND state != 'revoked'",
+                    (binding_id, project_id),
+                ).fetchone()
+                if row is None:
+                    raise DistributedError("binding_not_found", "Workspace binding was not found.", 404)
+                cursor = connection.execute(
+                    "UPDATE workspace_bindings SET state = 'revoked', revoked_at = ? "
+                    "WHERE binding_id = ? AND project_id = ? AND state != 'revoked'",
+                    (timestamp, binding_id, project_id),
+                )
+                if cursor.rowcount != 1:
+                    raise DistributedError("binding_not_found", "Workspace binding was not found.", 404)
+                append_project_activity(
+                    connection, project_id, "workspace_binding_revoked",
+                    {"binding_id": binding_id, "name": row["display_name"]}, timestamp,
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def create_disabled_task_contract(
         self,

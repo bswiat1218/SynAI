@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import {
   useEffect,
+  useCallback,
   useRef,
   useState,
   type CSSProperties,
@@ -32,6 +33,7 @@ import { useResource } from "./api/useResource";
 import type {
   ChatConversationListResponse,
   ChatConversationResponse,
+  ProjectActivityListResponse,
   DeviceListResponse,
   DeviceMetadataResponse,
   ExecutionTargetStatusResponse,
@@ -290,6 +292,7 @@ export function WorkbenchPage() {
   const project = useResource<LogicalProjectResponse>(`/api/v1/logical-projects/${projectId}`);
   const bindings = useResource<WorkspaceBindingListResponse>(`/api/v1/logical-projects/${projectId}/bindings`);
   const snapshots = useResource<SnapshotListResponse>(`/api/v1/logical-projects/${projectId}/snapshots`);
+  const activity = useResource<ProjectActivityListResponse>(`/api/v1/logical-projects/${projectId}/activity?limit=100`);
   const tasks = useResource<TaskListResponse>(`/api/v1/logical-projects/${projectId}/tasks`);
   const conversations = useResource<ChatConversationListResponse>(`/api/v1/chat/sessions?project_id=${projectId}`);
   const [detailOpen, setDetailOpen] = useState(true);
@@ -297,6 +300,13 @@ export function WorkbenchPage() {
   const [panel, setPanel] = useState<"project" | "chat" | "snapshots" | "activity" | "memory">(
     () => location.pathname.includes("/chat") ? "chat" : "project",
   );
+  const refreshProjectData = useCallback(() => {
+    activity.reload();
+    project.reload();
+    bindings.reload();
+    snapshots.reload();
+    tasks.reload();
+  }, [activity.reload, bindings.reload, project.reload, snapshots.reload, tasks.reload]);
   const style = { "--inspector-width": `${detailWidth}px` } as CSSProperties;
   if (project.error && !project.data) return <ErrorPage title="Project unavailable" message={project.error} />;
   return (
@@ -344,7 +354,13 @@ export function WorkbenchPage() {
           )}
           {panel === "chat" && <ChatPage embedded />}
           {panel === "snapshots" && <SnapshotPanel data={snapshots.data} loading={snapshots.loading} error={snapshots.error} />}
-          {panel === "activity" && <ActivityPanel snapshots={snapshots.data} tasks={tasks.data} loading={snapshots.loading || tasks.loading} />}
+          {panel === "activity" && <ActivityPanel
+            projectId={projectId}
+            data={activity.data}
+            loading={activity.loading}
+            error={activity.error}
+            reload={refreshProjectData}
+          />}
           {panel === "memory" && <StatusMessage tone="neutral" title="Project memory unavailable">Phase 12 memory is not automatically associated with logical projects. No memory content is read or migrated here.</StatusMessage>}
         </section>
         {detailOpen && (
@@ -381,17 +397,102 @@ function SnapshotPanel({ data, loading, error }: { data: SnapshotListResponse | 
   </div>;
 }
 
-function ActivityPanel({ snapshots, tasks, loading }: { snapshots: SnapshotListResponse | null; tasks: TaskListResponse | null; loading: boolean }) {
-  if (loading) return <p className="muted-copy">Loading persisted project activity…</p>;
-  const entries = [
-    ...(snapshots?.snapshots ?? []).map((item) => ({ id: item.snapshot_id, type: "Snapshot", state: item.state, at: item.created_at })),
-    ...(tasks?.tasks ?? []).map((item) => ({ id: item.task_id, type: "Agent Task", state: item.state, at: null as number | null })),
-  ];
-  return <div><span className="eyebrow">Project history</span><h2>Activity</h2>
-    {entries.length ? <ul className="compact-list">{entries.map((entry) => <li key={entry.id}><span className="list-main"><strong>{entry.type} · {entry.id.slice(0, 12)}</strong><span>{entry.at === null ? "Timestamp unavailable" : dateLabel(entry.at)}</span></span><span className={`status-pill ${statusClass(entry.state)}`}>{entry.state}</span></li>)}</ul>
-      : <EmptyState title="No project activity" detail="Persisted snapshot and task records will appear here when available." />}
+function ActivityPanel({ projectId, data, loading, error, reload }: {
+  projectId: string;
+  data: ProjectActivityListResponse | null;
+  loading: boolean;
+  error: string | null;
+  reload: () => void;
+}) {
+  const [streamStatus, setStreamStatus] = useState("connecting");
+  const cursor = useRef<number | null>(null);
+  useEffect(() => {
+    cursor.current = null;
+  }, [projectId]);
+  useEffect(() => {
+    if (!data || data.project_id !== projectId) return;
+    let active = true;
+    let socket: WebSocket | null = null;
+    let retry: number | undefined;
+    let delay = 700;
+    if (cursor.current === null) cursor.current = data.cursor;
+    const connect = () => {
+      if (!active) return;
+      setStreamStatus(cursor.current ? "reconnecting" : "connecting");
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      socket = new WebSocket(
+        `${protocol}//${window.location.host}/api/v1/events/v1/projects/${projectId}?after=${cursor.current ?? 0}`,
+      );
+      socket.onopen = () => {
+        delay = 700;
+        setStreamStatus("connected");
+      };
+      socket.onmessage = (message) => {
+        let event: ProjectActivityEvent;
+        try {
+          event = JSON.parse(message.data) as ProjectActivityEvent;
+        } catch {
+          setStreamStatus("resynchronizing");
+          reload();
+          return;
+        }
+        if (event.schema_version !== 1 || event.project_id !== projectId) return;
+        if (event.type === "project_snapshot" || event.type === "resynchronization_required") {
+          cursor.current = Math.max(cursor.current ?? 0, event.event_id);
+          setStreamStatus(event.type === "project_snapshot" ? "connected" : "resynchronizing");
+          reload();
+          return;
+        }
+        const previous = cursor.current ?? 0;
+        if (event.event_id <= previous) return;
+        cursor.current = event.event_id;
+        if (event.event_id !== previous + 1) setStreamStatus("resynchronizing");
+        reload();
+      };
+      socket.onclose = (event) => {
+        if (!active) return;
+        if (event.code === 4401) {
+          notifySessionExpired();
+          setStreamStatus("session expired");
+          return;
+        }
+        if (event.code === 4404) {
+          setStreamStatus("project unavailable");
+          return;
+        }
+        setStreamStatus("reconnecting");
+        retry = window.setTimeout(connect, delay);
+        delay = Math.min(delay * 2, 10_000);
+      };
+      socket.onerror = () => setStreamStatus("reconnecting");
+    };
+    connect();
+    return () => {
+      active = false;
+      if (retry) window.clearTimeout(retry);
+      socket?.close();
+    };
+  }, [data?.project_id, projectId, reload]);
+
+  const entries = data?.events ?? [];
+  return <div>
+    <span className="eyebrow">Project history</span><h2>Activity</h2>
+    <p className="small-note" role="status" aria-live="polite">
+      {loading ? "Loading persisted activity…" : error ? `Activity unavailable: ${error}` : `Live stream ${streamStatus}.`}
+    </p>
+    {entries.length ? <ul className="compact-list">{entries.map((entry) => (
+      <li key={entry.event_id}>
+        <span className="list-main">
+          <strong>{activityLabel(entry.type, entry.payload)}</strong>
+          <span>{dateLabel(entry.created_at)}</span>
+        </span>
+        <span className="status-pill status-neutral">#{entry.event_id}</span>
+      </li>
+    ))}</ul> : !loading && !error ? <EmptyState title="No project activity" detail="Persisted project, binding, and snapshot changes will appear here." /> : null}
   </div>;
 }
+
+type ProjectActivityEvent = ProjectActivityListResponse["events"][number];
 
 export function ChatPage({ embedded = false }: { embedded?: boolean }) {
   const { projectId, conversationId } = useParams();
@@ -406,7 +507,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
     conversationId ? `/api/v1/chat/sessions/${conversationId}` : null,
   );
   const [liveSession, setLiveSession] = useState<ChatConversationResponse | null>(null);
-  const [selectedModel, setSelectedModel] = useState("");
+  const [modelOverride, setModelOverride] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [eventStatus, setEventStatus] = useState<"connecting" | "connected" | "reconnecting" | "offline">("offline");
@@ -416,26 +517,30 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
   const nearBottom = useRef(true);
   const cursor = useRef(0);
   const currentData = useRef(current.data);
+  const routeConversation = useRef(conversationId ?? "");
+  routeConversation.current = conversationId ?? "";
   useEffect(() => {
     currentData.current = current.data;
   }, [current.data]);
   const session = liveSession?.id === conversationId ? liveSession : current.data;
   const messages = session?.messages ?? [];
+  const selectedModel = modelOverride ?? (
+    (conversationId && current.data?.id === conversationId && current.data.model)
+      ? current.data.model
+      : models.data?.models[0]?.name ?? ""
+  );
   const running = session?.state === "running" || sending;
 
   useEffect(() => {
     setDraft(draftCache.get(draftKey(conversationId, projectId)) ?? "");
     setLiveSession(null);
+    setModelOverride(null);
     setNotice(null);
   }, [conversationId, projectId]);
 
   useEffect(() => {
     if (current.data?.id === conversationId) setLiveSession(current.data);
   }, [current.data, conversationId]);
-
-  useEffect(() => {
-    if (!selectedModel && models.data?.models.length) setSelectedModel(models.data.models[0].name);
-  }, [models.data, selectedModel]);
 
   useEffect(() => {
     if (nearBottom.current && scrollRegion.current) {
@@ -478,9 +583,35 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
           refresh();
           return;
         }
+        if (event.type === "session_snapshot") {
+          cursor.current = Math.max(cursor.current, event.event_id);
+          refresh();
+          return;
+        }
         if (event.event_id <= cursor.current) return;
+        if (event.event_id !== cursor.current + 1) {
+          cursor.current = event.event_id;
+          refresh();
+          setNotice("Some live events were missed. Reloaded the saved conversation.");
+          return;
+        }
         cursor.current = event.event_id;
-        if (event.type === "content_delta" || event.type === "thinking_delta") {
+        if (event.type === "turn_started") {
+          setLiveSession((existing) => {
+            const base = existing?.id === conversationId ? existing : currentData.current;
+            if (!base) return base;
+            const updated = { ...base, state: "running" as const, messages: [...(base.messages ?? [])] };
+            const last = updated.messages.at(-1);
+            if (last?.role !== "assistant" || last.status !== "streaming") {
+              updated.messages.push({
+                role: "assistant", content: "", thinking: "", status: "streaming",
+                created_at: new Date().toISOString(),
+              });
+            }
+            return updated;
+          });
+          refresh();
+        } else if (event.type === "content_delta" || event.type === "thinking_delta") {
           const text = typeof event.payload.text === "string" ? event.payload.text : "";
           setLiveSession((existing) => {
             const base = existing?.id === conversationId ? existing : currentData.current;
@@ -493,7 +624,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
                 break;
               }
             }
-            if (assistantIndex < 0) {
+            if (assistantIndex < 0 || updated.messages.at(-1)?.role !== "assistant") {
               updated.messages.push({
                 role: "assistant", content: "", thinking: "", status: "streaming",
                 created_at: new Date().toISOString(),
@@ -509,7 +640,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
             };
             return updated;
           });
-        } else if (event.type === "session_snapshot" || event.type === "provider_unavailable"
+        } else if (event.type === "provider_unavailable"
           || event.type.startsWith("turn_")) {
           refresh();
           if (event.type === "turn_completed") setNotice("Response complete.");
@@ -562,6 +693,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
     setNotice(null);
     let activeId = conversationId;
     const prompt = draft;
+    const originalDraftKey = draftKey(conversationId, projectId);
     try {
       if (!activeId) {
         const created = await apiRequest<ChatConversationResponse>("/api/v1/chat/sessions", {
@@ -578,17 +710,38 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
         body: JSON.stringify({ prompt, model: selectedModel }),
       }, auth.csrfToken);
       draftCache.set(draftKey(activeId, projectId), "");
-      setDraft("");
-      setLiveSession((existing) => activeId && existing?.id === activeId
-        ? { ...existing, state: "running" }
-        : existing);
-      if (activeId === conversationId) current.reload();
-      setNotice("Generating response…");
-      composer.current?.focus();
+      draftCache.set(originalDraftKey, "");
+      if (routeConversation.current === activeId) {
+        setDraft("");
+        setLiveSession((existing) => {
+          const base = existing?.id === activeId ? existing : currentData.current;
+          if (!base || base.id !== activeId) return existing;
+          const updated = { ...base, state: "running" as const, messages: [...(base.messages ?? [])] };
+          const last = updated.messages.at(-1);
+          if (last?.role !== "user" || last.content !== prompt) {
+            updated.messages.push({
+              role: "user", content: prompt, thinking: "", status: "complete",
+              created_at: new Date().toISOString(),
+            });
+          }
+          if (updated.messages.at(-1)?.role !== "assistant") {
+            updated.messages.push({
+              role: "assistant", content: "", thinking: "", status: "streaming",
+              created_at: new Date().toISOString(),
+            });
+          }
+          return updated;
+        });
+        current.reload();
+        setNotice("Generating response…");
+        composer.current?.focus();
+      }
     } catch (cause) {
       if (activeId) draftCache.set(draftKey(activeId, projectId), prompt);
-      setDraft(prompt);
-      setNotice(cause instanceof Error ? cause.message : "The message could not be sent. Your draft is preserved.");
+      if (routeConversation.current === (activeId ?? "")) {
+        setDraft(prompt);
+        setNotice(cause instanceof Error ? cause.message : "The message could not be sent. Your draft is preserved.");
+      }
     } finally {
       setSending(false);
     }
@@ -635,8 +788,10 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
           <div><span className="eyebrow">{projectId ? "Project context · metadata only" : "General conversation"}</span>
             <h1>{session?.title || (conversationId ? "Conversation" : "New conversation")}</h1></div>
           <label className="model-picker"><span>Model</span>
-            <select value={selectedModel || session?.model || ""} onChange={(event) => setSelectedModel(event.target.value)} disabled={models.loading || availableModels.length === 0}>
+            <select value={selectedModel} onChange={(event) => setModelOverride(event.target.value)} disabled={models.loading || availableModels.length === 0}>
               {!availableModels.length && <option value="">{models.error ? "Ollama unavailable" : "No models available"}</option>}
+              {session?.model && !availableModels.some((model) => model.name === session.model)
+                && <option value={session.model}>{session.model} (unavailable)</option>}
               {availableModels.map((model) => <option value={model.name} key={model.name}>{model.name}</option>)}
             </select>
           </label>
@@ -901,6 +1056,27 @@ function dateLabel(value: number | string | null) {
   if (value === null) return "Unavailable";
   const date = typeof value === "number" ? new Date(value * 1000) : new Date(value);
   return Number.isNaN(date.getTime()) ? "Unavailable" : date.toLocaleString();
+}
+
+function activityLabel(type: ProjectActivityEvent["type"], payload: ProjectActivityEvent["payload"]) {
+  switch (type) {
+    case "project_created":
+      return `Project created · ${String(payload.project_name ?? "logical project")}`;
+    case "workspace_binding_created":
+      return `Workspace binding created · ${String(payload.name ?? "binding")}`;
+    case "workspace_binding_revoked":
+      return `Workspace binding revoked · ${String(payload.name ?? "binding")}`;
+    case "device_revoked":
+      return `Device authorization revoked · ${String(payload.device_id ?? "device")}`;
+    case "snapshot_committed":
+      return `Snapshot committed · ${String(payload.snapshot_id ?? "snapshot")}`;
+    case "snapshot_expired":
+      return `Snapshot expired · ${String(payload.snapshot_id ?? "snapshot")}`;
+    case "project_snapshot":
+      return "Project state synchronized";
+    case "resynchronization_required":
+      return "Activity gap detected · refreshing saved state";
+  }
 }
 
 function formatBytes(value: number) {

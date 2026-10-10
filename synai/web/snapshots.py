@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from synai.storage import checked_path
+from synai.web.activity import append_project_activity
 from synai.web.database import MetadataDatabase
 from synai.web.distributed import (
     DevicePrincipal,
@@ -373,6 +374,16 @@ class SnapshotStore:
                                 timestamp + self.limits.retention_seconds,
                             ),
                         )
+                        append_project_activity(
+                            connection, upload["project_id"], "snapshot_committed",
+                            {
+                                "snapshot_id": snapshot_id,
+                                "device_id": upload["device_id"],
+                                "created_at": timestamp,
+                                "total_bytes": upload["reserved_bytes"],
+                            },
+                            timestamp,
+                        )
                         connection.execute(
                             "UPDATE snapshot_uploads SET state = 'committed', snapshot_id = ? "
                             "WHERE upload_id = ? AND state = 'receiving'",
@@ -483,6 +494,13 @@ class SnapshotStore:
         with self._lock, self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                expired_snapshots = connection.execute(
+                    "SELECT snapshot_id, project_id, expires_at FROM immutable_snapshots "
+                    "WHERE state = 'available' AND expires_at <= ? AND NOT EXISTS "
+                    "(SELECT 1 FROM distributed_tasks t WHERE t.snapshot_id = immutable_snapshots.snapshot_id "
+                    "AND t.state IN ('queued', 'claimed')) ORDER BY project_id, snapshot_id",
+                    (timestamp,),
+                ).fetchall()
                 connection.execute(
                     "UPDATE snapshot_uploads SET state = 'expired' "
                     "WHERE state IN ('receiving', 'committing') AND deadline <= ?",
@@ -495,6 +513,16 @@ class SnapshotStore:
                     "AND t.state IN ('queued', 'claimed'))",
                     (timestamp,),
                 )
+                for snapshot in expired_snapshots:
+                    append_project_activity(
+                        connection, snapshot["project_id"], "snapshot_expired",
+                        {
+                            "snapshot_id": snapshot["snapshot_id"],
+                            "expired_at": timestamp,
+                            "retention_deadline": snapshot["expires_at"],
+                        },
+                        timestamp,
+                    )
                 connection.commit()
                 expired = connection.execute(
                     "SELECT upload_id FROM snapshot_uploads WHERE state = 'expired' AND deadline <= ?",
