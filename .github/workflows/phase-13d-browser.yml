@@ -1,0 +1,26 @@
+name: Phase 13D browser acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build isolated browser acceptance image
+        run: docker build -f web/e2e/Playwright.Dockerfile -t synai-phase13d-e2e:local .
+      - name: Run real-stack browser acceptance offline
+        run: |
+          docker run --rm \
+            --network none \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            --pids-limit 256 \
+            --memory 3g \
+            --cpus 2 \
+            synai-phase13d-e2e:local

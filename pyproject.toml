@@ -11,7 +11,7 @@ dependencies = [
     "textual>=1.0,<9",
     "httpx>=0.27,<1",
     "fastapi>=0.115,<1",
-    "uvicorn>=0.34,<1",
+    "uvicorn[standard]>=0.34,<1",
     "argon2-cffi>=23.1,<26",
     "cryptography>=44,<47",
 ]

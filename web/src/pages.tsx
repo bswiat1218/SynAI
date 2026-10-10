@@ -507,7 +507,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
     conversationId ? `/api/v1/chat/sessions/${conversationId}` : null,
   );
   const [liveSession, setLiveSession] = useState<ChatConversationResponse | null>(null);
-  const [modelOverride, setModelOverride] = useState<string | null>(null);
+  const [modelOverride, setModelOverride] = useState<{ scope: number; model: string } | null>(null);
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [eventStatus, setEventStatus] = useState<"connecting" | "connected" | "reconnecting" | "offline">("offline");
@@ -518,23 +518,33 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
   const cursor = useRef(0);
   const currentData = useRef(current.data);
   const routeConversation = useRef(conversationId ?? "");
+  const routeKey = `${projectId ?? ""}:${conversationId ?? ""}`;
+  const modelScope = useRef({ routeKey, generation: 0 });
+  if (modelScope.current.routeKey !== routeKey) {
+    modelScope.current = {
+      routeKey,
+      generation: modelScope.current.generation + 1,
+    };
+  }
+  const currentModelScope = modelScope.current.generation;
   routeConversation.current = conversationId ?? "";
   useEffect(() => {
     currentData.current = current.data;
   }, [current.data]);
   const session = liveSession?.id === conversationId ? liveSession : current.data;
   const messages = session?.messages ?? [];
-  const selectedModel = modelOverride ?? (
+  const selectedModel = (modelOverride?.scope === currentModelScope ? modelOverride.model : null) ?? (
     (conversationId && current.data?.id === conversationId && current.data.model)
       ? current.data.model
       : models.data?.models[0]?.name ?? ""
   );
-  const running = session?.state === "running" || sending;
+  const selectedModelRef = useRef(selectedModel);
+  selectedModelRef.current = selectedModel;
+  const running = (Boolean(conversationId) && session?.state === "running") || sending;
 
   useEffect(() => {
     setDraft(draftCache.get(draftKey(conversationId, projectId)) ?? "");
     setLiveSession(null);
-    setModelOverride(null);
     setNotice(null);
   }, [conversationId, projectId]);
 
@@ -613,6 +623,13 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
           refresh();
         } else if (event.type === "content_delta" || event.type === "thinking_delta") {
           const text = typeof event.payload.text === "string" ? event.payload.text : "";
+          const currentConversation = liveSession?.id === conversationId
+            ? liveSession
+            : currentData.current;
+          if (!currentConversation || currentConversation.id !== conversationId) {
+            refresh();
+            return;
+          }
           setLiveSession((existing) => {
             const base = existing?.id === conversationId ? existing : currentData.current;
             if (!base) return base;
@@ -684,8 +701,17 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
       : `/chat${id ? `/${id}` : ""}`;
 
   const send = async () => {
-    if (!draft.trim() || running || !auth.csrfToken) return;
-    if (!selectedModel) {
+    if (!draft.trim()) return;
+    if (running) {
+      setNotice("A response is already running. Stop it before sending another message.");
+      return;
+    }
+    if (!auth.csrfToken) {
+      setNotice("Your browser session expired. Sign in again to continue.");
+      return;
+    }
+    const model = selectedModelRef.current;
+    if (!model) {
       setNotice(models.error ? "Ollama is unavailable. Your draft is preserved." : "Select an available chat model first.");
       return;
     }
@@ -698,7 +724,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
       if (!activeId) {
         const created = await apiRequest<ChatConversationResponse>("/api/v1/chat/sessions", {
           method: "POST",
-          body: JSON.stringify({ model: selectedModel, project_id: projectId ?? null }),
+          body: JSON.stringify({ model, project_id: projectId ?? null }),
         }, auth.csrfToken);
         activeId = created.id;
         draftCache.set(draftKey(activeId, projectId), prompt);
@@ -707,7 +733,7 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
       }
       await apiRequest(`/api/v1/chat/sessions/${activeId}/turns`, {
         method: "POST",
-        body: JSON.stringify({ prompt, model: selectedModel }),
+        body: JSON.stringify({ prompt, model }),
       }, auth.csrfToken);
       draftCache.set(draftKey(activeId, projectId), "");
       draftCache.set(originalDraftKey, "");
@@ -749,9 +775,9 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
 
   const stop = async () => {
     if (!conversationId || !auth.csrfToken) return;
+    setNotice("Stopping generation…");
     try {
       await apiRequest(`/api/v1/chat/sessions/${conversationId}/cancel`, { method: "POST" }, auth.csrfToken);
-      setNotice("Stopping generation…");
     } catch (cause) {
       setNotice(cause instanceof Error ? cause.message : "Generation could not be stopped.");
     }
@@ -770,7 +796,17 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
     <section className={`chat-layout${embedded ? " chat-layout-embedded" : ""}`} aria-label="Browser chat">
       <aside className="chat-sidebar">
         <div className="chat-sidebar-heading"><span className="eyebrow">{projectId ? "Project conversations" : "Your conversations"}</span>
-          <Button variant="secondary" onClick={() => navigate(routeFor())}><Plus size={16} />New chat</Button>
+          <Button
+            variant="secondary"
+            onClick={() => {
+              modelScope.current = {
+                routeKey,
+                generation: modelScope.current.generation + 1,
+              };
+              setModelOverride(null);
+              navigate(routeFor());
+            }}
+          ><Plus size={16} />New chat</Button>
         </div>
         <ResourceMessage loading={history.loading} error={history.error} stale={history.stale} />
         <nav className="conversation-list" aria-label="Conversation history">
@@ -788,7 +824,15 @@ export function ChatPage({ embedded = false }: { embedded?: boolean }) {
           <div><span className="eyebrow">{projectId ? "Project context · metadata only" : "General conversation"}</span>
             <h1>{session?.title || (conversationId ? "Conversation" : "New conversation")}</h1></div>
           <label className="model-picker"><span>Model</span>
-            <select value={selectedModel} onChange={(event) => setModelOverride(event.target.value)} disabled={models.loading || availableModels.length === 0}>
+            <select
+              value={selectedModel}
+              onChange={(event) => {
+                const model = event.target.value;
+                selectedModelRef.current = model;
+                setModelOverride({ scope: currentModelScope, model });
+              }}
+              disabled={models.loading || availableModels.length === 0}
+            >
               {!availableModels.length && <option value="">{models.error ? "Ollama unavailable" : "No models available"}</option>}
               {session?.model && !availableModels.some((model) => model.name === session.model)
                 && <option value={session.model}>{session.model} (unavailable)</option>}

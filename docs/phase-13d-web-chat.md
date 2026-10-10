@@ -67,25 +67,109 @@ no source-file access.
 
 ## Development and browser acceptance checks
 
-Start the API with `synai-web` using an isolated `SYNAI_DATA_ROOT` equivalent
-through an injected `WebConfig` in tests; never point integration tests at a
-live TUI data root. For the frontend, run `cd web && npm install` followed by
-`npm run dev`. Run component checks, static typing, and a production build with
-`npm test`, `npm run typecheck`, and `npm run build`.
+Install locked frontend dependencies with `cd web && npm ci`. The UI-only
+Playwright suite (`npm run test:e2e`) mocks HTTP and WebSocket behavior. It is
+kept separate from `npm run test:e2e:integration`, which starts the real FastAPI
+application, Vite frontend, cookie/CSRF authentication, SQLite metadata, a
+disposable data root, and a deterministic provider implementing the existing
+`ModelProvider` protocol. The integration provider never contacts Ollama. It
+also supports deterministic cancellation, provider outage, and hostile native
+tool-call scenarios.
 
-The Playwright acceptance suite is started with `cd web && npm run test:e2e`.
-It uses an isolated Vite server and intercepts API and WebSocket traffic with
-deterministic test fixtures; it does not call Ollama or require an application
-database. Install a supported Playwright browser separately when permitted by
-the host operator (`npx playwright install chromium`). If the browser runtime is
-not present or its installation is not approved, report the browser suite as
-unexecuted rather than passing. Backend persistence, authorization, and provider
-behavior remain covered by the Python test suite using disposable data roots
-and injected mock providers.
+For reproducible Chromium acceptance, the repository pins the official
+Playwright `1.64.0` browser image and its digest. The Docker build copies the
+checkout into the test image; the browser container receives no runtime host
+workspace mounts. Run both suites with:
 
-The browser application supports keyboard focus indicators, semantic page and
-navigation landmarks, live response status, Radix-managed mobile navigation,
-responsive desktop/tablet/mobile layouts, and reduced-motion preferences.
-Manual acceptance should additionally cover keyboard-only operation, browser
-zoom, narrow layouts, and assistive-technology behavior; automated component
-and browser tests do not constitute a complete WCAG audit.
+```sh
+docker build -f web/e2e/Playwright.Dockerfile -t synai-phase13d-e2e:local .
+docker run --rm \
+  --network none \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --pids-limit 256 \
+  --memory 3g \
+  --cpus 2 \
+  synai-phase13d-e2e:local \
+  bash -lc 'npm run test:e2e && npm run test:e2e:integration'
+```
+
+The container runs as the unprivileged `pwuser`; it has no host workspace
+volume, Docker/Podman socket, elevated capabilities, production credential, or
+external network. API and Vite bind only to loopback inside that isolated
+container. The integration API uses a temporary data root and is restarted by
+its test supervisor to verify persistence and WebSocket reconnection. Test
+logs record provider model/tool-schema counts, not prompts. Screenshots, video,
+trace recording, and CI artifact uploads are disabled. The opt-in CI workflow
+`.github/workflows/phase-13d-browser.yml` runs this isolated test image on
+manual dispatch.
+
+Project activity events are transactionally persisted and the WebSocket reads
+the SQLite event log by cursor, so delivery is not dependent on an in-process
+notification queue. Subscriber accounting is local to each service instance.
+The web service's exclusive data-root ownership lock permits only one API
+process to own a data root; multi-worker/multi-process deployment is therefore
+not supported. Do not bypass the ownership lock to scale workers.
+
+The browser suite checks WCAG 2.1 A/AA rules with axe-core at desktop, tablet,
+and mobile sizes, including contrast checks, keyboard focus, responsive
+navigation, reduced motion, long code blocks, live status, and keyboard
+inspector resizing. These automated checks do not constitute complete
+assistive-technology validation. Manual screen-reader testing remains a
+separate acceptance item.
+
+The optional Ollama smoke test is skipped by default and never runs in the
+browser container:
+
+```sh
+SYNAI_RUN_OLLAMA_SMOKE=1 \
+SYNAI_OLLAMA_SMOKE_URL=http://127.0.0.1:11434 \
+SYNAI_OLLAMA_SMOKE_MODEL=your-installed-model \
+PYTHONPATH=tests ./.venv/bin/python -m unittest tests.test_web_ollama_smoke
+```
+
+Only enable it deliberately against a safe configured endpoint. It sends the
+non-sensitive prompt “Reply with the single word OK.”, performs model
+discovery and streaming, and verifies persisted conversation state after an
+application restart. It does not download models or change Ollama settings.
+
+## Phase 13D final acceptance results
+
+Acceptance was run with Playwright `1.64.0` and Chromium build `1248`
+(`156.0.8078.4`) from the digest-pinned
+`mcr.microsoft.com/playwright:v1.64.0-noble` image. The isolated browser run
+used `--network none`, dropped Linux capabilities, no-new-privileges, bounded
+CPU/memory/PIDs, no host mounts or sockets, and no production credentials.
+Chromium is provided by the pinned image; the test-only image adds Python
+virtual-environment support and locked project dependencies.
+
+Verified:
+
+- Existing UI-mock Playwright suite: **3 passed, 0 failed**.
+- Real FastAPI/React integration suite with disposable SQLite/data root and
+  deterministic provider: **3 passed, 0 failed**. This includes cookie and
+  CSRF authentication, model selection across conversations, streamed content
+  and reasoning, saved-history reopen, cancellation, provider outage, tool-call
+  rejection with zero tool schemas, hostile-HTML rendering, WebSocket
+  reconnect/gap recovery, project activity, session revocation/logout, and API
+  restart persistence.
+- Project activity verification: cursor ordering, retained-history gap
+  resynchronization, snapshot refresh, project authorization, server restart
+  reconnection, and UI refresh from authoritative state passed. Focused Python
+  tests cover Origin rejection and event/session limits.
+- Axe WCAG 2.1 A/AA scans: **0 violations** at desktop, tablet, and mobile
+  layouts. Browser assertions also covered visible keyboard focus, dialog
+  focus trapping/restoration, inspector keyboard resizing, reduced motion,
+  200% text scaling, and horizontally scrollable long code blocks.
+- Frontend TypeScript typecheck and production build passed; component tests:
+  **9 passed**. Playwright TypeScript sources typechecked.
+- OpenAPI consistency test passed. Python source compilation and
+  `git diff --check` passed.
+- Full Python unittest suite: **611 tests ran, 590 passed, 21 skipped, 0
+  failed**.
+
+Not performed: manual screen-reader/assistive-technology validation, the
+opt-in live Ollama smoke test, and the manually dispatched GitHub Actions
+workflow. Real Ollama endpoint connectivity and behavior therefore remain
+unverified. Activity delivery is verified only for the documented single API
+process per data root; multi-worker deployment remains unsupported.

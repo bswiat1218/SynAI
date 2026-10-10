@@ -7,7 +7,10 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     proxy: {
-      "/api": process.env.SYNAI_API_TARGET ?? "http://127.0.0.1:8765",
+      "/api": {
+        target: process.env.SYNAI_API_TARGET ?? "http://127.0.0.1:8765",
+        ws: true,
+      },
     },
   },
   test: {

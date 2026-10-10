@@ -1,4 +1,4 @@
-import { chromium, expect, test } from "@playwright/test";
+import { chromium, expect, test, type WebSocketRoute } from "@playwright/test";
 import { existsSync } from "node:fs";
 
 const projectId = "a".repeat(32);
@@ -11,44 +11,17 @@ test.skip(!existsSync(chromium.executablePath()), "Playwright Chromium is not in
 test("browser command center, chat, project status, and protected navigation", async ({ page }) => {
   let authenticated = false;
   let conversation: Record<string, unknown> | null = null;
-
-  await page.addInitScript(() => {
-    type Socket = {
-      url: string;
-      onopen: (() => void) | null;
-      onmessage: ((event: { data: string }) => void) | null;
-      onclose: ((event: { code: number }) => void) | null;
-      close: () => void;
-    };
-    const sockets: Socket[] = [];
-    class MockWebSocket {
-      static OPEN = 1;
-      readyState = 0;
-      onopen: (() => void) | null = null;
-      onmessage: ((event: { data: string }) => void) | null = null;
-      onclose: ((event: { code: number }) => void) | null = null;
-      constructor(readonly url: string) {
-        sockets.push(this);
-        setTimeout(() => {
-          this.readyState = 1;
-          this.onopen?.();
-          const match = this.url.match(/\/chat\/([a-f0-9]{32})/);
-          if (match) this.onmessage?.({ data: JSON.stringify({
-            schema_version: 1, event_id: 0, conversation_id: match[1],
-            type: "session_snapshot", payload: {},
-          }) });
-        }, 0);
-      }
-      close() { this.readyState = 3; }
-    }
-    Object.assign(window, {
-      WebSocket: MockWebSocket,
-      __emitChatEvent: (id: string, event: Record<string, unknown>) => {
-        sockets.filter((socket) => socket.url.includes(`/chat/${id}`))
-          .forEach((socket) => socket.onmessage?.({ data: JSON.stringify(event) }));
-      },
-      __disconnectChat: () => sockets.forEach((socket) => socket.onclose?.({ code: 1006 })),
-    });
+  let chatSocket: WebSocketRoute | undefined;
+  let resolveChatSocket!: (socket: WebSocketRoute) => void;
+  const chatSocketReady = new Promise<WebSocketRoute>((resolve) => { resolveChatSocket = resolve; });
+  await page.routeWebSocket("**/api/v1/events/v1/chat/**", (socket) => {
+    chatSocket = socket;
+    resolveChatSocket(socket);
+    socket.send(JSON.stringify({
+      schema_version: 1, event_id: 0, conversation_id: conversationId,
+      type: "session_snapshot", payload: {},
+    }));
+    socket.onMessage(() => {});
   });
 
   await page.route("**/api/v1/**", async (route) => {
@@ -59,7 +32,12 @@ test("browser command center, chat, project status, and protected navigation", a
       status, contentType: "application/json", body: JSON.stringify(body),
     });
     if (path.endsWith("/auth/session")) {
-      return json({ authenticated }, authenticated ? 200 : 401);
+      return json(
+        authenticated
+          ? { authenticated: true }
+          : { error: { code: "unauthenticated", message: "Sign in required.", request_id: "e2e" } },
+        authenticated ? 200 : 401,
+      );
     }
     if (path.endsWith("/auth/login") && request.method() === "POST") {
       authenticated = true;
@@ -84,38 +62,14 @@ test("browser command center, chat, project status, and protected navigation", a
         ...(conversation ?? {}), title: body.prompt, model: body.model, state: "running",
         messages: [{ role: "user", content: body.prompt, thinking: "", status: "complete", created_at: now }],
       };
-      const event = (eventId: number, type: string, payload: Record<string, unknown> = {}) => ({
-        schema_version: 1, event_id: eventId, conversation_id: conversationId, type, payload,
-      });
-      setTimeout(() => {
-        void page.evaluate(({ id, started, delta }) => {
-          const target = window as typeof window & {
-            __emitChatEvent: (key: string, value: Record<string, unknown>) => void;
-          };
-          target.__emitChatEvent(id, started);
-          target.__emitChatEvent(id, delta);
-        }, {
-          id: conversationId,
-          started: event(1, "turn_started"),
-          delta: event(2, "content_delta", { text: "A streamed answer." }),
-        });
-      }, 40);
       return json({ conversation_id: conversationId, model: body.model, state: "running" }, 202);
     }
     if (path === `/api/v1/chat/sessions/${conversationId}/cancel`) {
       conversation = { ...(conversation ?? {}), state: "cancelled" };
-      await page.evaluate(({ id, event }) => {
-        const target = window as typeof window & {
-          __emitChatEvent: (key: string, value: Record<string, unknown>) => void;
-        };
-        target.__emitChatEvent(id, event);
-      }, {
-        id: conversationId,
-        event: {
+      chatSocket?.send(JSON.stringify({
           schema_version: 1, event_id: 3, conversation_id: conversationId,
           type: "turn_cancelled", payload: {},
-        },
-      });
+      }));
       return json({ conversation_id: conversationId, state: "cancelled", cancelled: true });
     }
     if (path === `/api/v1/chat/sessions/${conversationId}`) {
@@ -157,15 +111,28 @@ test("browser command center, chat, project status, and protected navigation", a
 
   await page.getByRole("link", { name: "Chat", exact: true }).click();
   await page.getByLabel("Model").selectOption("test-model");
-  await page.getByLabel("Message").fill("hello");
+  await page.getByRole("textbox", { name: "Message" }).fill("hello");
   await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByRole("button", { name: "Stop generation" })).toBeVisible();
+  chatSocket = await chatSocketReady;
+  await expect(
+    page.getByRole("status").filter({ hasText: "Response is streaming." }),
+  ).toBeVisible();
+  chatSocket.send(JSON.stringify({
+    schema_version: 1, event_id: 1, conversation_id: conversationId, type: "turn_started", payload: {},
+  }));
+  chatSocket.send(JSON.stringify({
+    schema_version: 1, event_id: 2, conversation_id: conversationId,
+    type: "content_delta", payload: { text: "A streamed answer." },
+  }));
   await expect(page.getByText("A streamed answer.")).toBeVisible();
   await page.getByRole("button", { name: "Stop generation" }).click();
   await expect(page.getByText("Generation stopped. Partial response was saved.")).toBeVisible();
 
   await page.getByRole("link", { name: "Projects", exact: true }).click();
-  await page.getByRole("button", { name: "Open Acceptance project Workbench" }).click();
-  await expect(page.getByRole("heading", { name: "Activity" })).toBeVisible();
+  await page.getByRole("link", { name: "Open Acceptance project Workbench" }).click();
+  await page.getByRole("button", { name: "Activity" }).click();
+  await expect(page.getByRole("heading", { name: "Activity", exact: true })).toBeVisible();
   await page.getByRole("link", { name: "Devices", exact: true }).click();
   await expect(page.getByText("No registered devices")).toBeVisible();
   await page.getByRole("link", { name: "Sandboxes", exact: true }).click();
@@ -178,7 +145,8 @@ test("browser command center, chat, project status, and protected navigation", a
 
 test("invalid navigation remains inside the authenticated application", async ({ page }) => {
   await page.route("**/api/v1/auth/session", (route) => route.fulfill({
-    status: 401, contentType: "application/json", body: JSON.stringify({ detail: "Unauthorized" }),
+    status: 401, contentType: "application/json",
+    body: JSON.stringify({ error: { code: "unauthenticated", message: "Sign in required.", request_id: "e2e" } }),
   }));
   await page.goto("/not-a-real-page");
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
@@ -191,10 +159,17 @@ test("login errors are visible and Ollama failure leaves navigation available", 
     const json = (body: unknown, status = 200) => route.fulfill({
       status, contentType: "application/json", body: JSON.stringify(body),
     });
-    if (path.endsWith("/auth/session")) return json({ authenticated }, authenticated ? 200 : 401);
+    if (path.endsWith("/auth/session")) {
+      return json(
+        authenticated
+          ? { authenticated: true }
+          : { error: { code: "unauthenticated", message: "Sign in required.", request_id: "e2e" } },
+        authenticated ? 200 : 401,
+      );
+    }
     if (path.endsWith("/auth/login")) {
       if (route.request().postDataJSON()?.password !== "correct password") {
-        return json({ error: { code: "authentication_failed", message: "Sign in failed." } }, 401);
+        return json({ error: { code: "authentication_failed", message: "Sign in failed.", request_id: "e2e" } }, 401);
       }
       authenticated = true;
       return json({ authenticated: true, csrf_token: "test-csrf", expires_at: now });
@@ -218,6 +193,6 @@ test("login errors are visible and Ollama failure leaves navigation available", 
   await expect(page.getByRole("heading", { name: "Project Command Center" })).toBeVisible();
   await expect(page.getByText("Ollama unavailable")).toBeVisible();
   await page.getByRole("link", { name: "Projects", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Projects" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
 });
 });

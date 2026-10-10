@@ -61,7 +61,10 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
           {copied ? "Copied" : "Copy"}
         </button>
       </div>
-      <pre><code>{code}</code></pre>
+      <pre
+        tabIndex={0}
+        aria-label={language ? `${language} code block` : "Code block"}
+      ><code>{code}</code></pre>
       {error && <span role="status" className="copy-error">Clipboard access is unavailable.</span>}
     </div>
   );

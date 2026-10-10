@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b --pretty false",
     "test": "vitest run",
-    "test:e2e": "playwright test",
+    "test:e2e": "playwright test --config playwright.config.ts",
+    "test:e2e:integration": "playwright test --config playwright.integration.config.ts",
     "test:watch": "vitest",
     "api:types": "cd .. && ./.venv/bin/python -m synai.web.openapi > web/openapi.json && cd web && openapi-typescript openapi.json -o src/api/schema.d.ts"
   },
@@ -25,6 +26,7 @@
     "tailwind-merge": "^3.3.1"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.64.0",
     "@tailwindcss/vite": "^4.1.11",
     "@testing-library/jest-dom": "^6.8.0",

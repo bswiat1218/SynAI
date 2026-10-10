@@ -6,12 +6,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from synai.models import ChatEvent, Message, ModelInfo
 from synai.providers.errors import ProviderError
 from synai.web.app import create_app
+from synai.web.activity import ProjectActivityStore, append_project_activity
 from synai.web.config import WebConfig
 
 
@@ -362,6 +364,57 @@ class WebChatApiTests(unittest.TestCase):
                 headers={"Origin": ORIGIN},
             ):
                 pass
+
+    def test_project_activity_limits_gaps_and_live_session_revocation(self) -> None:
+        project = self.client.post(
+            "/api/v1/logical-projects",
+            json={"name": "Activity limits", "registration_key": "activity-limits-key-123456"},
+            headers=self.headers(),
+        ).json()
+        project_id = project["id"]
+        store = self.app.state.services.activity
+        self.assertIsInstance(store, ProjectActivityStore)
+
+        acquired = [store.acquire(project_id) for _ in range(store.MAX_SUBSCRIBERS_PER_PROJECT)]
+        self.assertTrue(all(acquired))
+        self.assertFalse(store.acquire(project_id))
+        for _ in acquired:
+            store.release(project_id)
+
+        with self.app.state.services.database.connect() as connection:
+            with self.assertRaises(ValueError):
+                append_project_activity(
+                    connection, project_id, "project_created",
+                    {"name": "x" * store.MAX_EVENT_BYTES},
+                    int(time.time()),
+                )
+
+        with patch.object(ProjectActivityStore, "MAX_RETAINED_EVENTS", 2):
+            with self.app.state.services.database.connect() as connection:
+                for sequence in range(3):
+                    append_project_activity(
+                        connection, project_id, "workspace_binding_created",
+                        {"binding_id": str(sequence)}, int(time.time()),
+                    )
+            events, cursor, gap = store.read_after(project_id, 0)
+            self.assertEqual(events, [])
+            self.assertTrue(gap)
+            self.assertEqual(cursor, 4)
+            retained, retained_cursor, retained_gap = store.read_after(project_id, 2)
+            self.assertFalse(retained_gap)
+            self.assertEqual(retained_cursor, 4)
+            self.assertEqual([event["event_id"] for event in retained], [3, 4])
+
+        with self.client.websocket_connect(
+            f"/api/v1/events/v1/projects/{project_id}?after=0",
+            headers={"Origin": ORIGIN},
+        ) as websocket:
+            self.assertEqual(websocket.receive_json()["type"], "resynchronization_required")
+            self.assertEqual(websocket.receive_json()["type"], "project_snapshot")
+            logout = self.client.post("/api/v1/auth/logout", headers=self.headers())
+            self.assertEqual(logout.status_code, 200, logout.text)
+            with self.assertRaises(Exception):
+                websocket.receive_json(timeout=3)
 
 
 if __name__ == "__main__":
