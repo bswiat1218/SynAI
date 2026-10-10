@@ -428,7 +428,12 @@
             "type": "boolean"
           },
           "connection_state": {
-            "const": "not_supported",
+            "enum": [
+              "connected",
+              "disconnected",
+              "recently_active",
+              "revoked"
+            ],
             "title": "Connection State",
             "type": "string"
           },
@@ -1047,6 +1052,8 @@
               "workspace_binding_created",
               "workspace_binding_revoked",
               "device_revoked",
+              "device_connected",
+              "device_disconnected",
               "snapshot_committed",
               "snapshot_expired"
             ],
@@ -1267,6 +1274,51 @@
           "snapshots"
         ],
         "title": "SnapshotListResponse",
+        "type": "object"
+      },
+      "SnapshotRequestResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "binding_id": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[a-f0-9]{32}$",
+            "title": "Binding Id",
+            "type": "string"
+          },
+          "expires_at": {
+            "minimum": 0.0,
+            "title": "Expires At",
+            "type": "integer"
+          },
+          "operation_id": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[a-f0-9]{32}$",
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "project_id": {
+            "maxLength": 32,
+            "minLength": 32,
+            "pattern": "^[a-f0-9]{32}$",
+            "title": "Project Id",
+            "type": "string"
+          },
+          "state": {
+            "const": "sent_to_client",
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id",
+          "project_id",
+          "binding_id",
+          "state",
+          "expires_at"
+        ],
+        "title": "SnapshotRequestResponse",
         "type": "object"
       },
       "SnapshotResponse": {
@@ -2971,6 +3023,111 @@
         "summary": "Accept Snapshot Chunk"
       }
     },
+    "/api/v1/device/{device_id}/workspace-bindings/{binding_id}": {
+      "get": {
+        "operationId": "inspect_device_binding_api_v1_device__device_id__workspace_bindings__binding_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "device_id",
+            "required": true,
+            "schema": {
+              "title": "Device Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceBindingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "DeviceCredential": []
+          },
+          {
+            "DeviceID": []
+          },
+          {
+            "DeviceTimestamp": []
+          },
+          {
+            "DeviceNonce": []
+          },
+          {
+            "DeviceSignature": []
+          }
+        ],
+        "summary": "Inspect Device Binding"
+      }
+    },
     "/api/v1/devices": {
       "get": {
         "operationId": "list_devices_api_v1_devices_get",
@@ -3625,6 +3782,92 @@
           }
         ],
         "summary": "Revoke Binding"
+      }
+    },
+    "/api/v1/logical-projects/{project_id}/bindings/{binding_id}/snapshot-requests": {
+      "post": {
+        "operationId": "request_client_snapshot_api_v1_logical_projects__project_id__bindings__binding_id__snapshot_requests_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "binding_id",
+            "required": true,
+            "schema": {
+              "title": "Binding Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SnapshotRequestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "SessionCookie": []
+          },
+          {
+            "CsrfToken": []
+          }
+        ],
+        "summary": "Request Client Snapshot"
       }
     },
     "/api/v1/logical-projects/{project_id}/memory-association-previews": {

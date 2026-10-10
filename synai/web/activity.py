@@ -18,6 +18,8 @@ ProjectActivityType = Literal[
     "workspace_binding_created",
     "workspace_binding_revoked",
     "device_revoked",
+    "device_connected",
+    "device_disconnected",
     "snapshot_committed",
     "snapshot_expired",
 ]

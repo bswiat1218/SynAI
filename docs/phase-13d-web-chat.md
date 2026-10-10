@@ -43,11 +43,14 @@ Chat, Projects, a logical-project Workbench, Agent Task metadata, Devices,
 Sandboxes, and Settings. It uses server API data and describes absent providers,
 devices, and execution infrastructure as unavailable rather than simulating
 them. Browser drafts are held in memory only and are preserved while navigating
-between conversations.
+between conversations. At Phase 13D completion, device activity was metadata
+only; Phase 13E adds a real Linux Client Agent and authenticated live presence,
+documented in [Phase 13E](phase-13e-client-agent.md).
 
 The Workbench exposes project, snapshot, activity, and memory-status panels.
 Project references are metadata only; they do not expose source workspaces.
-Registered device activity is not represented as a live connection. The
+At Phase 13D completion, registered device activity was not represented as a
+live connection. Phase 13E adds actual Client Agent connection state. The
 Sandbox Broker and task execution remain unavailable.
 
 ## Limits and boundary
@@ -60,10 +63,12 @@ drafts are not stored in browser local storage.
 
 Project activity covers persisted metadata and snapshot transitions only; it
 does not imply task execution, Client Agent connectivity, approvals, or sandbox
-activity. Agent Task execution, Client Agent transport, Sandbox Broker
-execution, verification/review/diff panels, and client-side patch application
-remain future work. A project reference in chat is metadata only and provides
-no source-file access.
+activity. At Phase 13D completion, Agent Task execution, Client Agent
+transport, Sandbox Broker execution, verification/review/diff panels, and
+client-side patch application remained future work. Phase 13E implements only
+the Client Agent transport and consented source snapshots; task execution,
+Broker execution, verification, and patch application remain disabled. A
+project reference in chat is metadata only and provides no source-file access.
 
 ## Development and browser acceptance checks
 

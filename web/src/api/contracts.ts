@@ -22,6 +22,7 @@ export type DeviceMetadataResponse = components["schemas"]["DeviceMetadataRespon
 export type DeviceListResponse = components["schemas"]["DeviceListResponse"];
 export type ExecutionTargetStatusResponse = components["schemas"]["ExecutionTargetStatusResponse"];
 export type PairingChallengeResponse = components["schemas"]["PairingChallengeResponse"];
+export type SnapshotRequestResponse = components["schemas"]["SnapshotRequestResponse"];
 export type DeviceEnrollmentRequest = components["schemas"]["DeviceEnrollmentRequest"];
 export type WorkspaceBindingResponse = components["schemas"]["WorkspaceBindingResponse"];
 export type WorkspaceBindingListResponse = components["schemas"]["WorkspaceBindingListResponse"];

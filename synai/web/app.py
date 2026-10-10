@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import sqlite3
@@ -34,7 +35,10 @@ from synai.web.distributed import (
     DistributedRegistry,
     Enrollment,
     SUPPORTED_PROTOCOL_VERSIONS,
+    canonical_json,
+    device_request_message,
 )
+from synai.web.connections import ActiveDeviceConnection, DeviceConnectionManager
 from synai.web.ownership import DataRootOwnership
 from synai.web.projects import (
     ProjectRegistry,
@@ -85,6 +89,7 @@ from synai.web.schemas import (
     WorkspaceBindingCreateRequest,
     WorkspaceBindingListResponse,
     WorkspaceBindingResponse,
+    SnapshotRequestResponse,
 )
 from synai.web.snapshots import SnapshotStore
 
@@ -124,6 +129,7 @@ class WebServices:
     snapshots: SnapshotStore | None = None
     chat: WebChatService | None = None
     activity: ProjectActivityStore | None = None
+    device_connections: DeviceConnectionManager | None = None
     snapshot_cleanup_task: asyncio.Task[None] | None = None
     ready: bool = False
 
@@ -139,6 +145,7 @@ class WebServices:
             self.projects = ProjectRegistry(self.database, self.config)
             self.distributed = DistributedRegistry(self.database)
             self.activity = ProjectActivityStore(self.database)
+            self.device_connections = DeviceConnectionManager(self.database)
             self.snapshots = SnapshotStore(self.database, self.distributed)
             self.snapshots.initialize()
             self.chat = WebChatService(
@@ -154,6 +161,8 @@ class WebServices:
 
     async def close(self) -> None:
         self.ready = False
+        if self.device_connections is not None:
+            await self.device_connections.close_all()
         if self.chat is not None:
             await self.chat.close()
         if self.snapshot_cleanup_task is not None:
@@ -757,6 +766,148 @@ def create_app(
         finally:
             current.activity.release(project_id)
 
+    @router.websocket("/api/v1/client/v1/connect")
+    async def device_connection_stream(websocket: WebSocket) -> None:
+        current: WebServices = websocket.app.state.services
+        if (
+            not current.ready
+            or current.distributed is None
+            or current.device_connections is None
+        ):
+            await websocket.close(code=1013)
+            return
+        await websocket.accept()
+        connection: ActiveDeviceConnection | None = None
+        credential: str | None = None
+        device_id: str | None = None
+        expected_sequence = 0
+        try:
+            raw = await asyncio.wait_for(websocket.receive_text(), timeout=10)
+            frame = _decode_device_frame(raw, expected_sequence=0)
+            if frame["type"] != "hello":
+                await websocket.close(code=4400, reason="First message must be hello")
+                return
+            payload = frame["payload"]
+            if set(payload) != {"credential", "protocol_versions", "capabilities", "agent_version"}:
+                await websocket.close(code=4400, reason="Invalid hello payload")
+                return
+            versions = payload["protocol_versions"]
+            if (
+                not isinstance(versions, list)
+                or any(type(version) is not int for version in versions)
+                or not set(versions).intersection(SUPPORTED_PROTOCOL_VERSIONS)
+            ):
+                await websocket.close(code=4406, reason="No compatible protocol version")
+                return
+            device_id = str(frame["device_id"])
+            unsigned = {key: frame[key] for key in (
+                "schema_version", "type", "device_id", "timestamp", "nonce", "sequence", "payload",
+            )}
+            body = canonical_json(unsigned)
+            principal = current.distributed.authenticate_device(
+                payload["credential"] if isinstance(payload["credential"], str) else None,
+                device_id,
+                str(frame["timestamp"]),
+                str(frame["nonce"]),
+                str(frame["signature"]),
+                "GET",
+                "/api/v1/client/v1/connect",
+                body,
+            )
+            if (
+                principal.protocol_version not in versions
+                or payload["capabilities"] != principal.capabilities
+                or payload["agent_version"] != principal.capabilities.get("agent_version")
+            ):
+                await websocket.close(code=4403, reason="Device identity or capabilities mismatch")
+                return
+            credential = payload["credential"]
+            connection = await current.device_connections.register(device_id, websocket)
+            await websocket.send_json({
+                "schema_version": 1,
+                "type": "hello_ack",
+                "device_id": device_id,
+                "sequence": 0,
+                "payload": {
+                    "protocol_version": principal.protocol_version,
+                    "server_identity": _normalized_origin(selected_config.public_origin),
+                    "server_time": int(time.time()),
+                    "heartbeat_seconds": 15,
+                    "capabilities": ["heartbeat-v1", "device-status-v1", "snapshot-v1"],
+                },
+            })
+            expected_sequence = 1
+            while True:
+                try:
+                    raw = await asyncio.wait_for(
+                        websocket.receive_text(),
+                        timeout=DeviceConnectionManager.HEARTBEAT_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    await websocket.close(code=4408, reason="Device heartbeat expired")
+                    return
+                frame = _decode_device_frame(raw, expected_sequence=expected_sequence)
+                message_type = str(frame["type"])
+                if frame["device_id"] != device_id or message_type not in {
+                    "heartbeat", "status", "disconnect", "snapshot_progress",
+                    "snapshot_completed", "snapshot_failed",
+                }:
+                    await websocket.close(code=4400, reason="Unsupported client operation")
+                    return
+                unsigned = {key: frame[key] for key in (
+                    "schema_version", "type", "device_id", "timestamp", "nonce", "sequence", "payload",
+                )}
+                current.distributed.authenticate_device(
+                    credential,
+                    device_id,
+                    str(frame["timestamp"]),
+                    str(frame["nonce"]),
+                    str(frame["signature"]),
+                    "GET",
+                    "/api/v1/client/v1/connect",
+                    canonical_json(unsigned),
+                )
+                if message_type in {"heartbeat", "status", "disconnect"}:
+                    if frame["payload"] != {}:
+                        await websocket.close(code=4400, reason="Unsupported client operation")
+                        return
+                    ack_type = "disconnect_ack" if message_type == "disconnect" else "heartbeat_ack"
+                    response_payload: dict[str, object] = {"server_time": int(time.time())}
+                else:
+                    if connection is None or not current.device_connections.validate_operation_message(
+                        connection, frame["payload"], message_type,
+                    ):
+                        await websocket.close(code=4403, reason="Snapshot operation identity mismatch")
+                        return
+                    ack_type = "message_ack"
+                    response_payload = {"operation_id": frame["payload"]["operation_id"]}
+                assert connection is not None
+                await current.device_connections.send(connection, ack_type, response_payload)
+                expected_sequence += 1
+                if message_type == "disconnect":
+                    return
+        except (WebSocketDisconnect, asyncio.CancelledError):
+            pass
+        except DistributedError as exc:
+            _logger.info("Device connection rejected code=%s", exc.code)
+            try:
+                await websocket.close(code=4401, reason=exc.code)
+            except RuntimeError:
+                pass
+        except (ValueError, TypeError, KeyError):
+            try:
+                await websocket.close(code=4401, reason="protocol_invalid")
+            except RuntimeError:
+                pass
+        except (TimeoutError, RuntimeError):
+            try:
+                await websocket.close(code=1011, reason="Device connection failed")
+            except RuntimeError:
+                pass
+        finally:
+            if connection is not None and current.device_connections is not None:
+                await current.device_connections.unregister(connection)
+
     @router.get(
         "/api/v1/projects",
         response_model=ProjectListResponse,
@@ -854,7 +1005,8 @@ def create_app(
     ) -> DeviceListResponse:
         assert current.distributed is not None
         return DeviceListResponse(devices=[
-            DeviceMetadataResponse(**entry) for entry in current.distributed.list_devices()
+            DeviceMetadataResponse(**_device_metadata(current, entry))
+            for entry in current.distributed.list_devices()
         ])
 
     @router.get(
@@ -868,7 +1020,9 @@ def create_app(
         current: WebServices = Depends(services_from),
     ) -> DeviceMetadataResponse:
         assert current.distributed is not None
-        return DeviceMetadataResponse(**current.distributed.device_metadata(device_id))
+        return DeviceMetadataResponse(**_device_metadata(
+            current, current.distributed.device_metadata(device_id),
+        ))
 
     @router.post(
         "/api/v1/devices/{device_id}/authorize",
@@ -884,7 +1038,9 @@ def create_app(
     ) -> DeviceMetadataResponse:
         require_csrf(request, session, current, csrf_token)
         assert current.distributed is not None
-        return DeviceMetadataResponse(**current.distributed.authorize_device(device_id))
+        return DeviceMetadataResponse(**_device_metadata(
+            current, current.distributed.authorize_device(device_id),
+        ))
 
     @router.delete(
         "/api/v1/devices/{device_id}",
@@ -901,6 +1057,8 @@ def create_app(
         require_csrf(request, session, current, csrf_token)
         assert current.distributed is not None
         current.distributed.revoke_device(device_id)
+        if current.device_connections is not None:
+            await current.device_connections.disconnect_device(device_id)
         return Response(status_code=204)
 
     @router.post(
@@ -979,6 +1137,48 @@ def create_app(
             _binding_response(item) for item in current.distributed.list_bindings(project_id)
         ])
 
+    @router.post(
+        "/api/v1/logical-projects/{project_id}/bindings/{binding_id}/snapshot-requests",
+        response_model=SnapshotRequestResponse,
+        status_code=202,
+        responses={403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    async def request_client_snapshot(
+        project_id: str,
+        binding_id: str,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> SnapshotRequestResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.distributed is not None and current.device_connections is not None
+        matches = [
+            item for item in current.distributed.list_bindings(project_id)
+            if str(item.binding_id) == binding_id
+        ]
+        if not matches:
+            raise DistributedError("binding_not_found", "Workspace binding was not found.", 404)
+        binding = current.distributed.require_binding(
+            project_id, str(matches[0].device_id), binding_id,
+        )
+        if not current.device_connections.connected(str(binding.device_id)):
+            raise DistributedError("device_offline", "Client Agent is not currently connected.", 409)
+        expires_at = int(time.time()) + 10 * 60
+        try:
+            operation_id = await current.device_connections.request_snapshot(
+                str(binding.device_id), project_id, binding_id, expires_at,
+            )
+        except RuntimeError as exc:
+            raise DistributedError("snapshot_request_unavailable", "Snapshot request could not be delivered to the connected Client Agent.", 409) from exc
+        return SnapshotRequestResponse(
+            operation_id=operation_id,
+            project_id=project_id,
+            binding_id=binding_id,
+            state="sent_to_client",
+            expires_at=expires_at,
+        )
+
     @router.delete(
         "/api/v1/logical-projects/{project_id}/bindings/{binding_id}",
         status_code=204,
@@ -1014,6 +1214,31 @@ def create_app(
             credential=credential.credential,
             credential_expires_at=credential.credential_expires_at,
         )
+
+    @router.get(
+        "/api/v1/device/{device_id}/workspace-bindings/{binding_id}",
+        response_model=WorkspaceBindingResponse,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
+    )
+    async def inspect_device_binding(
+        device_id: str,
+        binding_id: str,
+        principal: DevicePrincipal = Depends(current_device),
+        current: WebServices = Depends(services_from),
+    ) -> WorkspaceBindingResponse:
+        _require_path_device(device_id, principal)
+        assert current.distributed is not None
+        with current.database.connect() as connection:
+            row = connection.execute(
+                "SELECT project_id FROM workspace_bindings WHERE binding_id = ? AND device_id = ?",
+                (binding_id, device_id),
+            ).fetchone()
+        if row is None:
+            raise DistributedError("binding_not_found", "Workspace binding was not found.", 404)
+        binding = current.distributed.require_binding(
+            row["project_id"], device_id, binding_id,
+        )
+        return _binding_response(binding)
 
     @router.post(
         "/api/v1/device/{device_id}/snapshot-uploads",
@@ -1220,6 +1445,56 @@ def _binding_response(binding: object) -> WorkspaceBindingResponse:
         created_at=binding.created_at,
         expires_at=binding.expires_at,
     )
+
+
+def _device_metadata(current: WebServices, metadata: dict[str, object]) -> dict[str, object]:
+    result = dict(metadata)
+    if result["state"] == "revoked":
+        result["connection_state"] = "revoked"
+        result["connected"] = False
+    else:
+        connected = (
+            current.device_connections is not None
+            and current.device_connections.connected(str(result["id"]))
+        )
+        result["connected"] = connected
+        result["connection_state"] = (
+            "connected" if connected
+            else "recently_active" if result["recently_active"]
+            else "disconnected"
+        )
+    return result
+
+
+def _decode_device_frame(raw: str, expected_sequence: int) -> dict[str, object]:
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 8192:
+        raise ValueError("Device message exceeds its protocol bound.")
+    frame = json.loads(raw)
+    if (
+        not isinstance(frame, dict)
+        or set(frame) != {
+            "schema_version", "type", "device_id", "timestamp", "nonce",
+            "sequence", "payload", "signature",
+        }
+        or type(frame["schema_version"]) is not int
+        or frame["schema_version"] != 1
+        or not isinstance(frame["type"], str)
+        or len(frame["type"]) > 64
+        or not isinstance(frame["device_id"], str)
+        or len(frame["device_id"]) != 32
+        or any(char not in "0123456789abcdef" for char in frame["device_id"])
+        or type(frame["timestamp"]) is not int
+        or frame["timestamp"] <= 0
+        or type(frame["sequence"]) is not int
+        or frame["sequence"] != expected_sequence
+        or not isinstance(frame["nonce"], str)
+        or not isinstance(frame["payload"], dict)
+        or len(frame["payload"]) > 8
+        or not isinstance(frame["signature"], str)
+        or len(frame["signature"]) > 128
+    ):
+        raise ValueError("Device message does not match the versioned protocol.")
+    return frame
 
 
 def _require_path_device(device_id: str, principal: DevicePrincipal) -> None:

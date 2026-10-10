@@ -260,6 +260,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/device/{device_id}/workspace-bindings/{binding_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect Device Binding */
+        get: operations["inspect_device_binding_api_v1_device__device_id__workspace_bindings__binding_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/devices": {
         parameters: {
             query?: never;
@@ -461,6 +478,23 @@ export interface paths {
         post?: never;
         /** Revoke Binding */
         delete: operations["revoke_binding_api_v1_logical_projects__project_id__bindings__binding_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/logical-projects/{project_id}/bindings/{binding_id}/snapshot-requests": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request Client Snapshot */
+        post: operations["request_client_snapshot_api_v1_logical_projects__project_id__bindings__binding_id__snapshot_requests_post"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -751,9 +785,9 @@ export interface components {
             connected: boolean;
             /**
              * Connection State
-             * @constant
+             * @enum {string}
              */
-            connection_state: "not_supported";
+            connection_state: "connected" | "disconnected" | "recently_active" | "revoked";
             /** Created At */
             created_at: number;
             /** Credential Expires At */
@@ -968,7 +1002,7 @@ export interface components {
              * Type
              * @enum {string}
              */
-            type: "project_snapshot" | "resynchronization_required" | "project_created" | "workspace_binding_created" | "workspace_binding_revoked" | "device_revoked" | "snapshot_committed" | "snapshot_expired";
+            type: "project_snapshot" | "resynchronization_required" | "project_created" | "workspace_binding_created" | "workspace_binding_revoked" | "device_revoked" | "device_connected" | "device_disconnected" | "snapshot_committed" | "snapshot_expired";
         };
         /** ProjectActivityListResponse */
         ProjectActivityListResponse: {
@@ -1044,6 +1078,22 @@ export interface components {
         SnapshotListResponse: {
             /** Snapshots */
             snapshots: components["schemas"]["SnapshotResponse"][];
+        };
+        /** SnapshotRequestResponse */
+        SnapshotRequestResponse: {
+            /** Binding Id */
+            binding_id: string;
+            /** Expires At */
+            expires_at: number;
+            /** Operation Id */
+            operation_id: string;
+            /** Project Id */
+            project_id: string;
+            /**
+             * State
+             * @constant
+             */
+            state: "sent_to_client";
         };
         /** SnapshotResponse */
         SnapshotResponse: {
@@ -2013,6 +2063,74 @@ export interface operations {
             };
         };
     };
+    inspect_device_binding_api_v1_device__device_id__workspace_bindings__binding_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                device_id: string;
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceBindingResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_devices_api_v1_devices_get: {
         parameters: {
             query?: never;
@@ -2487,6 +2605,65 @@ export interface operations {
             };
             /** @description Not Found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    request_client_snapshot_api_v1_logical_projects__project_id__bindings__binding_id__snapshot_requests_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                project_id: string;
+                binding_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SnapshotRequestResponse"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

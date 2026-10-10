@@ -121,7 +121,7 @@ class ProjectActivityEventResponse(StrictSchema):
     type: Literal[
         "project_snapshot", "resynchronization_required", "project_created",
         "workspace_binding_created", "workspace_binding_revoked", "device_revoked",
-        "snapshot_committed", "snapshot_expired",
+        "device_connected", "device_disconnected", "snapshot_committed", "snapshot_expired",
     ]
     created_at: StrictInt = Field(ge=0)
     payload: dict[str, str | int | bool | None] = Field(max_length=8)
@@ -203,7 +203,7 @@ class DeviceMetadataResponse(StrictSchema):
     last_authenticated_activity_at: int | None
     credential_expires_at: int
     recently_active: bool
-    connection_state: Literal["not_supported"]
+    connection_state: Literal["connected", "disconnected", "recently_active", "revoked"]
     connected: bool
 
 
@@ -230,6 +230,14 @@ class WorkspaceBindingResponse(StrictSchema):
 
 class WorkspaceBindingListResponse(StrictSchema):
     bindings: list[WorkspaceBindingResponse] = Field(max_length=512)
+
+
+class SnapshotRequestResponse(StrictSchema):
+    operation_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    project_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    binding_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    state: Literal["sent_to_client"]
+    expires_at: StrictInt = Field(ge=0)
 
 
 class SnapshotFileManifest(StrictSchema):

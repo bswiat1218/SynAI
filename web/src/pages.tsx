@@ -41,7 +41,9 @@ import type {
   LogicalProjectResponse,
   ModelListResponse,
   ProjectListResponse,
+  PairingChallengeResponse,
   SnapshotListResponse,
+  SnapshotRequestResponse,
   TaskListResponse,
   WorkspaceBindingListResponse,
 } from "./api/contracts";
@@ -211,9 +213,9 @@ function TaskSummary({ project }: { project: LogicalProjectResponse }) {
 function DeviceSummary({ device }: { device: DeviceMetadataResponse }) {
   return (
     <li className="device-summary">
-      <span className={`status-dot ${device.state === "authorized" ? "status-dot-good" : device.state === "revoked" ? "status-dot-bad" : ""}`} />
+      <span className={`status-dot ${device.connected ? "status-dot-good" : device.state === "revoked" ? "status-dot-bad" : ""}`} />
       <span className="list-main"><strong>{deviceName(device)}</strong>
-        <span>{device.state} · {device.recently_active ? "recent authenticated activity" : "no recent authenticated activity"}</span>
+        <span>{device.state} · {device.connection_state === "connected" ? "connected now" : device.recently_active ? "recent authenticated activity" : "offline"}</span>
       </span>
     </li>
   );
@@ -292,6 +294,7 @@ export function WorkbenchPage() {
   const project = useResource<LogicalProjectResponse>(`/api/v1/logical-projects/${projectId}`);
   const bindings = useResource<WorkspaceBindingListResponse>(`/api/v1/logical-projects/${projectId}/bindings`);
   const snapshots = useResource<SnapshotListResponse>(`/api/v1/logical-projects/${projectId}/snapshots`);
+  const devices = useResource<DeviceListResponse>("/api/v1/devices");
   const activity = useResource<ProjectActivityListResponse>(`/api/v1/logical-projects/${projectId}/activity?limit=100`);
   const tasks = useResource<TaskListResponse>(`/api/v1/logical-projects/${projectId}/tasks`);
   const conversations = useResource<ChatConversationListResponse>(`/api/v1/chat/sessions?project_id=${projectId}`);
@@ -304,9 +307,10 @@ export function WorkbenchPage() {
     activity.reload();
     project.reload();
     bindings.reload();
+    devices.reload();
     snapshots.reload();
     tasks.reload();
-  }, [activity.reload, bindings.reload, project.reload, snapshots.reload, tasks.reload]);
+  }, [activity.reload, bindings.reload, devices.reload, project.reload, snapshots.reload, tasks.reload]);
   const style = { "--inspector-width": `${detailWidth}px` } as CSSProperties;
   if (project.error && !project.data) return <ErrorPage title="Project unavailable" message={project.error} />;
   return (
@@ -343,17 +347,31 @@ export function WorkbenchPage() {
                 <Button asChild><Link to={`/projects/${projectId}/chat`}><MessageSquare size={16} />Open project chat</Link></Button>
               </div>
               <div className="workbench-content-grid">
-                <InfoCard title="Source Device" value={bindings.data?.bindings.length ? `${bindings.data.bindings.length} workspace binding(s)` : "No device bindings"} detail="Binding metadata only; no Client Agent is connected." loading={bindings.loading} error={bindings.error} />
+                <InfoCard title="Source Device" value={bindings.data?.bindings[0] ? `${deviceNameFor(bindings.data.bindings[0].device_id)} · ${bindings.data.bindings[0].name}` : "No device bindings"} detail={devices.data?.devices.find((device) => device.id === bindings.data?.bindings[0]?.device_id)?.connection_state ?? "Connection status unavailable"} loading={bindings.loading || devices.loading} error={bindings.error || devices.error} />
                 <InfoCard title="Execution Target" value="Unavailable" detail="Sandbox Broker is not installed; no task can be executed." />
                 <InfoCard title="Apply Destination" value="Unavailable" detail="No client-side apply destination exists in this phase." />
                 <InfoCard title="Snapshots" value={snapshots.data ? `${snapshots.data.snapshots.length} retained record(s)` : "No snapshots"} detail="Immutable source metadata; no source files are exposed to Chat." loading={snapshots.loading} error={snapshots.error} />
                 <InfoCard title="Agent Tasks" value={tasks.data ? `${tasks.data.tasks.length} saved record(s)` : "No task records"} detail="Execution remains disabled until Phase 13F." loading={tasks.loading} error={tasks.error} />
                 <InfoCard title="Project conversations" value={conversations.data ? `${conversations.data.conversations.length} conversation(s)` : "No conversations"} detail="Project association is metadata only." loading={conversations.loading} error={conversations.error} />
               </div>
+              <WorkspaceBindingsControl
+                projectId={projectId}
+                bindings={bindings.data?.bindings ?? []}
+                devices={devices.data?.devices ?? []}
+                onChanged={refreshProjectData}
+              />
             </>
           )}
           {panel === "chat" && <ChatPage embedded />}
-          {panel === "snapshots" && <SnapshotPanel data={snapshots.data} loading={snapshots.loading} error={snapshots.error} />}
+          {panel === "snapshots" && <SnapshotPanel
+            projectId={projectId}
+            bindings={bindings.data?.bindings ?? []}
+            devices={devices.data?.devices ?? []}
+            data={snapshots.data}
+            loading={snapshots.loading}
+            error={snapshots.error}
+            onRequested={refreshProjectData}
+          />}
           {panel === "activity" && <ActivityPanel
             projectId={projectId}
             data={activity.data}
@@ -372,6 +390,8 @@ export function WorkbenchPage() {
               <dt>Project type</dt><dd>Logical distributed project</dd>
               <dt>Created</dt><dd>{project.data ? dateLabel(project.data.created_at) : "—"}</dd>
               <dt>Source binding</dt><dd>{bindings.data?.bindings[0]?.name ?? "Not registered"}</dd>
+              <dt>Source device</dt><dd>{bindings.data?.bindings[0] ? deviceNameFor(bindings.data.bindings[0].device_id) : "Not registered"}</dd>
+              <dt>Latest snapshot</dt><dd>{snapshots.data?.snapshots[0] ? dateLabel(snapshots.data.snapshots[0].created_at) : "No snapshots"}</dd>
               <dt>Snapshot state</dt><dd>{snapshots.data?.snapshots[0]?.state ?? "No snapshots"}</dd>
             </dl>
             <label className="resize-control" htmlFor="inspector-size">Inspector width</label>
@@ -389,11 +409,122 @@ function InfoCard({ title, value, detail, loading, error }: { title: string; val
   return <Card className="info-card"><span className="eyebrow">{title}</span><CardTitle>{loading ? "Loading…" : value}</CardTitle><p className="muted-copy">{error ? "Status is unavailable." : detail}</p></Card>;
 }
 
-function SnapshotPanel({ data, loading, error }: { data: SnapshotListResponse | null; loading: boolean; error: string | null }) {
-  return <div><span className="eyebrow">Snapshot history</span><h2>Immutable snapshots</h2><ResourceMessage loading={loading} error={error} />
-    {data?.snapshots.length ? <ul className="compact-list">{data.snapshots.map((snapshot) => <li key={snapshot.snapshot_id}>
-      <span className="list-main"><strong>{snapshot.snapshot_id.slice(0, 12)}</strong><span>{dateLabel(snapshot.created_at)} · {formatBytes(snapshot.total_bytes)}</span></span><span className={`status-pill ${statusClass(snapshot.state)}`}>{snapshot.state}</span>
-    </li>)}</ul> : !loading && !error ? <EmptyState title="No snapshots" detail="Snapshots require a future consent-based Client Agent flow." /> : null}
+function WorkspaceBindingsControl({ projectId, bindings, devices, onChanged }: {
+  projectId: string;
+  bindings: WorkspaceBindingListResponse["bindings"];
+  devices: DeviceMetadataResponse[];
+  onChanged: () => void;
+}) {
+  const auth = useAuth();
+  const [deviceId, setDeviceId] = useState("");
+  const [name, setName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const authorizedDevices = devices.filter((device) => device.state === "authorized");
+  const selectedDeviceId = deviceId || authorizedDevices[0]?.id || "";
+  const createBinding = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!auth.csrfToken || !selectedDeviceId || !name.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await apiRequest(
+        `/api/v1/logical-projects/${projectId}/bindings`,
+        { method: "POST", body: JSON.stringify({ device_id: selectedDeviceId, name: name.trim() }) },
+        auth.csrfToken,
+      );
+      setName("");
+      onChanged();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Workspace binding could not be created.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <section className="subsection">
+    <h2>Authorized workspaces</h2>
+    <p className="muted-copy">A server binding associates this project with one paired device; the local directory is chosen and stored only by that Client Agent.</p>
+    {authorizedDevices.length > 0 && <form className="inline-form" onSubmit={(event) => void createBinding(event)}>
+      <label htmlFor="binding-device">Authorized device</label>
+      <select id="binding-device" value={selectedDeviceId} onChange={(event) => setDeviceId(event.target.value)}>
+        {authorizedDevices.map((device) => <option key={device.id} value={device.id}>{deviceName(device)} · {device.connection_state}</option>)}
+      </select>
+      <label className="sr-only" htmlFor="binding-name">Workspace alias</label>
+      <input id="binding-name" value={name} onChange={(event) => setName(event.target.value)} maxLength={128} placeholder="Workspace alias" required />
+      <Button disabled={busy || !auth.csrfToken}>{busy ? "Registering…" : "Create binding"}</Button>
+    </form>}
+    {!authorizedDevices.length && <p className="small-note">Authorize a paired device on the Devices page before creating a workspace binding.</p>}
+    {error && <ErrorNotice message={error} />}
+    {bindings.length > 0 && <ul className="compact-list">{bindings.map((binding) => <li key={binding.id}>
+      <span className="list-main"><strong>{binding.name} · {deviceNameFor(binding.device_id)}</strong><span>Binding ID {binding.id} · {binding.status}; add the local directory with synai-client on that device.</span></span>
+      <span className={`status-pill ${statusClass(binding.status)}`}>{binding.status}</span>
+    </li>)}</ul>}
+  </section>;
+}
+
+function SnapshotPanel({ projectId, bindings, devices, data, loading, error, onRequested }: {
+  projectId: string;
+  bindings: WorkspaceBindingListResponse["bindings"];
+  devices: DeviceMetadataResponse[];
+  data: SnapshotListResponse | null;
+  loading: boolean;
+  error: string | null;
+  onRequested: () => void;
+}) {
+  return <div><span className="eyebrow">Snapshot history</span><h2>Immutable snapshots</h2>
+    <p className="muted-copy">Snapshot creation is read-only. A request is sent only to an online Client Agent, which must independently show a preview and obtain local user consent. Code execution remains unavailable.</p>
+    {bindings.filter((binding) => binding.status === "active").map((binding) => {
+      const device = devices.find((item) => item.id === binding.device_id);
+      return <SnapshotRequestControl key={binding.id} projectId={projectId} binding={binding} connected={device?.connected ?? false} onRequested={onRequested} />;
+    })}
+    <ResourceMessage loading={loading} error={error} />
+    {data?.snapshots.length ? <ul className="compact-list">{data.snapshots.map((snapshot) => {
+      const fileCount = Array.isArray(snapshot.manifest.files) ? snapshot.manifest.files.length : 0;
+      return <li key={snapshot.snapshot_id}>
+        <span className="list-main"><strong>{snapshot.snapshot_id.slice(0, 12)}</strong><span>
+          {dateLabel(snapshot.created_at)} · Device {deviceNameFor(snapshot.source_device_id)} · Binding {snapshot.workspace_binding_id.slice(0, 8)} · {fileCount} files · {formatBytes(snapshot.total_bytes)}
+        </span></span><span className={`status-pill ${statusClass(snapshot.state)}`}>{snapshot.state}</span>
+      </li>;
+    })}</ul> : !loading && !error ? <EmptyState title="No snapshots" detail="Snapshots require an authorized local workspace and explicit approval on the Client Agent." /> : null}
+  </div>;
+}
+
+function SnapshotRequestControl({ projectId, binding, connected, onRequested }: {
+  projectId: string;
+  binding: WorkspaceBindingListResponse["bindings"][number];
+  connected: boolean;
+  onRequested: () => void;
+}) {
+  const auth = useAuth();
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const request = async () => {
+    if (!auth.csrfToken || !window.confirm(`Ask ${binding.name} to preview a new read-only snapshot? The Client Agent will require local approval before any files are sent.`)) return;
+    setBusy(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await apiRequest<SnapshotRequestResponse>(
+        `/api/v1/logical-projects/${projectId}/bindings/${binding.id}/snapshot-requests`,
+        { method: "POST" },
+        auth.csrfToken,
+      );
+      setMessage(`Request sent; waiting for local confirmation (expires ${dateLabel(result.expires_at)}).`);
+      window.setTimeout(onRequested, 1500);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Snapshot request could not be sent.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <div className="subsection">
+    <Button variant="secondary" disabled={!connected || busy || !auth.csrfToken} onClick={() => void request()}>
+      {busy ? "Requesting…" : `Request snapshot · ${binding.name}`}
+    </Button>
+    {!connected && <p className="small-note">Client Agent is disconnected; no request was sent.</p>}
+    {message && <p role="status" className="small-note">{message}</p>}
+    {error && <ErrorNotice message={error} />}
   </div>;
 }
 
@@ -965,10 +1096,49 @@ function TaskProject({ project }: { project: LogicalProjectResponse }) {
 export function DevicesPage() {
   const devices = useResource<DeviceListResponse>("/api/v1/devices");
   const projects = useResource<LogicalProjectListResponse>("/api/v1/logical-projects");
-  return <section className="page-stack"><PageHeading eyebrow="Distributed identity" title="Devices">Registration and recent signed activity are not a live connection or proof that a Client Agent is installed.</PageHeading>
+  const auth = useAuth();
+  const [challenge, setChallenge] = useState<PairingChallengeResponse | null>(null);
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const [pairingBusy, setPairingBusy] = useState(false);
+  useEffect(() => {
+    const timer = window.setInterval(devices.reload, 10_000);
+    return () => window.clearInterval(timer);
+  }, [devices.reload]);
+  const createPairing = async () => {
+    if (!auth.csrfToken) return;
+    setPairingBusy(true);
+    setPairingError(null);
+    setChallenge(null);
+    try {
+      const result = await apiRequest<PairingChallengeResponse>(
+        "/api/v1/devices/pairing-challenges",
+        { method: "POST" },
+        auth.csrfToken,
+      );
+      setChallenge(result);
+    } catch (cause) {
+      setPairingError(cause instanceof Error ? cause.message : "Pairing challenge could not be created.");
+    } finally {
+      setPairingBusy(false);
+    }
+  };
+  return <section className="page-stack"><PageHeading eyebrow="Distributed identity" title="Devices">Paired-device presence reflects an authenticated live Client Agent connection; recent activity alone is not shown as connected.</PageHeading>
+    <Card className="device-pairing">
+      <CardTitle>Pair a Linux Client Agent</CardTitle>
+      <p className="muted-copy">Create a five-minute, single-use challenge. The client generates and keeps its private key locally; this browser never receives the private key or device credential.</p>
+      <Button disabled={pairingBusy || !auth.csrfToken} onClick={() => void createPairing()}>{pairingBusy ? "Creating…" : "Create pairing challenge"}</Button>
+      {pairingError && <ErrorNotice message={pairingError} />}
+      {challenge && <div role="status" className="pairing-challenge">
+        <p>On the Linux computer run <code>synai-client pair</code>, then enter the challenge ID and secret shown here. After enrollment, authorize the pending device below.</p>
+        <p><strong>Challenge ID</strong> <code>{challenge.challenge_id}</code></p>
+        <p><strong>One-time secret</strong> <code>{challenge.challenge_secret}</code></p>
+        <p>Expires {dateLabel(challenge.expires_at)} · protocol {challenge.protocol_versions.join(", ")}</p>
+        <p className="small-note">Treat this as a temporary pairing secret. Do not share it outside the intended client.</p>
+      </div>}
+    </Card>
     <ResourceMessage loading={devices.loading} error={devices.error} stale={devices.stale} />
     {devices.data?.devices.length ? <div className="device-list">{devices.data.devices.map((device) => <DeviceCard key={device.id} device={device} projects={projects.data?.projects ?? []} onChanged={devices.reload} />)}</div>
-      : !devices.loading && !devices.error ? <EmptyState title="No registered devices" detail="Device enrollment and local filesystem consent require a future Client Agent. No device is online." /> : null}
+      : !devices.loading && !devices.error ? <EmptyState title="No registered devices" detail="Pair a Client Agent to enable locally consented snapshots. No device is online." /> : null}
     <ResourceMessage loading={projects.loading} error={projects.error} />
   </section>;
 }
@@ -1005,8 +1175,8 @@ function DeviceCard({ device, projects, onChanged }: { device: DeviceMetadataRes
     <dl className="device-details">
       <dt>Authorization</dt><dd>{device.authorized_at ? `Authorized ${dateLabel(device.authorized_at)}` : device.state === "pending" ? "Awaiting operator authorization" : device.state}</dd>
       <dt>Last authenticated activity</dt><dd>{device.last_authenticated_activity_at ? `${dateLabel(device.last_authenticated_activity_at)}${device.recently_active ? " · recent" : ""}` : "No authenticated activity"}</dd>
-      <dt>Live connection</dt><dd>Not supported · registered devices are not shown as online</dd>
-      <dt>Protocol</dt><dd>Version {device.protocol_version} · credentials expire {dateLabel(device.credential_expires_at)}</dd>
+      <dt>Live connection</dt><dd>{device.connection_state === "connected" ? "Connected now" : device.connection_state === "recently_active" ? "Disconnected · recently authenticated" : device.connection_state}</dd>
+      <dt>Protocol</dt><dd>Version {device.protocol_version} · {String(device.capabilities.agent_version ?? "client version unavailable")} · credentials expire {dateLabel(device.credential_expires_at)}</dd>
       <dt>Capabilities</dt><dd>{capabilities}</dd>
       <dt>Workspace aliases</dt><dd><DeviceBindings deviceId={device.id} projects={projects} /></dd>
       <dt>Snapshot limits/history</dt><dd>Server-controlled limits apply; per-device quota and history are not exposed by this API.</dd>
@@ -1112,6 +1282,10 @@ function activityLabel(type: ProjectActivityEvent["type"], payload: ProjectActiv
       return `Workspace binding revoked · ${String(payload.name ?? "binding")}`;
     case "device_revoked":
       return `Device authorization revoked · ${String(payload.device_id ?? "device")}`;
+    case "device_connected":
+      return `Client Agent connected · ${String(payload.device_id ?? "device")}`;
+    case "device_disconnected":
+      return `Client Agent disconnected · ${String(payload.device_id ?? "device")}`;
     case "snapshot_committed":
       return `Snapshot committed · ${String(payload.snapshot_id ?? "snapshot")}`;
     case "snapshot_expired":
@@ -1131,4 +1305,8 @@ function formatBytes(value: number) {
 
 function deviceName(device: DeviceMetadataResponse) {
   return `Device ${device.id.slice(0, 8)}`;
+}
+
+function deviceNameFor(deviceId: string) {
+  return `Device ${deviceId.slice(0, 8)}`;
 }

@@ -63,7 +63,9 @@ activity views, and device/sandbox status. Chat remains tool-disabled and does
 not access source files, execute tasks, or apply patches. The original Phase
 13B read-only foundation is described in [web deployment and shared-data
 ownership](docs/phase-13b-web.md); see [Phase 13D browser chat](docs/phase-13d-web-chat.md)
-for current capabilities and limitations. Remote access requires HTTPS, and
+for browser capabilities and limitations, and [Phase 13E Client Agent](docs/phase-13e-client-agent.md)
+for Linux pairing, local workspace authorization, and explicitly consented
+immutable snapshots. Remote access requires HTTPS, and
 the web service and TUI cannot own the same data root concurrently.
 
 SynAI opens on its main menu. Set your Ollama server in **CONNECTION SETTINGS** if needed, then choose **NEW CONVERSATION**, review its environment, choose **NEXT**, select a model from the shared connection, and choose **CREATE CONVERSATION**. Use **CONVERSATIONS** to reopen or delete saved chats. Highlight a row with the arrows and press **Enter** or **OPEN** to restore its execution environment. Launching, configuring drafts, refreshing models, and browsing the menu do not create empty histories.

@@ -14,6 +14,7 @@ dependencies = [
     "uvicorn[standard]>=0.34,<1",
     "argon2-cffi>=23.1,<26",
     "cryptography>=44,<47",
+    "websockets>=13,<16",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -29,6 +30,7 @@ classifiers = [
 [project.scripts]
 synai = "synai.cli:main"
 synai-web = "synai.web.cli:main"
+synai-client = "synai.client.cli:main"
 
 [build-system]
 requires = ["setuptools>=77"]

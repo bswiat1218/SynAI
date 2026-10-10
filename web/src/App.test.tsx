@@ -36,6 +36,14 @@ function authenticatedApi() {
     if (url.endsWith("/api/v1/logical-projects")) return jsonResponse({ projects: [] });
     if (url.endsWith("/api/v1/projects")) return jsonResponse({ projects: [] });
     if (url.endsWith("/api/v1/devices")) return jsonResponse({ devices: [] });
+    if (url.endsWith("/api/v1/devices/pairing-challenges")) {
+      return jsonResponse({
+        challenge_id: "a".repeat(32),
+        challenge_secret: "one-time-pairing-secret",
+        expires_at: 1_900_000_000,
+        protocol_versions: [1],
+      }, 201);
+    }
     if (url.endsWith("/api/v1/models")) return jsonResponse({ models: [] });
     if (url.endsWith("/api/v1/execution-targets")) return jsonResponse({ available: false });
     if (/\/api\/v1\/logical-projects\/[^/]+\/bindings$/.test(url)) return jsonResponse({ bindings: [] });
@@ -92,6 +100,16 @@ describe("SynAI web foundation", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Chat$/ }));
     expect(await screen.findByRole("textbox", { name: "Message" })).toBeInTheDocument();
     expect(screen.getByText(/No source files or client workspace are provided to the model/)).toBeInTheDocument();
+  });
+
+  it("creates and clearly displays a short-lived device pairing challenge", async () => {
+    authenticatedApi();
+    renderRoute("/devices");
+    expect(await screen.findByRole("heading", { name: "Devices" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Create pairing challenge" }));
+    expect(await screen.findByText("one-time-pairing-secret")).toBeInTheDocument();
+    expect(screen.getByText(/synai-client pair/)).toBeInTheDocument();
+    expect(screen.getByText(/private key locally/)).toBeInTheDocument();
   });
 
   it("provides keyboard focus styling and uses Slate Dark tokens", async () => {

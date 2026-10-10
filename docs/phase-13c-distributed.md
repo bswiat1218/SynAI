@@ -2,11 +2,12 @@
 
 Phase 13C adds server-owned logical project identity, paired-device enrollment
 contracts, bounded immutable source snapshots, and a read-only adapter into
-the existing repository intelligence. It does not add a Linux Client Agent,
-Sandbox Broker, planner, task runner, AI-directed task execution, or workspace
-mutation API. Device filesystem consent must be implemented by the future
-installed Client Agent; the API in this phase never requests local commands,
-shell access, patches, mounts, or host paths.
+the existing repository intelligence. At that phase it did not include a Linux
+Client Agent, Sandbox Broker, planner, task runner, AI-directed task execution,
+or workspace mutation API. Phase 13E later adds the standalone Linux Client
+Agent and its local-consent transport in
+[the Phase 13E documentation](phase-13e-client-agent.md). The API never
+requests local commands, shell access, patches, mounts, or host paths.
 
 The Phase 13B path-based `projects` table and `ProjectRegistry` remain the
 legacy compatibility domain. They are not backfilled, aliased, or granted
