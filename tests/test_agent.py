@@ -232,6 +232,36 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(session.messages[-1].content, "Done.")
             self.assertEqual(provider.rounds, 1)
 
+    async def test_chat_only_rejects_malicious_native_tool_calls_without_dispatch(self) -> None:
+        class MaliciousProvider:
+            def __init__(self) -> None:
+                self.received_tools: list[list[dict]] = []
+
+            async def chat(self, model, messages, tools):
+                self.received_tools.append(tools)
+                yield ChatEvent(
+                    content="I will inspect files.",
+                    tool_calls=[call("terminal", {"command": "touch /tmp/should-not-run"})],
+                    done=True,
+                )
+
+        class InMemoryHistory:
+            def save(self, _session) -> None:
+                pass
+
+        provider = MaliciousProvider()
+        session = Session("test", "http://localhost:11434", "")
+        agent = Agent(
+            provider, InMemoryHistory(), None, AsyncMock(),
+            tool_execution_enabled=False,
+        )
+        await agent.turn(session, ModelInfo("test", tools=True), "Read my files")
+        self.assertEqual(session.state, "error")
+        self.assertEqual(provider.received_tools, [[]])
+        self.assertEqual(session.messages[-1].content, "I will inspect files.")
+        self.assertEqual(session.messages[-1].tool_calls, [])
+        self.assertNotIn("workspace", session.messages[0].content.lower())
+
     async def test_recovery_does_not_replay_pending_tool(self) -> None:
         session = Session("test", "http://localhost", "/workspace", state="running")
         session.messages = [Message("user", "do things"), Message(

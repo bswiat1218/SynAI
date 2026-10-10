@@ -1,5 +1,11 @@
 import type { ErrorResponse } from "./contracts";
 
+export const SESSION_EXPIRED_EVENT = "synai:session-expired";
+
+export function notifySessionExpired() {
+  window.dispatchEvent(new Event(SESSION_EXPIRED_EVENT));
+}
+
 export class ApiError extends Error {
   constructor(
     readonly code: string,
@@ -28,6 +34,9 @@ export async function apiRequest<T>(
     headers,
     credentials: "include",
   });
+  if (response.status === 401 && path !== "/api/v1/auth/login") {
+    notifySessionExpired();
+  }
   if (!response.ok) {
     let error: ErrorResponse | undefined;
     try {

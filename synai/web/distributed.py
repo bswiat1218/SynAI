@@ -382,12 +382,16 @@ class DistributedRegistry:
             "authorized_at": row["authorized_at"],
             "revoked_at": row["revoked_at"],
             "last_seen_at": row["last_seen_at"],
+            "last_authenticated_activity_at": row["last_seen_at"],
             "credential_expires_at": row["credential_expires_at"],
-            "connected": (
+            "recently_active": (
                 row["state"] == "authorized"
                 and row["last_seen_at"] is not None
+                and 0 <= timestamp - row["last_seen_at"]
                 and timestamp - row["last_seen_at"] <= 120
             ),
+            "connection_state": "not_supported",
+            "connected": False,
         }
 
     def list_devices(self, now: int | None = None) -> tuple[dict[str, object], ...]:

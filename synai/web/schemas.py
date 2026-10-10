@@ -55,6 +55,65 @@ class ModelListResponse(StrictSchema):
     models: list[ModelResponse] = Field(max_length=4096)
 
 
+class ChatConversationCreateRequest(StrictSchema):
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    project_id: str | None = Field(default=None, min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+
+
+class ChatTurnRequest(StrictSchema):
+    prompt: str = Field(min_length=1, max_length=32_768)
+    model: str = Field(min_length=1, max_length=256)
+
+
+class ChatMessageResponse(StrictSchema):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=1_048_576)
+    thinking: str = Field(max_length=1_048_576)
+    status: str = Field(max_length=32)
+    created_at: str = Field(max_length=64)
+
+
+class ChatConversationResponse(StrictSchema):
+    schema_version: Literal[1] = 1
+    id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    project_id: str | None
+    title: str = Field(max_length=255)
+    model: str = Field(max_length=256)
+    state: Literal["idle", "running", "cancelled", "error", "interrupted", "stopped"]
+    created_at: str = Field(max_length=64)
+    updated_at: str = Field(max_length=64)
+    messages: list[ChatMessageResponse] = Field(default_factory=list, max_length=256)
+
+
+class ChatConversationListResponse(StrictSchema):
+    conversations: list[ChatConversationResponse] = Field(max_length=256)
+
+
+class ChatTurnResponse(StrictSchema):
+    conversation_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    model: str = Field(min_length=1, max_length=256)
+    state: Literal["running"]
+
+
+class ChatCancelResponse(StrictSchema):
+    conversation_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    state: Literal["cancelling", "idle", "cancelled", "error", "interrupted", "stopped", "running"]
+    cancelled: bool
+
+
+class ChatEventEnvelope(StrictSchema):
+    schema_version: Literal[1] = 1
+    event_id: StrictInt = Field(ge=0)
+    conversation_id: str = Field(min_length=32, max_length=32, pattern=r"^[a-f0-9]{32}$")
+    type: Literal[
+        "session_snapshot", "turn_started", "content_delta", "thinking_delta",
+        "turn_completed", "turn_cancelled", "turn_interrupted", "turn_failed",
+        "provider_unavailable", "resynchronization_required",
+    ]
+    created_at: StrictInt = Field(ge=0)
+    payload: dict[str, str | int | bool | None] = Field(max_length=8)
+
+
 class ProjectRegistrationRequest(StrictSchema):
     workspace_key: str = Field(min_length=1, max_length=32, pattern=r"^[a-z][a-z0-9_-]*$")
 
@@ -121,7 +180,10 @@ class DeviceMetadataResponse(StrictSchema):
     authorized_at: int | None
     revoked_at: int | None
     last_seen_at: int | None
+    last_authenticated_activity_at: int | None
     credential_expires_at: int
+    recently_active: bool
+    connection_state: Literal["not_supported"]
     connected: bool
 
 

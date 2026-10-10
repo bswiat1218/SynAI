@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyCookie, APIKeyHeader
@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from synai.providers.base import ModelProvider, ProviderError
 from synai.providers.ollama import OllamaProvider
+from synai.web.chat import WebChatError, WebChatService
 from synai.web.auth import (
     AuthenticatedSession,
     AuthenticationError,
@@ -41,6 +42,12 @@ from synai.web.projects import (
 )
 from synai.web.schemas import (
     CsrfResponse,
+    ChatCancelResponse,
+    ChatConversationCreateRequest,
+    ChatConversationListResponse,
+    ChatConversationResponse,
+    ChatTurnRequest,
+    ChatTurnResponse,
     ErrorResponse,
     HealthResponse,
     LoginRequest,
@@ -112,6 +119,7 @@ class WebServices:
     projects: ProjectRegistry | None = None
     distributed: DistributedRegistry | None = None
     snapshots: SnapshotStore | None = None
+    chat: WebChatService | None = None
     snapshot_cleanup_task: asyncio.Task[None] | None = None
     ready: bool = False
 
@@ -128,6 +136,11 @@ class WebServices:
             self.distributed = DistributedRegistry(self.database)
             self.snapshots = SnapshotStore(self.database, self.distributed)
             self.snapshots.initialize()
+            self.chat = WebChatService(
+                self.config.data_root, self.config.ollama_url, self.database,
+                self.provider, self.distributed,
+            )
+            self.chat.initialize()
             self.ready = True
             self.snapshot_cleanup_task = asyncio.create_task(self._snapshot_cleanup_loop())
         except BaseException:
@@ -136,6 +149,8 @@ class WebServices:
 
     async def close(self) -> None:
         self.ready = False
+        if self.chat is not None:
+            await self.chat.close()
         if self.snapshot_cleanup_task is not None:
             self.snapshot_cleanup_task.cancel()
             try:
@@ -234,6 +249,19 @@ async def _unused_receive() -> dict[str, object]:
     return {"type": "http.disconnect"}
 
 
+async def _reject_websocket_input(websocket: WebSocket) -> None:
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+        data = message.get("text")
+        if data is None:
+            data = message.get("bytes", b"")
+        size = len(data.encode("utf-8")) if isinstance(data, str) else len(data)
+        await websocket.close(code=1009 if size > 8192 else 1008)
+        return
+
+
 def create_app(
     config: WebConfig | None = None,
     *,
@@ -284,6 +312,7 @@ def create_app(
         max_concurrent=selected_config.concurrent_request_limit,
     )
     app.add_exception_handler(AuthenticationError, _authentication_error)
+    app.add_exception_handler(WebChatError, _chat_error)
     app.add_exception_handler(ProjectRegistryError, _project_error)
     app.add_exception_handler(DistributedError, _distributed_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
@@ -470,6 +499,155 @@ def create_app(
         ):
             raise HTTPException(status_code=503, detail="provider_unavailable")
         return ModelListResponse(models=[ModelResponse(name=item.name) for item in available])
+
+    @router.post(
+        "/api/v1/chat/sessions",
+        response_model=ChatConversationResponse,
+        status_code=201,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+    )
+    async def create_chat_session(
+        body: ChatConversationCreateRequest,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> ChatConversationResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.chat is not None
+        return ChatConversationResponse(**await current.chat.create_session(body.model, body.project_id))
+
+    @router.get(
+        "/api/v1/chat/sessions",
+        response_model=ChatConversationListResponse,
+    )
+    async def list_chat_sessions(
+        project_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=256),
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> ChatConversationListResponse:
+        assert current.chat is not None
+        return ChatConversationListResponse(
+            conversations=[
+                ChatConversationResponse(**entry)
+                for entry in current.chat.list_sessions(project_id, limit)
+            ],
+        )
+
+    @router.get(
+        "/api/v1/chat/sessions/{conversation_id}",
+        response_model=ChatConversationResponse,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def get_chat_session(
+        conversation_id: str,
+        _: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+    ) -> ChatConversationResponse:
+        assert current.chat is not None
+        return ChatConversationResponse(**current.chat.get_session(conversation_id))
+
+    @router.post(
+        "/api/v1/chat/sessions/{conversation_id}/turns",
+        response_model=ChatTurnResponse,
+        status_code=202,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 409: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    )
+    async def start_chat_turn(
+        conversation_id: str,
+        body: ChatTurnRequest,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> ChatTurnResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.chat is not None
+        return ChatTurnResponse(**await current.chat.start_turn(
+            conversation_id, body.prompt, body.model,
+        ))
+
+    @router.post(
+        "/api/v1/chat/sessions/{conversation_id}/cancel",
+        response_model=ChatCancelResponse,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    )
+    async def cancel_chat_turn(
+        conversation_id: str,
+        request: Request,
+        session: AuthenticatedSession = Depends(current_session),
+        current: WebServices = Depends(services_from),
+        csrf_token: str | None = Depends(_csrf_header),
+    ) -> ChatCancelResponse:
+        require_csrf(request, session, current, csrf_token)
+        assert current.chat is not None
+        return ChatCancelResponse(**await current.chat.cancel_turn(conversation_id))
+
+    @router.websocket("/api/v1/events/v1/chat/{conversation_id}")
+    async def chat_event_stream(
+        websocket: WebSocket,
+        conversation_id: str,
+        after: int | None = Query(default=None, ge=0),
+    ) -> None:
+        current: WebServices = websocket.app.state.services
+        if not current.ready or current.chat is None or current.auth is None:
+            await websocket.close(code=1013)
+            return
+        if websocket.headers.get("origin") != _normalized_origin(selected_config.public_origin):
+            await websocket.close(code=4403)
+            return
+        raw_token = websocket.cookies.get(_SESSION_COOKIE)
+        try:
+            current.auth.session(raw_token)
+            queue, replay, cursor, gap = current.chat.subscribe(conversation_id, after)
+        except AuthenticationError:
+            await websocket.close(code=4401)
+            return
+        except WebChatError as exc:
+            await websocket.close(code=4404 if exc.status_code == 404 else 4409)
+            return
+
+        await websocket.accept()
+        reader = asyncio.create_task(_reject_websocket_input(websocket))
+        try:
+            if after is None:
+                current.auth.session(raw_token)
+                await websocket.send_json(current.chat.snapshot_event(conversation_id, cursor))
+            elif gap:
+                current.auth.session(raw_token)
+                await websocket.send_json({
+                    "schema_version": 1,
+                    "event_id": cursor,
+                    "conversation_id": conversation_id,
+                    "type": "resynchronization_required",
+                    "created_at": int(time.time()),
+                    "payload": {"cursor": cursor},
+                })
+                current.auth.session(raw_token)
+                await websocket.send_json(current.chat.snapshot_event(conversation_id, cursor))
+            else:
+                for event in replay:
+                    current.auth.session(raw_token)
+                    await websocket.send_json(event)
+            while not reader.done():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except TimeoutError:
+                    current.auth.session(raw_token)
+                    continue
+                current.auth.session(raw_token)
+                await websocket.send_json(event)
+                current.auth.session(raw_token)
+        except AuthenticationError:
+            await websocket.close(code=4401)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            current.chat.unsubscribe(conversation_id, queue)
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
 
     @router.get(
         "/api/v1/projects",
@@ -960,6 +1138,10 @@ def _content_length(scope: Scope) -> int | None:
 
 
 async def _authentication_error(_: Request, exc: AuthenticationError) -> JSONResponse:
+    return _error_response(exc.status_code, exc.code, exc.public_message)
+
+
+async def _chat_error(_: Request, exc: WebChatError) -> JSONResponse:
     return _error_response(exc.status_code, exc.code, exc.public_message)
 
 

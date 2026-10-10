@@ -462,13 +462,21 @@ class SnapshotStore:
         }
 
     def list_snapshots(self, project_id: str, now: int | None = None) -> tuple[dict[str, object], ...]:
+        timestamp = int(time.time()) if now is None else now
         with self.database.connect() as connection:
             ids = connection.execute(
-                "SELECT snapshot_id FROM immutable_snapshots WHERE project_id = ? "
-                "ORDER BY created_at DESC LIMIT 256",
-                (project_id,),
+                "SELECT s.snapshot_id FROM immutable_snapshots s "
+                "WHERE s.project_id = ? AND s.state = 'available' "
+                "AND (s.expires_at > ? OR EXISTS ("
+                "SELECT 1 FROM distributed_tasks t WHERE t.snapshot_id = s.snapshot_id "
+                "AND t.state IN ('queued', 'claimed'))) "
+                "ORDER BY s.created_at DESC, s.snapshot_id DESC LIMIT 256",
+                (project_id, timestamp),
             ).fetchall()
-        return tuple(self.snapshot_status(project_id, row["snapshot_id"], now) for row in ids)
+        return tuple(
+            self.snapshot_status(project_id, row["snapshot_id"], timestamp)
+            for row in ids
+        )
 
     def expire(self, now: int | None = None) -> int:
         timestamp = int(time.time()) if now is None else now

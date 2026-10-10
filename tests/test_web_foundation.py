@@ -207,10 +207,9 @@ class WebFoundationTests(unittest.TestCase):
             self.client.get("/api/v1/projects/00000000000000000000000000000000").status_code,
             404,
         )
-        self.assertFalse(any(
-            "/tools" in path or "/chat" in path
-            for path in self.app.openapi()["paths"]
-        ))
+        paths = self.app.openapi()["paths"]
+        self.assertIn("/api/v1/chat/sessions", paths)
+        self.assertFalse(any("/tools" in path or "/execute" in path for path in paths))
         project_methods = {
             method
             for path, methods in self.app.openapi()["paths"].items()

@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import type { LoginRequest, LoginResponse, SessionResponse } from "../api/contracts";
-import { apiRequest } from "../api/client";
+import { apiRequest, SESSION_EXPIRED_EVENT } from "../api/client";
 
 type AuthState = {
   authenticated: boolean;
@@ -20,7 +20,6 @@ type AuthState = {
 };
 
 const AuthContext = createContext<AuthState | null>(null);
-const CSRF_SESSION_KEY = "synai.csrf";
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [authenticated, setAuthenticated] = useState(false);
@@ -29,7 +28,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
 
   const installSession = useCallback((token: string) => {
-    window.sessionStorage.setItem(CSRF_SESSION_KEY, token);
     setCsrfToken(token);
     setAuthenticated(true);
     setError(null);
@@ -37,6 +35,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let active = true;
+    const onSessionExpired = () => {
+      setAuthenticated(false);
+      setCsrfToken(null);
+    };
+    window.addEventListener(SESSION_EXPIRED_EVENT, onSessionExpired);
     const initialize = async () => {
       try {
         const session = await apiRequest<SessionResponse>("/api/v1/auth/session");
@@ -57,6 +60,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     void initialize();
     return () => {
       active = false;
+      window.removeEventListener(SESSION_EXPIRED_EVENT, onSessionExpired);
     };
   }, [installSession]);
 
@@ -78,7 +82,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(async () => {
     if (!csrfToken) return;
     await apiRequest("/api/v1/auth/logout", { method: "POST" }, csrfToken);
-    window.sessionStorage.removeItem(CSRF_SESSION_KEY);
     setCsrfToken(null);
     setAuthenticated(false);
   }, [csrfToken]);

@@ -13,7 +13,7 @@ from synai.storage import ConversationStorage, checked_path
 class MetadataDatabase:
     """Private, versioned browser-service metadata, separate from conversation history."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, data_root: Path) -> None:
         self.storage = ConversationStorage(data_root)
@@ -30,7 +30,7 @@ class MetadataDatabase:
                 raise ValueError("Web metadata must be a private regular file owned by this user")
         with self.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, self.SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, self.SCHEMA_VERSION}:
                 raise ValueError("Unsupported web metadata schema version")
             if version == 0:
                 connection.executescript(
@@ -107,6 +107,9 @@ class MetadataDatabase:
             current_version = connection.execute("PRAGMA user_version").fetchone()[0]
             if current_version == 2:
                 self._migrate_to_distributed_v3(connection)
+                current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if current_version == 3:
+                self._migrate_to_web_chat_v4(connection)
             elif current_version != self.SCHEMA_VERSION:
                 raise ValueError("Web metadata migration did not reach the current schema version")
         os.chmod(self.path, 0o600)
@@ -241,6 +244,45 @@ class MetadataDatabase:
                     UNIQUE(legacy_identity, project_id)
                 );
                 PRAGMA user_version = 3;
+                COMMIT;
+                """
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_to_web_chat_v4(connection: sqlite3.Connection) -> None:
+        try:
+            connection.executescript(
+                """
+                BEGIN EXCLUSIVE;
+                CREATE TABLE web_conversations (
+                    conversation_id TEXT PRIMARY KEY
+                        CHECK(length(conversation_id) = 32),
+                    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+                    project_id TEXT REFERENCES logical_projects(project_id),
+                    title TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    event_sequence INTEGER NOT NULL DEFAULT 0
+                        CHECK(event_sequence >= 0)
+                );
+                CREATE INDEX web_conversations_recent
+                    ON web_conversations(updated_at DESC, conversation_id);
+                CREATE INDEX web_conversations_project
+                    ON web_conversations(project_id, updated_at DESC);
+                CREATE TABLE web_chat_events (
+                    conversation_id TEXT NOT NULL
+                        REFERENCES web_conversations(conversation_id) ON DELETE CASCADE,
+                    sequence INTEGER NOT NULL CHECK(sequence > 0),
+                    created_at INTEGER NOT NULL,
+                    event_json TEXT NOT NULL,
+                    PRIMARY KEY(conversation_id, sequence)
+                );
+                PRAGMA user_version = 4;
                 COMMIT;
                 """
             )

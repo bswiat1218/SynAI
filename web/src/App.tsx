@@ -1,5 +1,16 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { Menu, PanelsTopLeft, X } from "lucide-react";
+import {
+  Bot,
+  FolderKanban,
+  LayoutDashboard,
+  Menu,
+  MessageSquare,
+  PanelsTopLeft,
+  Settings2,
+  Smartphone,
+  SquareTerminal,
+  X,
+} from "lucide-react";
 import { useState, type FormEvent } from "react";
 import {
   BrowserRouter,
@@ -10,12 +21,22 @@ import {
   Route,
   Routes,
   useLocation,
-  useParams,
 } from "react-router-dom";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import { Button } from "./components/ui/button";
 import { Card, CardTitle } from "./components/ui/card";
 import { Separator } from "./components/ui/separator";
+import {
+  AgentTasksPage,
+  ChatPage,
+  clearChatDrafts,
+  CommandCenter,
+  DevicesPage,
+  ProjectsPage,
+  SandboxesPage,
+  SettingsPage,
+  WorkbenchPage,
+} from "./pages";
 
 export function App() {
   return (
@@ -38,7 +59,19 @@ export function AppRoutes() {
       <Route element={<RequireAuthentication />}>
         <Route element={<ApplicationShell />}>
           <Route path="/" element={<CommandCenter />} />
-          <Route path="/workbench/:projectId" element={<Workbench />} />
+          <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:conversationId" element={<ChatPage />} />
+          <Route path="/projects" element={<ProjectsPage />} />
+          <Route path="/projects/:projectId/chat" element={<ChatPage />} />
+          <Route path="/projects/:projectId/chat/:conversationId" element={<ChatPage />} />
+          <Route path="/projects/:projectId/agent-tasks" element={<AgentTasksPage />} />
+          <Route path="/workbench/:projectId/chat" element={<WorkbenchPage />} />
+          <Route path="/workbench/:projectId/chat/:conversationId" element={<WorkbenchPage />} />
+          <Route path="/workbench/:projectId" element={<WorkbenchPage />} />
+          <Route path="/agent-tasks" element={<AgentTasksPage />} />
+          <Route path="/devices" element={<DevicesPage />} />
+          <Route path="/sandboxes" element={<SandboxesPage />} />
+          <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<NotFound />} />
         </Route>
       </Route>
@@ -52,9 +85,7 @@ function RequireAuthentication() {
   if (auth.loading) {
     return <main className="center-state" aria-live="polite">Checking your session…</main>;
   }
-  if (auth.error) {
-    return <ErrorState message={auth.error} />;
-  }
+  if (auth.error) return <ErrorState message={auth.error} />;
   if (!auth.authenticated) {
     return <Navigate to="/login" replace state={{ from: location.pathname }} />;
   }
@@ -68,6 +99,7 @@ function ApplicationShell() {
   const logout = async () => {
     try {
       await auth.logout();
+      clearChatDrafts();
     } catch {
       setLogoutError("Could not end the session. Try again.");
     }
@@ -75,10 +107,11 @@ function ApplicationShell() {
   return (
     <div className="application-shell">
       <header className="topbar">
-        <div className="brand">
+        <Link className="brand" to="/" aria-label="SynAI Command Center">
           <PanelsTopLeft aria-hidden="true" size={20} />
           <span>SynAI</span>
-        </div>
+          <span className="brand-version">2.0</span>
+        </Link>
         <Dialog.Root open={mobileNavigationOpen} onOpenChange={setMobileNavigationOpen}>
           <Dialog.Trigger asChild>
             <Button className="mobile-menu-trigger" variant="secondary" aria-label="Open navigation">
@@ -99,16 +132,20 @@ function ApplicationShell() {
           </Dialog.Portal>
         </Dialog.Root>
         <div className="topbar-actions">
-          <span className="session-label">Single-user session</span>
+          <span className="session-label"><span className="status-dot status-dot-good" />Authenticated browser session</span>
           <Button variant="ghost" onClick={() => void logout()}>Sign out</Button>
         </div>
       </header>
       <div className="shell-body">
-        <aside className="sidebar" aria-label="Primary navigation">
+        <aside className="sidebar" aria-label="Application navigation">
           <Navigation />
+          <div className="sidebar-footer">
+            <span className="eyebrow">Phase 13D</span>
+            <span>Chat only · execution disabled</span>
+          </div>
         </aside>
         <main className="page-content">
-          {logoutError && <ErrorNotice message={logoutError} />}
+          {logoutError && <p className="error-message" role="alert">{logoutError}</p>}
           <Outlet />
         </main>
       </div>
@@ -117,10 +154,25 @@ function ApplicationShell() {
 }
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
+  const entries = [
+    { to: "/", label: "Command Center", icon: LayoutDashboard, end: true },
+    { to: "/chat", label: "Chat", icon: MessageSquare },
+    { to: "/projects", label: "Projects", icon: FolderKanban },
+    { to: "/agent-tasks", label: "Agent Tasks", icon: Bot },
+    { to: "/devices", label: "Devices", icon: Smartphone },
+    { to: "/sandboxes", label: "Sandboxes", icon: SquareTerminal },
+    { to: "/settings", label: "Settings", icon: Settings2 },
+  ];
   return (
     <nav className="navigation" aria-label="Primary navigation">
-      <NavLink to="/" end onClick={onNavigate}>Project Command Center</NavLink>
-      <NavLink to="/workbench/demo" onClick={onNavigate}>Developer Workbench</NavLink>
+      <span className="nav-section-label">Workspace</span>
+      {entries.map(({ to, label, icon: Icon, end }) => (
+        <NavLink key={to} to={to} end={end} onClick={onNavigate}>
+          <Icon aria-hidden="true" size={17} />
+          <span>{label}</span>
+          {label === "Agent Tasks" && <span className="nav-badge">disabled</span>}
+        </NavLink>
+      ))}
     </nav>
   );
 }
@@ -135,7 +187,7 @@ function LoginPage() {
     try {
       await auth.login(password);
     } catch {
-      // The provider stores a bounded public error for rendering.
+      // AuthContext provides a bounded public error message.
     } finally {
       setSubmitting(false);
     }
@@ -147,6 +199,7 @@ function LoginPage() {
     <main className="login-page">
       <Card className="login-card">
         <div className="brand login-brand"><PanelsTopLeft aria-hidden="true" size={20} /><span>SynAI</span></div>
+        <span className="eyebrow">Secure browser access</span>
         <CardTitle>Sign in</CardTitle>
         <p className="muted-copy">Use the credential configured by your SynAI operator.</p>
         <form className="login-form" onSubmit={(event) => void submit(event)}>
@@ -167,66 +220,9 @@ function LoginPage() {
           </Button>
         </form>
         <Separator />
-        <p className="muted-copy text-xs">SynAI web mode does not execute tools or modify projects.</p>
+        <p className="muted-copy text-xs">Browser chat has no tools, filesystem access, or task execution authority.</p>
       </Card>
     </main>
-  );
-}
-
-function CommandCenter() {
-  return (
-    <section className="content-stack">
-      <div>
-        <p className="eyebrow">Workspace overview</p>
-        <h1>Project Command Center</h1>
-        <p className="muted-copy">A read-only foundation for your registered SynAI workspaces.</p>
-      </div>
-      <div className="content-grid">
-        <Card>
-          <p className="eyebrow">Projects</p>
-          <CardTitle>No project selected</CardTitle>
-          <p className="muted-copy">Projects become available after an operator-configured workspace is registered.</p>
-        </Card>
-        <Card>
-          <p className="eyebrow">Activity</p>
-          <CardTitle>Ready for your workspace</CardTitle>
-          <p className="muted-copy">Chat and Agent Task execution are disabled in this foundation phase.</p>
-        </Card>
-      </div>
-      <Button asChild variant="secondary"><Link to="/workbench/demo">Open Workbench shell</Link></Button>
-    </section>
-  );
-}
-
-function Workbench() {
-  const { projectId } = useParams();
-  return (
-    <section className="content-stack">
-      <div>
-        <p className="eyebrow">Developer Workbench</p>
-        <h1>Workbench shell</h1>
-        <p className="muted-copy">Project {projectId ?? "not selected"} · read-only foundation</p>
-      </div>
-      <div className="workbench-grid">
-        <Card className="workbench-pane">
-          <p className="eyebrow">Project</p>
-          <CardTitle>Workspace context</CardTitle>
-          <p className="muted-copy">Registered project metadata will appear here.</p>
-        </Card>
-        <Card className="workbench-pane workbench-main">
-          <p className="eyebrow">Conversation</p>
-          <CardTitle>Execution is disabled</CardTitle>
-          <p className="muted-copy">No chat, streaming, tools, or task execution is exposed in Phase 13B.</p>
-        </Card>
-        <aside className="details-pane" aria-label="Resizable details pane">
-          <Card className="workbench-pane">
-            <p className="eyebrow">Details</p>
-            <CardTitle>Project details</CardTitle>
-            <p className="muted-copy">A future workbench panel.</p>
-          </Card>
-        </aside>
-      </div>
-    </section>
   );
 }
 
@@ -248,13 +244,9 @@ function ErrorState({ message }: { message: string }) {
     <main className="center-state">
       <Card>
         <CardTitle>Service unavailable</CardTitle>
-        <ErrorNotice message={message} />
+        <p className="error-message" role="alert">{message}</p>
         <Button variant="secondary" onClick={() => window.location.reload()}>Try again</Button>
       </Card>
     </main>
   );
-}
-
-function ErrorNotice({ message }: { message: string }) {
-  return <p className="error-message" role="alert">{message}</p>;
 }

@@ -180,6 +180,13 @@ class DistributedFoundationTests(unittest.TestCase):
         self.assertEqual(sum(isinstance(value, DistributedError) for value in outcomes), 1)
 
     def test_device_auth_replay_expiration_revocation_and_credential_rotation(self) -> None:
+        metadata = self.registry.device_metadata(self.device_id, now=1006)
+        self.assertEqual(metadata["state"], "authorized")
+        self.assertEqual(metadata["last_authenticated_activity_at"], 1005)
+        self.assertTrue(metadata["recently_active"])
+        self.assertEqual(metadata["connection_state"], "not_supported")
+        self.assertFalse(metadata["connected"])
+
         with self.assertRaises(DistributedError) as replay:
             timestamp, nonce = 1005, "replay-nonce-abcdefghijkl"
             signature = base64.b64encode(self.key.sign(device_request_message(
@@ -508,6 +515,54 @@ class DistributedFoundationTests(unittest.TestCase):
             restarted.upload_status(self.principal, abandoned["upload_id"], now=now + 51)
         self.assertEqual(upload_expired.exception.code, "upload_expired")
 
+    def test_snapshot_listing_isolates_expired_records_and_retains_task_sources(self) -> None:
+        now = int(time.time())
+        snapshot_ids: list[str] = []
+        for index, content in enumerate((b"expired", b"retained", b"available")):
+            manifest = [{
+                "path": f"source-{index}.txt",
+                "file_type": "regular",
+                "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }]
+            upload = self.snapshots.begin(
+                self.principal,
+                str(self.project.project_id),
+                str(self.binding.binding_id),
+                manifest,
+                idempotency_key=f"mixed-snapshot-listing-{index:02d}",
+                now=now,
+            )
+            self.snapshots.accept_chunk(
+                self.principal, str(upload["upload_id"]), 0, 0, content, now=now + 1,
+            )
+            snapshot = self.snapshots.commit(
+                self.principal, str(upload["upload_id"]), now=now + 2,
+            )
+            snapshot_ids.append(str(snapshot["snapshot_id"]))
+
+        retained_task = self.registry.create_disabled_task_contract(
+            str(self.project.project_id), snapshot_ids[1], (), now=now + 2,
+        )
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE immutable_snapshots SET expires_at = ? WHERE snapshot_id IN (?, ?)",
+                (now + 1, snapshot_ids[0], snapshot_ids[1]),
+            )
+            connection.execute(
+                "UPDATE distributed_tasks SET state = 'queued' WHERE task_id = ?",
+                (str(retained_task.task_id),),
+            )
+
+        listed = self.snapshots.list_snapshots(str(self.project.project_id), now=now + 4)
+        listed_ids = [str(snapshot["snapshot_id"]) for snapshot in listed]
+        self.assertEqual(listed_ids, sorted([snapshot_ids[1], snapshot_ids[2]], reverse=True))
+        with self.assertRaises(DistributedError) as expired:
+            self.snapshots.snapshot_status(
+                str(self.project.project_id), snapshot_ids[0], now=now + 4,
+            )
+        self.assertEqual(expired.exception.code, "snapshot_expired")
+
     def test_memory_preview_is_read_only_and_does_not_touch_legacy_projects(self) -> None:
         with self.database.connect() as connection:
             before = connection.execute("SELECT count(*) FROM memory_associations").fetchone()[0]
@@ -546,7 +601,7 @@ class DistributedFoundationTests(unittest.TestCase):
         os.chmod(path, 0o600)
         legacy_database.initialize()
         with legacy_database.connect() as migrated:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(migrated.execute("SELECT project_id FROM projects").fetchone()[0], "legacy-project")
             self.assertEqual(migrated.execute("SELECT token_hash FROM sessions").fetchone()[0], "session-hash")
             self.assertEqual(migrated.execute("SELECT count(*) FROM logical_projects").fetchone()[0], 0)
