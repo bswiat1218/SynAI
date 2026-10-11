@@ -14,7 +14,6 @@ from synai.history import History, HistoryError, ManagedHistory
 from synai.models import Session
 from synai.sandbox import Sandbox, SandboxError
 from synai.storage import ConversationStorage, SOURCE
-import test_menu as menus
 
 
 class StorageTests(unittest.TestCase):
