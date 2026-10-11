@@ -11,6 +11,8 @@ from typing import Any
 
 from synai.broker.protocol import BrokerError, OperationKind, canonical_json
 from synai.broker.snapshots import MAX_FILE_BYTES, validate_relative_path
+from synai.broker.filesystem import Directory, directory_access, open_beneath, mount_identity
+from collections.abc import Callable
 
 
 _COMMANDS = frozenset({"python3", "pytest", "git", "ruff", "npm"})
@@ -92,16 +94,32 @@ def validate_claim_operation(claim_kind: str, request_kind: str, arguments: obje
     return validate_operation(request_kind, arguments)
 
 
-def execute_file_operation(workspace: Path, kind: str, arguments: dict[str, Any], output_limit: int) -> dict[str, Any]:
+def execute_file_operation(workspace: Path | Directory, kind: str, arguments: dict[str, Any], output_limit: int) -> dict[str, Any]:
+    with directory_access(workspace) as authority:
+        return _execute_file_operation(authority, kind, arguments, output_limit)
+
+
+def _execute_file_operation(workspace: Directory, kind: str, arguments: dict[str, Any], output_limit: int) -> dict[str, Any]:
     """Perform bounded workspace-only file operations using no-follow dirfds."""
     arguments = validate_operation(kind, arguments)
-    root_fd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    root_fd = os.dup(workspace.fd)
     try:
         parent_fd, name = _parent_fd(root_fd, arguments["path"]) if arguments.get("path") != "." else (os.dup(root_fd), ".")
         try:
+            identity = mount_identity(parent_fd)
+
+            def verify_parent() -> None:
+                workspace.revalidate()
+                fresh, _ = _parent_fd(root_fd, arguments["path"]) if arguments["path"] != "." else (os.dup(root_fd), ".")
+                try:
+                    if mount_identity(fresh) != identity:
+                        raise BrokerError("filesystem_identity_changed", "Workspace parent was substituted.", 409)
+                finally:
+                    os.close(fresh)
+
             if kind == "list_files":
-                target_fd = os.dup(root_fd) if name == "." else os.open(
-                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd,
+                target_fd = os.dup(root_fd) if name == "." else open_beneath(
+                    parent_fd, name, os.O_RDONLY | os.O_DIRECTORY,
                 )
                 try:
                     result = sorted(os.listdir(target_fd))
@@ -119,6 +137,7 @@ def execute_file_operation(workspace: Path, kind: str, arguments: dict[str, Any]
             if kind == "delete_file":
                 data = _read_at(parent_fd, name)
                 _check_preimage(data, arguments["expected_sha256"])
+                verify_parent()
                 os.unlink(name, dir_fd=parent_fd)
                 os.fsync(parent_fd)
                 return {"deleted": True, "preimage_sha256": hashlib.sha256(data).hexdigest()}
@@ -130,7 +149,7 @@ def execute_file_operation(workspace: Path, kind: str, arguments: dict[str, Any]
                     raise BrokerError("preimage_conflict", "Workspace file existence changed before write.", 409)
                 if existing is not None:
                     _check_preimage(existing, expected)
-                _atomic_write(parent_fd, name, data)
+                _atomic_write(parent_fd, name, data, verify_parent)
                 return {
                     "written": True,
                     "preimage_sha256": None if existing is None else hashlib.sha256(existing).hexdigest(),
@@ -145,7 +164,7 @@ def execute_file_operation(workspace: Path, kind: str, arguments: dict[str, Any]
                 updated = text.replace(arguments["old"], arguments["new"], 1).encode("utf-8")
                 if len(updated) > MAX_FILE_BYTES:
                     raise BrokerError("operation_too_large", "Patched file exceeds its size limit.", 413)
-                _atomic_write(parent_fd, name, updated)
+                _atomic_write(parent_fd, name, updated, verify_parent)
                 return {
                     "written": True,
                     "preimage_sha256": hashlib.sha256(existing).hexdigest(),
@@ -171,13 +190,14 @@ def _parent_fd(root_fd: int, path: str) -> tuple[int, str]:
     current = os.dup(root_fd)
     try:
         for component in parts[:-1]:
-            next_fd = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=current,
+            next_fd = open_beneath(
+                current, component, os.O_RDONLY | os.O_DIRECTORY,
             )
             os.close(current)
             current = next_fd
+            info = os.fstat(current)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                raise BrokerError("filesystem_ownership_invalid", "Workspace parent is untrusted.", 409)
         return current, parts[-1]
     except BaseException:
         os.close(current)
@@ -186,12 +206,12 @@ def _parent_fd(root_fd: int, path: str) -> tuple[int, str]:
 
 def _read_optional_at(parent_fd: int, name: str) -> bytes | None:
     try:
-        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+        descriptor = open_beneath(parent_fd, name, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     try:
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES or info.st_uid != os.geteuid():
             raise BrokerError("file_type_unsupported", "Only bounded regular workspace files are supported.", 422)
         data = bytearray()
         while len(data) <= MAX_FILE_BYTES:
@@ -218,11 +238,11 @@ def _check_preimage(data: bytes, expected: str) -> None:
         raise BrokerError("preimage_conflict", "Workspace file changed since its approved preimage.", 409)
 
 
-def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
+def _atomic_write(parent_fd: int, name: str, data: bytes, verify_parent: Callable[[], None]) -> None:
+    verify_parent()
     temporary = f".synai-{secrets.token_hex(16)}.tmp"
-    descriptor = os.open(
-        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600, dir_fd=parent_fd,
+    descriptor = open_beneath(
+        parent_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
     )
     try:
         view = memoryview(data)
@@ -238,6 +258,7 @@ def _atomic_write(parent_fd: int, name: str, data: bytes) -> None:
     finally:
         os.close(descriptor)
     try:
+        verify_parent()
         # Do not replace a symlink or directory even though the parent is held.
         existing = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(existing.st_mode):

@@ -4,11 +4,15 @@ import logging
 import os
 import stat
 import sys
+from collections.abc import Callable
+from typing import TextIO
 
 import uvicorn
 
 from synai.broker.app import BrokerService, create_app
 from synai.broker.config import BrokerConfig
+from synai.broker.filesystem import Directory, mount_identity
+from synai.broker.protocol import BrokerError
 
 
 def main() -> None:
@@ -26,7 +30,11 @@ def main() -> None:
             or not service.quota_manager.verify_storage_role(log_role.role_id)
         ):
             raise RuntimeError("Bounded Broker log storage could not be verified")
-        _configure_bounded_logging(config)
+        authority = service.quota_manager.open_storage_role(log_role.role_id)
+        _configure_bounded_logging(
+            config, authority=authority,
+            on_failure=lambda: service._invalidate_storage_readiness("logging_authority_lost"),
+        )
         uvicorn.run(
             create_app(service), host="127.0.0.1", port=config.listen_port,
             ssl_certfile=str(config.broker_cert_file),
@@ -42,51 +50,25 @@ def main() -> None:
         raise SystemExit(1) from exc
 
 
-def _configure_bounded_logging(config: BrokerConfig) -> None:
+def _configure_bounded_logging(config: BrokerConfig, *, authority: Directory | None = None,
+                               on_failure: Callable[[], None] | None = None) -> None:
     role = next(
         (item for item in config.storage_roles if item.kind == "broker_logs"),
         None,
     )
     if role is None:
         raise RuntimeError("Broker log storage role is not configured")
-    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    authority = authority or Directory(role.path, owner_uid=config.service_uid,
+                                      owner_gid=config.service_gid, private=True)
     try:
-        for component in role.path.parts[1:]:
-            next_directory = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=directory,
-            )
-            os.close(directory)
-            directory = next_directory
-            parent_info = os.fstat(directory)
-            if (
-                not stat.S_ISDIR(parent_info.st_mode)
-                or parent_info.st_uid not in {0, config.service_uid}
-                or (
-                    parent_info.st_mode & 0o022
-                    and not (
-                        parent_info.st_uid == 0
-                        and parent_info.st_mode & stat.S_ISVTX
-                    )
-                )
-            ):
-                raise RuntimeError("Broker log path contains an unprotected directory")
-        directory_info = os.fstat(directory)
-        if (
-            directory_info.st_uid != config.service_uid
-            or directory_info.st_gid != config.service_gid
-            or directory_info.st_mode & 0o077
-        ):
-            raise RuntimeError("Broker log directory ownership or permissions are unsafe")
-        descriptor = os.open(
+        descriptor = authority.open(
             "broker.log",
             os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
-            dir_fd=directory,
         )
-    finally:
-        os.close(directory)
+    except BaseException:
+        authority.close()
+        raise
     info = os.fstat(descriptor)
     if (
         not stat.S_ISREG(info.st_mode)
@@ -95,9 +77,10 @@ def _configure_bounded_logging(config: BrokerConfig) -> None:
         or info.st_mode & 0o077
     ):
         os.close(descriptor)
+        authority.close()
         raise RuntimeError("Broker log file ownership or permissions are unsafe")
     stream = os.fdopen(descriptor, "a", encoding="utf-8", buffering=1)
-    handler = logging.StreamHandler(stream)
+    handler = _PinnedLogHandler(stream, authority, mount_identity(descriptor), on_failure)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root = logging.getLogger()
     root.handlers[:] = [handler]
@@ -109,6 +92,43 @@ def _configure_bounded_logging(config: BrokerConfig) -> None:
     access = logging.getLogger("uvicorn.access")
     access.handlers.clear()
     access.disabled = True
+
+
+class _PinnedLogHandler(logging.StreamHandler):
+    def __init__(self, stream: TextIO, authority: Directory,
+                 identity: tuple[int, int, int], on_failure: Callable[[], None] | None = None) -> None:
+        super().__init__(stream)
+        self.authority = authority
+        self.identity = identity
+        self.on_failure = on_failure
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._emit_verified(record)
+        except (BrokerError, OSError, RuntimeError):
+            if self.on_failure is not None:
+                self.on_failure()
+            raise
+
+    def _emit_verified(self, record: logging.LogRecord) -> None:
+        self.authority.revalidate()
+        descriptor = self.authority.open("broker.log", os.O_PATH)
+        try:
+            if mount_identity(descriptor) != self.identity:
+                raise RuntimeError("Broker log file was substituted; logging refused")
+        finally:
+            os.close(descriptor)
+        if self.stream is None:
+            raise RuntimeError("Broker log stream is unavailable")
+        self.stream.write(self.format(record) + self.terminator)
+        self.flush()
+        self.authority.revalidate()
+
+    def close(self) -> None:
+        if self.stream is not None:
+            self.stream.close()
+        self.authority.close()
+        super().close()
 
 
 if __name__ == "__main__":

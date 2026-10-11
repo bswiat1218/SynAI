@@ -16,6 +16,7 @@ from typing import Any, Literal
 from synai.broker.config import BrokerConfig, BrokerReadiness
 from synai.broker.protocol import BrokerError
 from synai.broker.registry import BrokerRegistry
+from synai.broker.filesystem import Directory
 
 
 ContainmentState = Literal[
@@ -45,6 +46,7 @@ class RootlessPodmanRuntime:
         self.image_id: str | None = None
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self.workspace_resolver: Callable[[str], Path] | None = None
+        self.workspace_authority: Callable[[str], Directory] | None = None
         self.storage_containment_check: Callable[[], bool] | None = None
         self._containment_locks: dict[str, asyncio.Lock] = {}
 
@@ -180,7 +182,22 @@ class RootlessPodmanRuntime:
             raise BrokerError("broker_not_ready", "Broker startup verification has not completed.", 503)
         if not self.readiness.execution_available:
             raise BrokerError("execution_unavailable", "Required rootless container isolation is not available.", 503)
-        container = await self._run(
+        if self.workspace_authority is None:
+            raise BrokerError("bind_source_unverified", "Pinned workspace authority is unavailable.", 503)
+        with self.workspace_authority(task_id) as source:
+            record = self.registry.container_record(task_id)
+            if source.path != workspace or record is None or record["allocation_id"] != allocation_id:
+                raise BrokerError("bind_source_unverified", "Workspace allocation identity is inconsistent.", 503)
+            source.revalidate()
+        # Podman CLI resolves the source later; no accepted descriptor handoff exists.
+        raise BrokerError(
+            "bind_source_resolution_unaccepted",
+            "External runtime bind-source resolution has not passed identity-preserving acceptance.",
+            503,
+        )
+
+    def create_arguments(self, task_id: str, allocation_id: str, workspace: Path) -> tuple[str, ...]:
+        return (
             "create", "--name", f"synai-task-{allocation_id}",
             "--label", f"synai.broker.allocation={allocation_id}",
             "--label", f"synai.broker.task={task_id}",
@@ -201,17 +218,13 @@ class RootlessPodmanRuntime:
             "--workdir", "/workspace",
             self.config.image,
             "sleep", "infinity",
-            timeout=15, maximum=4096,
         )
-        container_id = container.strip()
-        if len(container_id) != 64 or any(char not in "0123456789abcdef" for char in container_id):
-            raise BrokerError("runtime_response_invalid", "Podman returned an invalid container identity.", 502)
-        return container_id
 
     async def start_owned(self, task_id: str) -> None:
         lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
             self.registry.require_execution_authority()
+            self._require_accepted_execution_source(task_id)
             owned = self.registry.owned_container(task_id)
             await self.inspect_owned(task_id)
             await self._run("start", owned["container_id"], timeout=15, maximum=4096)
@@ -619,6 +632,7 @@ class RootlessPodmanRuntime:
         self, task_id: str, argv: list[str], cwd: str, timeout: int, output_limit: int,
     ) -> dict[str, Any]:
         self.registry.require_execution_authority()
+        self._require_accepted_execution_source(task_id)
         owned = self.registry.owned_container(task_id)
         await self.inspect_owned(task_id)
         workdir = "/workspace" if cwd == "." else f"/workspace/{cwd}"
@@ -673,6 +687,17 @@ class RootlessPodmanRuntime:
             "timed_out": False,
             "resource_limit_failure": False,
         }
+
+    def _require_accepted_execution_source(self, task_id: str) -> None:
+        if self.workspace_authority is None:
+            raise BrokerError("bind_source_unverified", "Verified workspace authority is unavailable.", 503)
+        with self.workspace_authority(task_id) as source:
+            source.revalidate()
+        raise BrokerError(
+            "bind_source_resolution_unaccepted",
+            "Actual runtime mount-source identity requires later acceptance; execution is refused.",
+            503,
+        )
 
     async def wait_cancelled_operation(self, task_id: str) -> None:
         process = self._active_processes.get(task_id)

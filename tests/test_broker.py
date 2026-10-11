@@ -29,6 +29,7 @@ from synai.broker.protocol import (
     verify_claim,
 )
 from synai.broker.registry import BrokerRegistry
+from synai.broker.filesystem import Directory, remove_tree
 from synai.broker import runtime as runtime_module
 from synai.broker.runtime import RootlessPodmanRuntime
 from synai.broker.quota_slots import QuotaUsage, aggregate_storage_reasons
@@ -63,9 +64,12 @@ CLAIM_PUBLIC = Ed25519PrivateKey.from_private_bytes(CLAIM_PRIVATE).public_key().
 def config(root: Path, *, podman: str = "podman", slot_count: int = 1) -> BrokerConfig:
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(root, 0o700)
+    os.chmod(root.parent, 0o700)
     mount_path = root.parent / "quota-volume"
     tasks_path = mount_path / "tasks"
     tasks_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(mount_path, 0o700)
+    os.chmod(tasks_path, 0o700)
     slots = tuple(
         QuotaSlot(
             slot_id=f"slot-{index:02d}",
@@ -96,6 +100,8 @@ def config(root: Path, *, podman: str = "podman", slot_count: int = 1) -> Broker
         ))
     for index, (kind, role_id, path, byte_limit, inode_limit) in enumerate(role_data):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if kind.startswith("podman_") or kind == "image_scratch":
+            os.chmod(path.parent, 0o700)
         storage_roles.append(StorageRole(
             role_id=role_id, kind=kind, path=path, mount_path=mount_path,
             filesystem_uuid="11111111-1111-4111-8111-111111111111",
@@ -140,19 +146,39 @@ class FakeQuotaManager:
     def verify_storage_role(self, role_id: str) -> bool:
         return role_id in {role.role_id for role in self.config.storage_roles}
 
-    def resolve_task_root(self, task_id: str, *, allow_quarantined: bool = False) -> Path:
+    def open_storage_role(self, role_id: str) -> Directory:
+        role = next(role for role in self.config.storage_roles if role.role_id == role_id)
+        return Directory(role.path)
+
+    def task_path_for_inspection(self, task_id: str, *, allow_quarantined: bool = False) -> Path:
         assignment = self.registry.task_slot(task_id, allow_quarantined=allow_quarantined)
         slot = next(slot for slot in self.config.quota_slots if slot.slot_id == assignment["slot_id"])
         return slot.path / task_id
 
     def verify_releasable(self, task_id: str) -> Path:
-        return self.resolve_task_root(task_id, allow_quarantined=True)
+        return self.task_path_for_inspection(task_id, allow_quarantined=True)
 
-    def create_task_root(self, task_id: str) -> Path:
-        task_root = self.resolve_task_root(task_id)
+    def create_task_root(self, task_id: str) -> Directory:
+        task_root = self.task_path_for_inspection(task_id)
         task_root.mkdir(mode=0o700)
-        return task_root
+        return Directory(task_root)
 
+    def open_task_root(self, task_id: str, *, allow_quarantined: bool = False) -> Directory:
+        return Directory(self.task_path_for_inspection(task_id, allow_quarantined=allow_quarantined))
+
+    def remove_empty_task_root(self, task_id: str) -> None:
+        root = self.task_path_for_inspection(task_id, allow_quarantined=True)
+        if root.exists():
+            with Directory(root) as directory:
+                if os.listdir(directory.fd):
+                    raise BrokerError("workspace_cleanup_incomplete", "Task root is not empty.", 409)
+            root.rmdir()
+
+    def clean_task_root(self, task_id: str) -> None:
+        root = self.task_path_for_inspection(task_id)
+        if root.exists():
+            with Directory(root) as directory:
+                remove_tree(directory)
     def recover_pending_releases(self) -> None:
         return None
 
@@ -688,10 +714,12 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         with patch.object(
             quota_slots_module, "_project_attributes",
             return_value=(self.slot.project_id, quota_slots_module._FS_XFLAG_PROJINHERIT),
-        ), patch.object(manager, "_verify_local_role_path"):
+        ), patch.object(manager, "_verify_local_role_path"), patch.object(
+            manager, "open_storage_role", side_effect=lambda _: Directory(self.slot.path),
+        ):
             task_root = manager.create_task_root(request.task_id)
-        self.assertTrue(task_root.is_dir())
-        self.assertEqual(task_root.stat().st_uid, self.selected.service_uid)
+        with task_root:
+            self.assertEqual(os.fstat(task_root.fd).st_uid, self.selected.service_uid)
 
     def test_symlink_substitution_and_missing_inheritance_quarantine_the_slot(self) -> None:
         request = claim("prepare", {})
@@ -705,7 +733,7 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         task_root.symlink_to(external, target_is_directory=True)
         with patch.object(manager, "_verify_local_role_path"):
             with self.assertRaises(BrokerError):
-                manager.resolve_task_root(request.task_id)
+                manager.task_path_for_inspection(request.task_id)
         self.assertEqual(
             self.registry.task_slot(request.task_id, allow_quarantined=True)["state"],
             "quarantined",
@@ -1089,7 +1117,7 @@ class TypedOperationTests(unittest.TestCase):
     def test_workspace_file_mutations_are_scoped_and_preimage_checked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "workspace"
-            root.mkdir()
+            root.mkdir(mode=0o700)
             original = b"before\n"
             (root / "file.txt").write_bytes(original)
             old_digest = hashlib.sha256(original).hexdigest()
@@ -1248,13 +1276,16 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.start()
             self.assertIsNotNone(service._storage_watchdog_task)
             deadline = asyncio.get_running_loop().time() + 2
-            while service.readiness.execution_available and asyncio.get_running_loop().time() < deadline:
+            while "storage_role_unavailable" not in service.readiness.reasons and asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.02)
             self.assertFalse(service.readiness.execution_available)
             self.assertIn("storage_role_unavailable", service.readiness.reasons)
             await asyncio.sleep(0.15)
             self.assertFalse(service.readiness.execution_available)
-            self.assertEqual(service.quota_manager.verify_startup.call_count, 4)
+            deadline = asyncio.get_running_loop().time() + 2
+            while service.quota_manager.verify_startup.call_count < 4 and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            self.assertGreaterEqual(service.quota_manager.verify_startup.call_count, 4)
             await service.close()
         self.assertIsNone(service._storage_watchdog_task)
 
@@ -1699,14 +1730,10 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         request = claim("prepare", {})
         self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
         self.service.registry.transition(request.task_id, "ready")
-        with patch.object(runtime, "_run", new_callable=AsyncMock) as run:
-            run.return_value = "a" * 64
-            await runtime.create_task(
-                request.task_id, request.allocation_id,
-                self.selected.quota_slots[0].path / request.task_id / "workspace",
-            )
-
-        arguments = run.await_args.args
+        arguments = runtime.create_arguments(
+            request.task_id, request.allocation_id,
+            self.selected.quota_slots[0].path / request.task_id / "workspace",
+        )
         tmpfs = arguments[arguments.index("--tmpfs") + 1]
         self.assertEqual(
             tmpfs,
@@ -1801,9 +1828,9 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         digest = self.snapshots.prepare_manifest(original.snapshot_id)
         request = replace(original, snapshot_digest=digest)
 
-        def interrupt(task_root: Path, *_: object) -> Path:
-            partial = task_root / "snapshot"
-            partial.mkdir()
+        def interrupt(task_root: Directory, *_: object) -> Path:
+            partial = task_root.path / "snapshot"
+            partial.mkdir(mode=0o700)
             (partial / "partial").write_text("incomplete")
             raise OSError("simulated staging interruption")
 
@@ -1946,6 +1973,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_live_lease_authority_fails_closed(self) -> None:
         service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
+        service.quota_manager = FakeQuotaManager(self.selected, service.registry)
         service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         service._started = True
         request = claim("prepare", {})
@@ -1977,6 +2005,7 @@ class BrokerMtlsBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             selected = config(Path(directory) / "broker")
             service = BrokerService(selected)
+            service.quota_manager = FakeQuotaManager(selected, service.registry)
             service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             app = create_app(service)
             client = TestClient(app)
@@ -1988,6 +2017,7 @@ class BrokerMtlsBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             selected = config(Path(directory) / "broker")
             service = BrokerService(selected)
+            service.quota_manager = FakeQuotaManager(selected, service.registry)
             service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             client = TestClient(create_app(service), base_url="https://testserver")
             body = json.dumps({

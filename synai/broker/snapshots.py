@@ -5,13 +5,13 @@ import base64
 import json
 import os
 import re
-import shutil
 import stat
 import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from synai.broker.protocol import BrokerError, canonical_json
+from synai.broker.filesystem import Directory, directory_access, read_file, walk_files, write_new
 
 
 MAX_FILES = 500
@@ -82,93 +82,50 @@ def validate_snapshot(manifest: object, expected_snapshot: str, expected_digest:
     return manifest
 
 
-def stage_snapshot(task_root: Path, manifest: dict[str, Any], files: dict[str, bytes]) -> Path:
-    try:
-        info = task_root.lstat()
-    except OSError as exc:
-        raise BrokerError(
-            "task_workspace_unavailable",
-            "Quota-assigned task workspace was not provisioned before staging.",
-            409,
-        ) from exc
-    if (
-        not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-        or task_root.is_symlink() or any(task_root.iterdir())
-    ):
-        raise BrokerError("task_workspace_exists", "Task workspace is not an empty assigned task directory.", 409)
-    source = task_root / "snapshot"
-    work = task_root / "workspace"
-    source.mkdir(mode=0o700)
-    try:
-        manifest_bytes = canonical_json(manifest)
-        manifest_path = task_root / "manifest.json"
-        manifest_descriptor = os.open(
-            manifest_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o400,
-        )
-        try:
-            view = memoryview(manifest_bytes)
-            while view:
-                written = os.write(manifest_descriptor, view)
-                if written <= 0:
-                    raise OSError("Snapshot manifest write made no progress")
-                view = view[written:]
-            os.fsync(manifest_descriptor)
-        finally:
-            os.close(manifest_descriptor)
-        for entry in manifest["files"]:
-            path = validate_relative_path(entry["path"])
-            parent = source
-            for component in PurePosixPath(path).parts[:-1]:
-                parent = parent / component
-                parent.mkdir(mode=0o700, exist_ok=True)
-            target = parent / PurePosixPath(path).name
-            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
-            try:
-                view = memoryview(files[path])
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError("Snapshot staging write made no progress")
-                    view = view[written:]
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-        for current, dirs, _ in os.walk(source, topdown=False):
-            for directory in dirs:
-                os.chmod(Path(current) / directory, 0o500)
-            os.chmod(current, 0o500)
-        shutil.copytree(source, work, copy_function=shutil.copyfile, symlinks=False)
-        for current, dirs, filenames in os.walk(work):
-            os.chmod(current, 0o700)
-            for name in dirs:
-                os.chmod(Path(current) / name, 0o700)
-            for name in filenames:
-                os.chmod(Path(current) / name, 0o600)
-        return work
-    except BaseException:
-        shutil.rmtree(task_root, ignore_errors=True)
-        raise
+def stage_snapshot(task_root: Path | Directory, manifest: dict[str, Any], files: dict[str, bytes]) -> Path:
+    with directory_access(task_root) as root:
+        if os.listdir(root.fd):
+            raise BrokerError("task_workspace_exists", "Assigned task directory is not empty.", 409)
+        write_new(root, "manifest.json", canonical_json(manifest), 0o400)
+        with root.mkdir("snapshot") as source, root.mkdir("workspace") as work:
+            for entry in manifest["files"]:
+                path = validate_relative_path(entry["path"])
+                _stage_file(source, path, files[path], 0o400)
+                _stage_file(work, path, files[path], 0o600)
+            _make_immutable(source)
+        return root.path / "workspace"
 
 
-def load_staged_manifest(task_root: Path, expected_digest: str) -> dict[str, Any]:
-    path = task_root / "manifest.json"
+def _stage_file(root: Directory, path: str, data: bytes, mode: int) -> None:
+    parts = PurePosixPath(path).parts
+    if len(parts) == 1:
+        write_new(root, parts[0], data, mode)
+        return
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 2 * 1024 * 1024:
-                raise ValueError("Staged snapshot manifest is invalid")
-            data = bytearray()
-            while len(data) <= 2 * 1024 * 1024:
-                piece = os.read(descriptor, min(65536, 2 * 1024 * 1024 + 1 - len(data)))
-                if not piece:
-                    break
-                data.extend(piece)
-            if len(data) > 2 * 1024 * 1024:
-                raise ValueError("Staged snapshot manifest exceeds its size limit")
-        finally:
-            os.close(descriptor)
+        child = root.mkdir(parts[0])
+    except FileExistsError:
+        child = root.child_directory(parts[0])
+    with child:
+        _stage_file(child, "/".join(parts[1:]), data, mode)
+
+
+def _make_immutable(directory: Directory) -> None:
+    for name in os.listdir(directory.fd):
+        info = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            with directory.child_directory(name) as child:
+                _make_immutable(child)
+        elif not stat.S_ISREG(info.st_mode):
+            raise BrokerError("snapshot_file_invalid", "Snapshot entry changed during staging.", 409)
+    directory.revalidate()
+    os.fchmod(directory.fd, 0o500)
+    os.fsync(directory.fd)
+
+
+def load_staged_manifest(task_root: Path | Directory, expected_digest: str) -> dict[str, Any]:
+    try:
+        with directory_access(task_root) as root:
+            data = read_file(root, "manifest.json", 2 * 1024 * 1024)
         manifest = json.loads(data)
         if hashlib.sha256(canonical_json(manifest)).hexdigest() != expected_digest:
             raise ValueError("Staged snapshot manifest digest changed")
@@ -178,7 +135,7 @@ def load_staged_manifest(task_root: Path, expected_digest: str) -> dict[str, Any
 
 
 def changed_files(
-    workspace: Path,
+    workspace: Path | Directory,
     manifest: dict[str, Any],
     maximum: int = MAX_SNAPSHOT_BYTES,
     output_limit: int = 1024 * 1024,
@@ -188,30 +145,11 @@ def changed_files(
     changes: list[dict[str, object]] = []
     total = 0
     encoded_output = 0
-    for current, dirs, files in os.walk(workspace, followlinks=False):
-        for name in tuple(dirs):
-            item = Path(current) / name
-            if item.is_symlink():
-                raise BrokerError("artifact_unsupported_file", "Workspace contains a symlink.", 422)
-        for name in files:
-            file_path = Path(current) / name
-            relative = validate_relative_path(file_path.relative_to(workspace).as_posix())
-            info = file_path.lstat()
-            if not stat.S_ISREG(info.st_mode):
-                raise BrokerError("artifact_unsupported_file", "Workspace contains a special file.", 422)
-            if info.st_size > MAX_FILE_BYTES or total + info.st_size > maximum:
+    with directory_access(workspace) as root:
+        for relative, data in walk_files(root):
+            relative = validate_relative_path(relative)
+            if total + len(data) > maximum:
                 raise BrokerError("artifact_limit", "Task artifacts exceed the configured bound.", 413)
-            descriptor = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            try:
-                content = bytearray()
-                while len(content) <= MAX_FILE_BYTES:
-                    piece = os.read(descriptor, min(65536, MAX_FILE_BYTES + 1 - len(content)))
-                    if not piece:
-                        break
-                    content.extend(piece)
-                data = bytes(content)
-            finally:
-                os.close(descriptor)
             if len(data) > MAX_FILE_BYTES:
                 raise BrokerError("artifact_limit", "Task artifact file exceeds its configured bound.", 413)
             total += len(data)

@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from synai.broker.config import BrokerConfig
+from synai.broker.filesystem import Directory, mount_identity
 from synai.broker.protocol import (
     BrokerError,
     LIFECYCLE_KINDS,
@@ -65,8 +66,25 @@ class BrokerRegistry:
         self.failure_code: str | None = None
         self.failure_callback: Callable[[str], None] | None = None
         self.storage_check: Callable[[], bool] | None = None
+        self.directory_factory: Callable[[], Directory] | None = None
         self._lock = threading.RLock()
         self._initializing_thread: int | None = None
+        self._directory: Directory | None = None
+        self._database_identity: tuple[int, int, int] | None = None
+
+    def _state_directory(self) -> Directory:
+        if self._directory is None:
+            self._directory = self.directory_factory() if self.directory_factory is not None else Directory(
+                self.config.state_dir, owner_uid=self.config.service_uid,
+                owner_gid=self.config.service_gid, private=True,
+            )
+        self._directory.revalidate()
+        return self._directory
+
+    def close(self) -> None:
+        if self._directory is not None:
+            self._directory.close()
+            self._directory = None
 
     @property
     def _initializing(self) -> bool:
@@ -120,15 +138,23 @@ class BrokerRegistry:
         return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
 
     def _identity(self) -> dict[str, object]:
-        info = self.path.lstat()
+        directory = self._state_directory()
+        descriptor = directory.open(self.path.name, os.O_RDONLY | os.O_NONBLOCK)
+        info = os.fstat(descriptor)
+        identity = mount_identity(descriptor)
+        if self._database_identity is not None and identity != self._database_identity:
+            os.close(descriptor)
+            raise BrokerError("registry_identity_mismatch", "Registry descriptor identity changed.", 503)
+        self._database_identity = identity
         if (
             not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
             or info.st_mode & 0o077
             or info.st_size > 512 * 1024 * 1024
         ):
+            os.close(descriptor)
             raise BrokerError("registry_identity_mismatch", "Registry identity is unsafe.", 503)
         digest = hashlib.sha256()
-        with self.path.open("rb") as source:
+        with os.fdopen(descriptor, "rb") as source:
             for chunk in iter(lambda: source.read(65536), b""):
                 digest.update(chunk)
         return {
@@ -137,37 +163,69 @@ class BrokerRegistry:
         }
 
     def _sync_directory(self) -> None:
-        descriptor = os.open(self.config.state_dir, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        os.fsync(self._state_directory().fd)
 
     def _seal(self) -> None:
         temporary = self.seal_path.with_suffix(".pending")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        directory = self._state_directory()
+        descriptor = directory.open(temporary.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as target:
             json.dump(self._identity(), target, sort_keys=True)
             target.flush()
             os.fsync(target.fileno())
-        os.replace(temporary, self.seal_path)
+        directory.revalidate()
+        os.replace(temporary.name, self.seal_path.name, src_dir_fd=directory.fd, dst_dir_fd=directory.fd)
         self._sync_directory()
 
     def _verify_seal(self) -> None:
-        if self.dirty_path.exists() or self.seal_path.with_suffix(".pending").exists():
+        directory = self._state_directory()
+        if self._exists(self.dirty_path) or self._exists(self.seal_path.with_suffix(".pending")):
             raise BrokerError("registry_recovery_evidence_missing", "Registry access was interrupted; operator recovery is required.", 503)
         for suffix in ("-wal", "-shm", "-journal"):
-            if self.path.with_name(self.path.name + suffix).exists():
+            if self._exists(self.path.with_name(self.path.name + suffix)):
                 raise BrokerError("registry_journal_unexpected", "Registry journal evidence requires operator recovery.", 503)
-        info = self.seal_path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 4096:
-            raise BrokerError("registry_identity_mismatch", "Registry seal is unsafe.", 503)
+        descriptor = directory.open(self.seal_path.name, os.O_RDONLY | os.O_NONBLOCK)
         try:
-            seal = json.loads(self.seal_path.read_text())
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 4096:
+                raise BrokerError("registry_identity_mismatch", "Registry seal is unsafe.", 503)
+            data = os.read(descriptor, 4097)
+        finally:
+            os.close(descriptor)
+        try:
+            seal = json.loads(data)
         except (ValueError, UnicodeError) as exc:
             raise BrokerError("registry_identity_mismatch", "Registry seal is invalid.", 503) from exc
         if seal != self._identity():
             raise BrokerError("registry_identity_mismatch", "Registry or storage policy changed; operator recovery is required.", 503)
+
+    def _exists(self, path: Path) -> bool:
+        directory = self._state_directory()
+        try:
+            descriptor = directory.open(path.name, os.O_PATH)
+        except FileNotFoundError:
+            return False
+        else:
+            os.close(descriptor)
+            return True
+
+    def _verify_sidecar(self, suffix: str) -> bool:
+        directory = self._state_directory()
+        try:
+            descriptor = directory.open(self.path.name + suffix, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return False
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_uid != self.config.service_uid
+                or info.st_gid != self.config.service_gid or info.st_mode & 0o077
+                or mount_identity(descriptor)[2] != mount_identity(directory.fd)[2]
+            ):
+                raise BrokerError("registry_identity_mismatch", "SQLite sidecar filesystem identity is unsafe.", 503)
+            return True
+        finally:
+            os.close(descriptor)
 
     def initialize(self, *, storage_verified: bool = False, provision: bool = False,
                    adopt_legacy: bool = False) -> None:
@@ -178,16 +236,16 @@ class BrokerRegistry:
         self.trust = RegistryTrust.NOT_OPENED
         try:
             with self._serialized():
-                if not self.path.exists():
-                    if not provision or self.seal_path.exists() or self.dirty_path.exists():
+                if not self._exists(self.path):
+                    if not provision or self._exists(self.seal_path) or self._exists(self.dirty_path):
                         raise BrokerError("registry_unavailable", "Historical registry is missing; no replacement will be created.", 503)
-                    descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    descriptor = self._state_directory().open(self.path.name, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
                     os.close(descriptor)
-                elif not self.seal_path.exists() and not adopt_legacy:
+                elif not self._exists(self.seal_path) and not adopt_legacy:
                     raise BrokerError("registry_recovery_evidence_missing", "Registry identity evidence is missing; operator adoption is required.", 503)
-                if self.seal_path.exists():
+                if self._exists(self.seal_path):
                     self._verify_seal()
-                elif self.dirty_path.exists():
+                elif self._exists(self.dirty_path):
                     raise BrokerError("registry_recovery_evidence_missing", "Interrupted provisioning requires operator recovery.", 503)
                 self._initializing_thread = threading.get_ident()
                 try:
@@ -202,14 +260,14 @@ class BrokerRegistry:
             raise
 
     def _initialize_schema(self) -> None:
-        info = self.config.state_dir.lstat()
+        info = os.fstat(self._state_directory().fd)
         if (
             not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
             or info.st_uid != os.geteuid() or info.st_mode & 0o077
         ):
             raise ValueError("Broker state directory must be private and owned by the Broker identity")
         with self.connect() as connection:
-            if self.seal_path.exists():
+            if self._exists(self.seal_path):
                 expected = {
                     "broker_tasks", "broker_operations", "broker_containers",
                     "broker_request_nonces", "broker_slots", "broker_storage_roles",
@@ -402,7 +460,11 @@ class BrokerRegistry:
             except BaseException:
                 connection.rollback()
                 raise
-        os.chmod(self.path, 0o600)
+        descriptor = self._state_directory().open(self.path.name, os.O_RDWR)
+        try:
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
 
     def verify_ownership(self) -> None:
         with self.connect() as connection:
@@ -441,9 +503,14 @@ class BrokerRegistry:
                     raise BrokerError(self.failure_code, "Registry trust is revoked; restart and operator recovery are required.", 503)
                 if not self._initializing:
                     self._verify_seal()
-                descriptor = os.open(self.path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+                directory = self._state_directory()
+                descriptor = directory.open(self.path.name, os.O_RDWR)
                 try:
                     info = os.fstat(descriptor)
+                    expected_identity = mount_identity(descriptor)
+                    if self._database_identity is not None and expected_identity != self._database_identity:
+                        raise BrokerError("registry_identity_mismatch", "Registry file was substituted.", 503)
+                    self._database_identity = expected_identity
                     if (
                         not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                         or info.st_mode & 0o077 or info.st_size > 512 * 1024 * 1024
@@ -451,13 +518,23 @@ class BrokerRegistry:
                         raise BrokerError("registry_identity_mismatch", "Registry ownership or type is unsafe.", 503)
                 finally:
                     os.close(descriptor)
-                marker = os.open(self.dirty_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                marker = directory.open(self.dirty_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 try:
                     os.fsync(marker)
                 finally:
                     os.close(marker)
                 self._sync_directory()
-                connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=2, isolation_level=None)
+                connection = sqlite3.connect(
+                    f"file:/proc/self/fd/{directory.fd}/{self.path.name}?mode=rw",
+                    uri=True, timeout=2, isolation_level=None,
+                )
+                directory.revalidate()
+                descriptor = directory.open(self.path.name, os.O_RDWR)
+                try:
+                    if mount_identity(descriptor) != expected_identity:
+                        raise BrokerError("registry_identity_mismatch", "SQLite database path was substituted.", 503)
+                finally:
+                    os.close(descriptor)
                 connection.row_factory = sqlite3.Row
                 connection.execute("PRAGMA foreign_keys=ON")
                 connection.execute("PRAGMA busy_timeout=2000")
@@ -482,7 +559,7 @@ class BrokerRegistry:
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise BrokerError("registry_corrupt", "Registry references are inconsistent.", 503)
                 if connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
-                    if any(not self.path.with_name(self.path.name + suffix).is_file()
+                    if any(not self._verify_sidecar(suffix)
                            for suffix in ("-wal", "-shm")):
                         raise BrokerError("registry_journal_unexpected", "Active registry journal evidence is missing.", 503)
                 checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -490,14 +567,17 @@ class BrokerRegistry:
                     raise BrokerError("registry_checkpoint_failed", "Registry checkpoint did not complete.", 503)
                 connection.close()
                 connection = None
+                directory.revalidate()
                 self._seal()
-                self.dirty_path.unlink()
+                os.unlink(self.dirty_path.name, dir_fd=directory.fd)
                 self._sync_directory()
                 if rejection is not None:
                     raise rejection
             except BrokerError as exc:
-                if exc.status_code == 503:
+                if exc.status_code == 503 or exc.code.startswith("filesystem_"):
                     self._access_failed(exc)
+                    if exc.status_code != 503:
+                        raise BrokerError("registry_identity_mismatch", "Registry filesystem authority was lost.", 503) from exc
                 raise
             except (OSError, sqlite3.Error) as exc:
                 self._access_failed(exc)
@@ -527,6 +607,8 @@ class BrokerRegistry:
             "registry_identity_mismatch": RegistryTrust.MISMATCH,
             "registry_recovery_evidence_missing": RegistryTrust.RECOVERY_INCOMPLETE,
             "registry_journal_unexpected": RegistryTrust.RECOVERY_INCOMPLETE,
+            "filesystem_identity_changed": RegistryTrust.MISMATCH,
+            "filesystem_ownership_invalid": RegistryTrust.MISMATCH,
         }.get(code, RegistryTrust.UNAVAILABLE)
         self.fail(state, code)
 

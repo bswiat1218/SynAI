@@ -111,14 +111,15 @@ class RegistryTrustTests(unittest.TestCase):
         self.provision()
         original = self.registry.path.read_bytes()
         restarted = BrokerRegistry(self.selected)
-        real_open = Path.open
+        from synai.broker.filesystem import Directory
+        real_open = Directory.open
 
-        def denied(path: Path, *args: object, **kwargs: object) -> object:
-            if path == restarted.path:
+        def denied(directory: Directory, name: str, *args: object, **kwargs: object) -> object:
+            if directory.path == restarted.path.parent and name == restarted.path.name:
                 raise PermissionError("injected unreadable registry")
-            return real_open(path, *args, **kwargs)
+            return real_open(directory, name, *args, **kwargs)
 
-        with patch.object(Path, "open", denied):
+        with patch.object(Directory, "open", denied):
             with self.assertRaises(PermissionError):
                 restarted.initialize(storage_verified=True)
         self.assertEqual(restarted.trust, RegistryTrust.UNAVAILABLE)

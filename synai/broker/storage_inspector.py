@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Protocol
 
 from synai.broker.config import StorageRole
+from synai.broker.filesystem import Directory, mount_identity
+from synai.broker.protocol import BrokerError
 
 
 PROTOCOL_VERSION = 1
@@ -216,10 +218,31 @@ class UnixStorageInspectorClient:
             if len(payload) > MAX_FRAME_BYTES:
                 raise InspectorInvalid("Quota inspector request exceeds its frame limit.")
             deadline = time.monotonic() + self.timeout_seconds
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            with Directory(self.socket_path.parent, owner_uid=self.inspector_uid,
+                           owner_gid=self.inspector_gid) as parent, socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(max(0.001, deadline - time.monotonic()))
-                connection.connect(str(self.socket_path))
-                self._verify_peer(connection)
+                endpoint = parent.open(self.socket_path.name, os.O_PATH)
+                try:
+                    info = os.fstat(endpoint)
+                    if (
+                        not stat.S_ISSOCK(info.st_mode) or info.st_uid != self.inspector_uid
+                        or info.st_gid != self.inspector_gid or info.st_mode & 0o007
+                    ):
+                        raise InspectorInvalid("Connected inspector endpoint metadata is unsafe.")
+                    identity = mount_identity(endpoint)
+                    # This is same-process kernel pathname resolution of an O_PATH socket fd,
+                    # not descriptor transfer to an external runtime.
+                    connection.connect(f"/proc/self/fd/{endpoint}")
+                    self._verify_peer(connection)
+                    parent.revalidate()
+                    check = parent.open(self.socket_path.name, os.O_PATH)
+                    try:
+                        if mount_identity(check) != identity:
+                            raise InspectorInvalid("Inspector endpoint was substituted during connection.")
+                    finally:
+                        os.close(check)
+                finally:
+                    os.close(endpoint)
                 connection.settimeout(max(0.001, deadline - time.monotonic()))
                 connection.sendall(struct.pack("!I", len(payload)) + payload)
                 header = self._receive_exact(connection, 4, deadline)
@@ -239,6 +262,8 @@ class UnixStorageInspectorClient:
                 raise InspectorInvalid("Quota inspector response is not valid JSON.") from exc
         except InspectorFailure:
             raise
+        except BrokerError as exc:
+            raise InspectorInvalid("Inspector filesystem authority cannot be established.") from exc
         except (OSError, TimeoutError, struct.error) as exc:
             raise InspectorUnavailable("Quota inspector transport is unavailable.") from exc
 

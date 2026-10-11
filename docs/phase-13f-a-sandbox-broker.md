@@ -334,6 +334,91 @@ preexisting-file project-ID checks (MEDIUM-1) are deliberately not implemented.
 The seal is Broker-owned corruption/replacement detection, not protection
 against a compromised Broker identity rewriting both database and seal.
 
+### HIGH-4 descriptor authority and remaining external boundaries
+
+Broker filesystem authority is now a pinned `Directory` object, not a
+previously checked pathname. It retains trusted ancestor descriptors and
+device/inode/kernel mount IDs, verifies ownership and permissions, and
+revalidates the configured spelling against those identities at use boundaries.
+Linux `openat2()` uses `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` for children. Trusted absolute
+ancestry is opened component-by-component without `NO_XDEV`, so reaching the
+approved storage mount from `/` is allowed; children cannot cross into another
+mount after authority has been anchored inside that filesystem. Unsupported
+architectures, blocked/unavailable syscalls, symlinks, and inconclusive mount
+identity are refused without a `Path.resolve()` or ordinary-open fallback.
+The initial implementation supports Linux x86-64 and aarch64.
+
+Security-sensitive inventory:
+
+| Surface | Verification and use |
+|---|---|
+| Storage roles and quota slots | Fresh inspector binding, ext4/device/mount/project checks, pinned role inode/mount, protected ancestors, and private owned directory descriptors |
+| Task creation | SQLite assignment checked again under the opened slot; exclusive descriptor-relative mkdir; inherited project identity checked before staging |
+| Snapshot and workspace | Descriptor-relative exclusive files/directories; no pathname copytree or walk; immutable snapshot permissions applied through descriptors; partial staging evidence preserved on failure |
+| File operations | Restricted child resolution, bounded owned regular files, preimage checks, pinned parents rechecked before atomic replacement |
+| Artifacts | Descriptor traversal and bounded reads; no-follow artifact directory; exclusive descriptor-relative evidence files and fsync |
+| Cleanup and release | Descriptor preflight rejects unsafe content; no symlink traversal; exact assigned root only; project and allocation rechecked; uncertainty quarantines rather than deleting foreign evidence |
+| Inspector socket | Protected directory, O_PATH socket descriptor, actual SO_PEERCRED UID/GID/PID validation, and post-connect endpoint identity comparison before sending a request |
+| SQLite and recovery evidence | Pinned state-role directory; no-follow database/seal/marker opens, pinned database inode, directory-relative seal replacement/unlink/fsync, existing-only SQLite open and post-use identity checks |
+| Logging | Opened verified log-role descriptor; pinned file identity checked on emit; substitution refuses logging and invalidates readiness |
+| Podman mount source | Descriptor-backed task workspace and exact allocation validation; CLI execution refused pending an accepted source-identity handoff |
+
+The inspector connects through `/proc/self/fd/<socket-fd>` **in the Broker
+process**, retaining the O_PATH descriptor until actual peer and endpoint
+checks complete. Local disposable Unix-socket tests exercise these Linux
+semantics. This is not an inspector implementation or proof of its privileged
+deployment. Challenges, freshness, boot epochs, and inventory-generation
+checks remain mandatory. Metadata verification is not a substitute for the
+connected process credentials.
+
+Podman CLI accepts a source pathname and resolves it independently. Passing
+`/proc/self/fd/<n>` to that separate process does not transfer authority and
+is not used. Matching container mount-source text cannot establish the actual
+mounted inode. Creation, start, and exec therefore refuse with
+`bind_source_resolution_unaccepted` until a separately reviewed runtime
+interface and acceptance controls demonstrate identity preservation. The pure
+argument builder is tested but does not invoke Podman. Exact-container stop,
+inspection, and containment remain separate and are not disabled by this gate.
+There is no configuration/test flag that enables this unaccepted boundary.
+
+SQLite has a second external pathname boundary: Python's SQLite API does not
+expose an identity-preserving dirfd/VFS handoff for the database and sidecars.
+Its existing-only URI is rooted through the Broker's retained state-directory
+descriptor; the database is checked before/after opening and before sealing.
+Controlled parent/database-replacement tests require refusal and preserve
+interruption evidence. These checks do **not** prove the installed SQLite VFS
+never canonicalizes or reopens a pathname during a race. Service execution is
+latched unavailable with `external_filesystem_resolution_unaccepted`; later
+acceptance must establish a safe VFS/storage boundary rather than merely remove
+the gate. No SQLite trust/seal schema or second ledger is introduced here.
+
+Task-controlled code must never be able to rename authoritative slot/task-root
+ancestors. Descriptor access prevents symlink/mount escape and detects observed
+substitution, but ordinary Linux unlink/rename lacks atomic inode-conditional
+semantics. Concurrent mutation by the trusted Broker UID or a host administrator
+is outside a proven atomic cleanup guarantee. Kernel-backed dedicated-identity,
+permission, mount-namespace, and runtime acceptance must establish that those
+actors cannot race authoritative namespace changes. Unknown paths are refused;
+no uncertain slot is released and no unrestricted pathname retry is used.
+Task-root inode pins are process-local and allocation-scoped; restart still
+requires fresh quota/ownership and historical snapshot/reconciliation checks,
+not an assertion of inode continuity across an outage.
+
+The tests use disposable directories/SQLite, controlled replacement barriers,
+mocked quota/runtime evidence, and local Unix sockets. Only `openat2`, no-follow
+resolution, descriptor identity, and local socket behavior are exercised against
+the current kernel. No project quota, remount, privileged inspector, live Podman
+mount, or power-loss acceptance is claimed. HIGH-4 remains **partially resolved**
+pending the SQLite/runtime boundary and dedicated-host acceptance. HIGH-5 and
+MEDIUM-1 remain out of scope.
+
+Separate pre-existing lifecycle concern: the CLI bootstraps `service.start()`
+with `asyncio.run()` before entering Uvicorn's event loop. This phase does not
+redesign that bootstrap; production acceptance must also establish that the
+watchdog remains attached to the serving lifecycle. No successful filesystem
+test is evidence that the CLI deployment lifecycle has passed acceptance.
+
 These controls are unit-tested with fake runtime and registry adapters only.
 They do not establish real Podman stop/kill behavior, privileged-inspector
 availability, kernel quota enforcement, or production containment acceptance.
