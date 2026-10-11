@@ -533,7 +533,10 @@ class BrokerRegistry:
     def container_record(self, task_id: str) -> sqlite3.Row | None:
         with self.connect() as connection:
             return connection.execute(
-                "SELECT c.*, t.project_id, t.snapshot_id, t.state AS task_state FROM broker_containers c "
+                "SELECT c.*, t.project_id, t.snapshot_id, t.state AS task_state, "
+                "t.allocation_id AS task_allocation_id, t.image_digest AS task_image_digest, "
+                "t.snapshot_digest AS task_snapshot_digest, t.profile AS task_profile "
+                "FROM broker_containers c "
                 "JOIN broker_tasks t ON t.task_id = c.task_id WHERE c.task_id = ?",
                 (task_id,),
             ).fetchone()
@@ -541,7 +544,9 @@ class BrokerRegistry:
     def container_records(self) -> tuple[sqlite3.Row, ...]:
         with self.connect() as connection:
             rows = connection.execute(
-                "SELECT c.*, t.project_id, t.snapshot_id, t.state AS task_state "
+                "SELECT c.*, t.project_id, t.snapshot_id, t.state AS task_state, "
+                "t.allocation_id AS task_allocation_id, t.image_digest AS task_image_digest, "
+                "t.snapshot_digest AS task_snapshot_digest, t.profile AS task_profile "
                 "FROM broker_containers c JOIN broker_tasks t USING(task_id) "
                 "ORDER BY c.created_at, c.task_id",
             ).fetchall()
@@ -700,8 +705,13 @@ class BrokerRegistry:
                 )
                 for task_id in tasks:
                     connection.execute(
-                        "UPDATE broker_containers SET reconciliation_evidence = ? "
-                        "WHERE task_id = ? AND lifecycle_state != 'removed'",
+                        "UPDATE broker_containers SET "
+                        "lifecycle_state = CASE "
+                        "WHEN lifecycle_state IN ('removed', 'terminated') THEN lifecycle_state "
+                        "ELSE 'quarantined' END, "
+                        "reconciliation_evidence = CASE "
+                        "WHEN lifecycle_state IN ('removed', 'terminated') THEN reconciliation_evidence "
+                        "ELSE ? END WHERE task_id = ?",
                         (f"storage_assurance_lost:{reason}:{now}", task_id),
                     )
                 connection.commit()

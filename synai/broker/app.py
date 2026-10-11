@@ -31,7 +31,7 @@ from synai.broker.protocol import (
     verify_claim,
 )
 from synai.broker.registry import BrokerRegistry
-from synai.broker.runtime import RootlessPodmanRuntime
+from synai.broker.runtime import ContainmentResult, RootlessPodmanRuntime
 from synai.broker.snapshots import (
     changed_files,
     load_staged_manifest,
@@ -120,6 +120,7 @@ class BrokerService:
         self._task_locks: dict[str, asyncio.Lock] = {}
         self._storage_assurance_lock = asyncio.Lock()
         self._storage_watchdog_task: asyncio.Task[None] | None = None
+        self._containment_tasks: dict[str, asyncio.Task[ContainmentResult]] = {}
 
     async def start(self) -> None:
         if self._started:
@@ -200,6 +201,20 @@ class BrokerService:
                 await watchdog
             except asyncio.CancelledError:
                 pass
+        containment_tasks = tuple(self._containment_tasks.values())
+        if containment_tasks:
+            done, pending = await asyncio.wait(containment_tasks, timeout=45)
+            if pending:
+                self._invalidate_storage_readiness(
+                    "storage_containment_unconfirmed",
+                )
+                logger.error(
+                    "Broker shutdown left %d exact-container containment attempt(s) unresolved",
+                    len(pending),
+                )
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
         if self.core_client is not None:
             await self.core_client.close()
 
@@ -229,16 +244,18 @@ class BrokerService:
                     )
                     continue
                 if not storage_ready:
-                    try:
-                        await self._handle_storage_assurance_loss(reasons)
-                    except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                        self._invalidate_storage_readiness(
-                            "storage_loss_handling_failed",
-                        )
-                        logger.error(
-                            "Broker storage assurance loss handling failed: %s",
-                            type(exc).__name__,
-                        )
+                    self._invalidate_storage_readiness("storage_assurance_lost")
+            if not storage_ready:
+                try:
+                    await self._handle_storage_assurance_loss(reasons)
+                except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                    self._invalidate_storage_readiness(
+                        "storage_loss_handling_failed",
+                    )
+                    logger.error(
+                        "Broker storage assurance loss handling failed: %s",
+                        type(exc).__name__,
+                    )
 
     def _storage_watchdog_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -541,52 +558,207 @@ class BrokerService:
 
     async def _handle_storage_assurance_loss(self, reasons: tuple[str, ...]) -> None:
         reason = ",".join(reasons)[:128] or "inspection_unavailable"
-        checks = dict(self.readiness.checks) if self.readiness is not None else {}
-        checks["workspace_quota"] = False
-        checks["storage_inspector"] = False
-        checks["storage_inventory"] = False
+        self._invalidate_storage_readiness("storage_assurance_lost")
         self.readiness = BrokerReadiness(
-            False, False, checks,
-            tuple(dict.fromkeys((*reasons, "storage_containment_pending"))),
+            False, False, dict(self.readiness.checks),
+            tuple(dict.fromkeys((*self.readiness.reasons, *reasons))),
         )
-        task_ids = self.registry.quarantine_all_for_storage_loss(reason)
-        unresolved: list[str] = []
+        durable_quarantine = False
+        container_records: tuple[Any, ...] = ()
+        task_ids: tuple[str, ...] = ()
+        container_records_available = False
+        try:
+            container_records = self.registry.container_records()
+            container_records_available = True
+        except (BrokerError, OSError, sqlite3.Error, ValueError):
+            pass
+        try:
+            task_ids = self.registry.quarantine_all_for_storage_loss(reason)
+            durable_quarantine = True
+        except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
+            logger.error(
+                "Broker could not persist storage-loss quarantine: %s",
+                type(exc).__name__,
+            )
+            if container_records:
+                task_ids = tuple(dict.fromkeys(
+                    str(row["task_id"]) for row in container_records
+                ))
+
+        records_by_task = {
+            str(record["task_id"]): record for record in container_records
+        }
+        pending: list[asyncio.Task[ContainmentResult]] = []
+        unresolved: list[str] = (
+            ["registry_quarantine_not_durable"] if not durable_quarantine else []
+        )
+        if not container_records_available:
+            unresolved.append("registry_ownership_unavailable")
         for task_id in task_ids:
-            container = self.registry.container_record(task_id)
-            if container is None or container["lifecycle_state"] == "removed":
+            container = records_by_task.get(task_id)
+            if container is None:
+                if not container_records_available:
+                    unresolved.append(task_id)
                 continue
-            if not self.quota_manager.runtime_containment_available:
-                unresolved.append(task_id)
-                self.registry.record_reconciliation(
-                    task_id, "quarantined",
-                    f"storage_loss_runtime_path_unverified:{int(time.time())}",
-                )
+            if container["lifecycle_state"] == "removed":
                 continue
             if not container["container_id"]:
                 unresolved.append(task_id)
-                self.registry.record_reconciliation(
-                    task_id, "quarantined", f"storage_loss_no_container_id:{int(time.time())}",
+                self._persist_containment_unresolved(
+                    task_id, "identity_mismatch", "recorded_container_id_missing",
+                    durable_quarantine=durable_quarantine,
                 )
                 continue
-            try:
-                evidence = await self.runtime.terminate_recorded(task_id)
-                await self.runtime.inspect_recorded(task_id)
-                self.registry.record_reconciliation(
-                    task_id, "terminated", f"storage_loss_verified_stop:{evidence}",
+            pending.append(self._containment_task(
+                task_id, durable_quarantine=durable_quarantine,
+            ))
+
+        if pending:
+            done, still_pending = await asyncio.wait(pending, timeout=45)
+            if still_pending:
+                unresolved.extend(
+                    task_id for task_id, task in self._containment_tasks.items()
+                    if task in still_pending
                 )
-            except (BrokerError, OSError, TimeoutError) as exc:
-                unresolved.append(task_id)
-                code = exc.code if isinstance(exc, BrokerError) else "runtime_unavailable"
-                self.registry.record_reconciliation(
-                    task_id, "quarantined",
-                    f"storage_loss_containment_unconfirmed:{code}:{int(time.time())}",
+            for task in done:
+                try:
+                    outcome = task.result()
+                except asyncio.CancelledError:
+                    continue
+                except Exception as exc:
+                    task_id = next(
+                        (key for key, value in self._containment_tasks.items() if value is task),
+                        "",
+                    )
+                    if task_id:
+                        unresolved.append(task_id)
+                        self._persist_containment_unresolved(
+                            task_id, "inspection_inconclusive",
+                            type(exc).__name__,
+                            durable_quarantine=durable_quarantine,
+                        )
+                    continue
+                task_id = next(
+                    (key for key, value in self._containment_tasks.items() if value is task),
+                    "",
                 )
+                if not task_id:
+                    continue
+                if not outcome.verified:
+                    unresolved.append(task_id)
         if unresolved:
             checks = dict(self.readiness.checks)
             checks["storage_containment_confirmed"] = False
             self.readiness = BrokerReadiness(
                 False, False, checks,
                 tuple(dict.fromkeys((*self.readiness.reasons, "storage_containment_unconfirmed"))),
+            )
+        else:
+            checks = dict(self.readiness.checks)
+            checks["storage_containment_confirmed"] = True
+            self.readiness = BrokerReadiness(
+                False, False, checks,
+                tuple(dict.fromkeys((*self.readiness.reasons, "storage_assurance_lost"))),
+            )
+
+    def _containment_task(
+        self, task_id: str, *, durable_quarantine: bool,
+    ) -> asyncio.Task[ContainmentResult]:
+        existing = self._containment_tasks.get(task_id)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._contain_and_persist(
+                task_id, durable_quarantine=durable_quarantine,
+            ),
+            name=f"synai-broker-containment-{task_id}",
+        )
+        self._containment_tasks[task_id] = task
+        return task
+
+    async def _contain_and_persist(
+        self, task_id: str, *, durable_quarantine: bool,
+    ) -> ContainmentResult:
+        try:
+            outcome = await self.runtime.contain_recorded(task_id)
+        except asyncio.CancelledError:
+            self._persist_containment_unresolved(
+                task_id, "inspection_inconclusive", "containment_cancelled",
+                durable_quarantine=durable_quarantine,
+            )
+            raise
+        except Exception as exc:
+            self._persist_containment_unresolved(
+                task_id, "inspection_inconclusive", type(exc).__name__,
+                durable_quarantine=durable_quarantine,
+            )
+            return ContainmentResult(
+                "inspection_inconclusive", error_code="containment_operation_failed",
+            )
+        if not self._persist_containment_result(
+            task_id, outcome, durable_quarantine=durable_quarantine,
+        ):
+            return ContainmentResult(
+                "inspection_inconclusive", error_code="containment_state_not_durable",
+            )
+        return outcome
+
+    def _persist_containment_result(
+        self,
+        task_id: str,
+        outcome: ContainmentResult,
+        *,
+        durable_quarantine: bool,
+    ) -> bool:
+        if not durable_quarantine:
+            self._persist_containment_unresolved(
+                task_id, outcome.state, outcome.error_code or "quarantine_not_durable",
+                durable_quarantine=False,
+            )
+            return False
+        evidence = canonical_json({
+            "state": outcome.state,
+            "evidence": outcome.evidence,
+            "error_code": outcome.error_code,
+            "observed_at": int(time.time()),
+        }).decode("utf-8")
+        try:
+            self.registry.record_reconciliation(
+                task_id,
+                "terminated" if outcome.verified else "quarantined",
+                evidence,
+            )
+        except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
+            logger.error(
+                "Broker could not persist containment result for an owned container: %s",
+                type(exc).__name__,
+            )
+            return False
+        return True
+
+    def _persist_containment_unresolved(
+        self,
+        task_id: str,
+        state: str,
+        error_code: str,
+        *,
+        durable_quarantine: bool,
+    ) -> None:
+        if not durable_quarantine:
+            return
+        try:
+            self.registry.record_reconciliation(
+                task_id, "quarantined",
+                canonical_json({
+                    "state": state,
+                    "error_code": error_code[:64],
+                    "observed_at": int(time.time()),
+                }).decode("utf-8"),
+            )
+        except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
+            logger.error(
+                "Broker could not persist unresolved containment state: %s",
+                type(exc).__name__,
             )
 
     async def _execute_with_lease_monitor(
@@ -615,8 +787,9 @@ class BrokerService:
                         storage_ready = False
                         storage_reasons = ("storage_verification_failed",)
                     if not storage_ready:
-                        await self._handle_storage_assurance_loss(storage_reasons)
+                        self._invalidate_storage_readiness("storage_assurance_lost")
                 if not storage_ready:
+                    await self._handle_storage_assurance_loss(storage_reasons)
                     operation.cancel()
                     try:
                         await operation

@@ -218,13 +218,40 @@ copy, manifests, and artifacts consume the same per-slot project quota. The
 initial one-active-container limit remains in force.
 
 When storage inspection is lost or inconsistent during active work, the
-registry durably marks operations uncertain and quarantines assigned slots.
-The Broker tries to stop only each exact recorded Broker-owned container,
-only while the independently verified Broker-state, Podman graph/runtime,
-and temporary-storage roles remain usable, then independently inspects it.
-If those roles cannot be verified, Podman containment is blocked and operator
-intervention is required. Unconfirmed termination is escalated in readiness
-and never permits slot reuse. No runtime-wide cleanup is issued.
+Broker immediately revokes execution readiness, blocks new allocations, and
+durably marks operations uncertain and assigned slots quarantined where the
+registry remains writable. Emergency containment is separate from execution
+readiness and quota-inspector availability: it may use only the independently
+restricted Broker runtime authority and a readable authoritative ownership
+record. The record must bind the exact container ID, task, allocation, pinned
+image digest, snapshot digest, and resource profile; Podman inspection must
+also confirm the exact ID, expected labels, and previously verified image ID.
+Missing or inconsistent evidence is unresolved and never authorizes a
+termination command.
+
+For an eligible container, the Broker inspects state, requests a bounded
+graceful stop, inspects again, and requests a bounded exact-ID forced stop
+only if still running. It inspects once more and records `verified_stopped`
+only from matching runtime evidence. `verified_absent` requires an exact-ID
+Podman existence query to confirm absence; runtime errors are not absence.
+Still-running, unavailable, mismatched, or inconclusive states remain
+unresolved, keep readiness unavailable, and require operator intervention.
+The containment operation is single-flight per task and shares a lock with
+start, normal termination, and removal. It never releases a quota slot or
+performs runtime-wide cleanup; removal and slot reuse remain subject to the
+separate cleanup and reconciliation gates. Container artifacts and task files
+are preserved.
+
+If registry ownership records cannot be read, the Broker does not infer that
+no container exists and does not choose a target through Podman enumeration.
+It refuses containment and escalates to operator-assisted recovery. Durable
+quarantine or containment is claimed only when the registry write succeeds.
+This is the HIGH-3 registry-loss recovery boundary: no independent recovery
+journal or root-filesystem fallback is introduced here.
+
+These controls are unit-tested with fake runtime and registry adapters only.
+They do not establish real Podman stop/kill behavior, privileged-inspector
+availability, kernel quota enforcement, or production containment acceptance.
 
 Collected change manifests (including bounded artifact payloads) are fsynced
 under the assigned task root before Core result recording. The Broker's

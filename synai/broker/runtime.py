@@ -4,15 +4,35 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
+import sqlite3
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from synai.broker.config import BrokerConfig, BrokerReadiness
 from synai.broker.protocol import BrokerError
 from synai.broker.registry import BrokerRegistry
+
+
+ContainmentState = Literal[
+    "verified_stopped", "verified_absent", "still_running",
+    "runtime_unavailable", "identity_mismatch", "inspection_inconclusive",
+]
+
+
+@dataclass(frozen=True)
+class ContainmentResult:
+    state: ContainmentState
+    evidence: str | None = None
+    error_code: str | None = None
+
+    @property
+    def verified(self) -> bool:
+        return self.state in {"verified_stopped", "verified_absent"}
 
 
 class RootlessPodmanRuntime:
@@ -26,6 +46,7 @@ class RootlessPodmanRuntime:
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self.workspace_resolver: Callable[[str], Path] | None = None
         self.storage_containment_check: Callable[[], bool] | None = None
+        self._containment_locks: dict[str, asyncio.Lock] = {}
 
     async def verify_startup(self, base_readiness: BrokerReadiness | None = None) -> BrokerReadiness:
         base = base_readiness or self.config.readiness()
@@ -163,6 +184,7 @@ class RootlessPodmanRuntime:
             "--label", f"synai.broker.allocation={allocation_id}",
             "--label", f"synai.broker.task={task_id}",
             "--label", f"synai.broker.image-digest={self.config.image_digest.removeprefix('sha256:')}",
+            "--label", f"synai.broker.snapshot-digest={self.registry.task(task_id)['snapshot_digest']}",
             "--user", "65532:65532",
             "--userns", "keep-id:uid=65532,gid=65532",
             "--cap-drop", "ALL",
@@ -181,18 +203,20 @@ class RootlessPodmanRuntime:
             timeout=15, maximum=4096,
         )
         container_id = container.strip()
-        if len(container_id) < 12 or any(char not in "0123456789abcdef" for char in container_id):
+        if len(container_id) != 64 or any(char not in "0123456789abcdef" for char in container_id):
             raise BrokerError("runtime_response_invalid", "Podman returned an invalid container identity.", 502)
         return container_id
 
     async def start_owned(self, task_id: str) -> None:
-        owned = self.registry.owned_container(task_id)
-        await self.inspect_owned(task_id)
-        await self._run("start", owned["container_id"], timeout=15, maximum=4096)
-        info = await self.inspect_owned(task_id)
-        if info["State"]["Running"] is not True:
-            self.registry.mark_container(task_id, "quarantined")
-            raise BrokerError("container_start_unconfirmed", "Task container did not enter the running state.", 502)
+        lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            owned = self.registry.owned_container(task_id)
+            await self.inspect_owned(task_id)
+            await self._run("start", owned["container_id"], timeout=15, maximum=4096)
+            info = await self.inspect_owned(task_id)
+            if info["State"]["Running"] is not True:
+                self.registry.mark_container(task_id, "quarantined")
+                raise BrokerError("container_start_unconfirmed", "Task container did not enter the running state.", 502)
 
     async def inspect_owned(self, task_id: str) -> dict[str, Any]:
         owned = self.registry.owned_container(task_id)
@@ -247,6 +271,7 @@ class RootlessPodmanRuntime:
                 or labels.get("synai.broker.allocation") != owned["allocation_id"]
                 or labels.get("synai.broker.task") != task_id
                 or labels.get("synai.broker.image-digest") != owned["image_digest"]
+                or labels.get("synai.broker.snapshot-digest") != owned["snapshot_digest"]
                 or expected_image_id is None or info["Image"] != expected_image_id
                 or host.get("Privileged") is True
                 or host.get("NetworkMode") != "none"
@@ -285,10 +310,179 @@ class RootlessPodmanRuntime:
             raise BrokerError("container_inspection_invalid", "Runtime returned invalid task container evidence.", 502) from exc
 
     async def terminate_owned(self, task_id: str) -> str:
-        return await self._terminate_container(task_id, recovery=False)
+        lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            return await self._terminate_container(task_id, recovery=False)
 
     async def terminate_recorded(self, task_id: str) -> str:
-        return await self._terminate_container(task_id, recovery=True)
+        lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            return await self._terminate_container(task_id, recovery=True)
+
+    def emergency_containment_available(self) -> bool:
+        from synai.broker.quota_slots import _process_identity_is_restricted
+
+        return (
+            _process_identity_is_restricted(
+                self.config.service_uid, self.config.service_gid,
+            )
+            and shutil.which(self.config.podman) is not None
+        )
+
+    async def contain_recorded(self, task_id: str) -> ContainmentResult:
+        lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=2)
+        except TimeoutError:
+            return ContainmentResult(
+                "inspection_inconclusive", error_code="containment_busy",
+            )
+        try:
+            return await self._contain_recorded_locked(task_id)
+        finally:
+            lock.release()
+
+    async def _contain_recorded_locked(self, task_id: str) -> ContainmentResult:
+        if not self.emergency_containment_available():
+            return ContainmentResult(
+                "runtime_unavailable", error_code="containment_authority_unavailable",
+            )
+        try:
+            owned = self.registry.container_record(task_id)
+            self._validate_containment_record(task_id, owned)
+        except (BrokerError, OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            return ContainmentResult(
+                "identity_mismatch",
+                error_code=exc.code if isinstance(exc, BrokerError) else "ownership_record_unavailable",
+            )
+
+        first = await self._containment_inspect(task_id, owned)
+        if isinstance(first, ContainmentResult):
+            return first
+        if first["State"]["Running"] is not True:
+            return self._verified_stopped(first)
+
+        try:
+            await self._run(
+                "stop", "--time", "3", owned["container_id"],
+                timeout=5, maximum=4096,
+            )
+        except (BrokerError, OSError, TimeoutError):
+            pass
+        stopped = await self._containment_inspect(task_id, owned)
+        if isinstance(stopped, ContainmentResult):
+            return stopped
+        if stopped["State"]["Running"] is not True:
+            return self._verified_stopped(stopped)
+
+        try:
+            await self._run(
+                "kill", owned["container_id"], timeout=5, maximum=4096,
+            )
+        except (BrokerError, OSError, TimeoutError):
+            pass
+        final = await self._containment_inspect(task_id, owned)
+        if isinstance(final, ContainmentResult):
+            return final
+        if final["State"]["Running"] is True:
+            return ContainmentResult("still_running", error_code="forced_stop_unconfirmed")
+        return self._verified_stopped(final)
+
+    def _validate_containment_record(self, task_id: str, owned: Any) -> None:
+        container_id = None if owned is None else owned["container_id"]
+        if (
+            owned is None
+            or owned["task_id"] != task_id
+            or not re.fullmatch(r"[a-f0-9]{32}", task_id)
+            or not isinstance(container_id, str)
+            or len(container_id) != 64
+            or any(char not in "0123456789abcdef" for char in container_id)
+            or not re.fullmatch(r"[a-f0-9]{32}", str(owned["allocation_id"]))
+            or owned["allocation_id"] != owned["task_allocation_id"]
+            or owned["image_digest"] != self.config.image_digest.removeprefix("sha256:")
+            or owned["task_image_digest"] != self.config.image_digest.removeprefix("sha256:")
+            or owned["snapshot_digest"] != owned["task_snapshot_digest"]
+            or not re.fullmatch(r"[a-f0-9]{64}", str(owned["snapshot_digest"]))
+            or owned["resource_profile"] != self.config.profile.name
+            or owned["task_profile"] != self.config.profile.name
+            or owned["lifecycle_state"] not in {"owned", "terminated", "quarantined"}
+        ):
+            raise BrokerError(
+                "container_ownership_invalid",
+                "Durable container ownership identity is incomplete or inconsistent.",
+                409,
+            )
+
+    async def _containment_inspect(
+        self, task_id: str, owned: Any,
+    ) -> dict[str, Any] | ContainmentResult:
+        try:
+            info = await self.inspect_recorded(task_id)
+            self._verify_containment_info(task_id, owned, info)
+            if type(info["State"].get("Running")) is not bool:
+                return ContainmentResult(
+                    "inspection_inconclusive", error_code="container_state_invalid",
+                )
+            return info
+        except asyncio.CancelledError:
+            raise
+        except BrokerError as exc:
+            if exc.code == "container_policy_mismatch":
+                return ContainmentResult("identity_mismatch", error_code=exc.code)
+            if exc.code in {"container_inspection_invalid", "workspace_slot_missing"}:
+                return ContainmentResult("inspection_inconclusive", error_code=exc.code)
+            return await self._containment_absence_or_unavailable(owned, exc.code)
+        except (OSError, TimeoutError, sqlite3.Error):
+            return await self._containment_absence_or_unavailable(
+                owned, "runtime_unavailable",
+            )
+
+    def _verify_containment_info(self, task_id: str, owned: Any, info: dict[str, Any]) -> None:
+        try:
+            labels = info["Config"]["Labels"]
+            if (
+                info["Id"] != owned["container_id"]
+                or labels.get("synai.broker.task") != task_id
+                or labels.get("synai.broker.allocation") != owned["allocation_id"]
+                or labels.get("synai.broker.image-digest") != owned["image_digest"]
+                or labels.get("synai.broker.snapshot-digest") != owned["snapshot_digest"]
+                or self.image_id is None
+                or info["Image"] != self.image_id
+                or not isinstance(info["State"], dict)
+            ):
+                raise ValueError("Runtime identity differs from durable ownership")
+        except (KeyError, TypeError, AttributeError, ValueError) as exc:
+            raise BrokerError(
+                "container_policy_mismatch",
+                "Runtime container identity does not match its durable owner record.",
+                409,
+            ) from exc
+
+    async def _containment_absence_or_unavailable(
+        self, owned: Any, error_code: str,
+    ) -> ContainmentResult:
+        try:
+            exists = await self._container_exists(owned["container_id"])
+        except (BrokerError, OSError, TimeoutError):
+            return ContainmentResult(
+                "runtime_unavailable", error_code="container_state_unavailable",
+            )
+        if not exists:
+            evidence = hashlib.sha256(
+                f"{owned['container_id']}\n{owned['allocation_id']}\nverified_absent".encode(),
+            ).hexdigest()
+            return ContainmentResult("verified_absent", evidence=evidence)
+        return ContainmentResult(
+            "inspection_inconclusive", error_code=error_code,
+        )
+
+    @staticmethod
+    def _verified_stopped(info: dict[str, Any]) -> ContainmentResult:
+        raw = json.dumps(info, sort_keys=True, separators=(",", ":"))
+        return ContainmentResult(
+            "verified_stopped",
+            evidence=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        )
 
     async def _terminate_container(self, task_id: str, *, recovery: bool) -> str:
         if (
@@ -333,9 +527,14 @@ class RootlessPodmanRuntime:
         return evidence
 
     async def remove_owned(self, task_id: str) -> str:
+        lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
+        async with lock:
+            return await self._remove_owned_locked(task_id)
+
+    async def _remove_owned_locked(self, task_id: str) -> str:
         owned = self.registry.owned_container(task_id)
         if owned["lifecycle_state"] != "terminated":
-            await self.terminate_owned(task_id)
+            await self._terminate_container(task_id, recovery=False)
             owned = self.registry.owned_container(task_id)
         await self.inspect_owned(task_id)
         await self._run("rm", owned["container_id"], timeout=10, maximum=4096)

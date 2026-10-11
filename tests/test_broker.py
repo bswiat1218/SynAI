@@ -1291,15 +1291,15 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.registry.transition(request.task_id, "ready")
         self.service.registry.reserve_container(request.task_id, request.allocation_id)
         self.service.registry.bind_container(request.task_id, request.allocation_id, "c" * 64)
-        self.service.runtime.terminate_recorded = AsyncMock(return_value="stopped")
-        self.service.runtime.inspect_recorded = AsyncMock(
-            return_value={"State": {"Running": False}},
+        self.service.runtime.contain_recorded = AsyncMock(
+            return_value=runtime_module.ContainmentResult(
+                "verified_stopped", evidence="f" * 64,
+            ),
         )
 
         await self.service._handle_storage_assurance_loss(("storage_role_unavailable",))
 
-        self.service.runtime.terminate_recorded.assert_awaited_once_with(request.task_id)
-        self.service.runtime.inspect_recorded.assert_awaited_once_with(request.task_id)
+        self.service.runtime.contain_recorded.assert_awaited_once_with(request.task_id)
         container = self.service.registry.container_record(request.task_id)
         self.assertEqual(container["lifecycle_state"], "terminated")
         self.assertEqual(
@@ -1314,8 +1314,10 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.registry.transition(request.task_id, "ready")
         self.service.registry.reserve_container(request.task_id, request.allocation_id)
         self.service.registry.bind_container(request.task_id, request.allocation_id, "d" * 64)
-        self.service.runtime.terminate_recorded = AsyncMock(
-            side_effect=BrokerError("termination_unconfirmed", "not stopped", 409),
+        self.service.runtime.contain_recorded = AsyncMock(
+            return_value=runtime_module.ContainmentResult(
+                "still_running", error_code="forced_stop_unconfirmed",
+            ),
         )
 
         await self.service._handle_storage_assurance_loss(("storage_role_stale",))
@@ -1325,35 +1327,377 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("storage_containment_unconfirmed", self.service.readiness.reasons)
         self.assertFalse(self.service.readiness.execution_available)
 
-    async def test_storage_loss_skips_podman_when_runtime_storage_is_unverified(self) -> None:
+    async def test_storage_loss_containment_is_independent_of_quota_readiness(self) -> None:
         request = claim("prepare", {})
         self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
         self.service.registry.transition(request.task_id, "ready")
         self.service.registry.reserve_container(request.task_id, request.allocation_id)
         self.service.registry.bind_container(request.task_id, request.allocation_id, "e" * 64)
         self.service.quota_manager.runtime_containment_available = False
-
-        with patch.object(self.service.runtime, "_run", new_callable=AsyncMock) as run:
-            await self.service._handle_storage_assurance_loss(("storage_role_unavailable",))
-
-            with self.assertRaises(BrokerError) as blocked:
-                await self.service.runtime.terminate_recorded(request.task_id)
-            self.assertEqual(blocked.exception.code, "runtime_storage_unverified")
-            run.assert_not_awaited()
+        self.service.runtime.contain_recorded = AsyncMock(
+            return_value=runtime_module.ContainmentResult(
+                "verified_stopped", evidence="a" * 64,
+            ),
+        )
+        await self.service._handle_storage_assurance_loss(("storage_role_unavailable",))
+        self.service.runtime.contain_recorded.assert_awaited_once_with(request.task_id)
         self.assertEqual(
             self.service.registry.container_record(request.task_id)["lifecycle_state"],
-            "quarantined",
+            "terminated",
+        )
+        self.assertNotIn("storage_containment_unconfirmed", self.service.readiness.reasons)
+
+    def _register_owned_container(self, container_id: str = "b" * 64) -> Any:
+        self.service.runtime.image_id = "image-id"
+        request = claim("prepare", {})
+        self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
+        self.service.registry.transition(request.task_id, "ready")
+        self.service.registry.reserve_container(
+            request.task_id, request.allocation_id,
+        )
+        self.service.registry.bind_container(
+            request.task_id, request.allocation_id, container_id,
+        )
+        return self.service.registry.container_record(request.task_id)
+
+    @staticmethod
+    def _containment_info(record: Any, *, running: bool, labels: dict[str, str] | None = None) -> dict[str, Any]:
+        return {
+            "Id": record["container_id"],
+            "Image": "image-id",
+            "Config": {"Labels": labels or {
+                "synai.broker.task": record["task_id"],
+                "synai.broker.allocation": record["allocation_id"],
+                "synai.broker.image-digest": record["image_digest"],
+                "synai.broker.snapshot-digest": record["snapshot_digest"],
+            }},
+            "State": {"Running": running, "Status": "running" if running else "exited"},
+        }
+
+    async def test_containment_graceful_stop_is_independently_verified(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(side_effect=[
+            self._containment_info(record, running=True),
+            self._containment_info(record, running=False),
+        ])
+        runtime._run = AsyncMock(return_value="")
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "verified_stopped")
+        self.assertIsNotNone(result.evidence)
+        runtime._run.assert_awaited_once_with(
+            "stop", "--time", "3", record["container_id"],
+            timeout=5, maximum=4096,
+        )
+
+    async def test_containment_escalates_after_graceful_timeout_and_verifies_kill(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(side_effect=[
+            self._containment_info(record, running=True),
+            self._containment_info(record, running=True),
+            self._containment_info(record, running=False),
+        ])
+        runtime._run = AsyncMock(side_effect=[TimeoutError(), ""])
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "verified_stopped")
+        self.assertEqual(runtime._run.await_count, 2)
+        self.assertEqual(runtime._run.await_args_list[1].args, ("kill", record["container_id"]))
+
+    async def test_containment_reports_still_running_after_bounded_force_attempt(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(side_effect=[
+            self._containment_info(record, running=True),
+            self._containment_info(record, running=True),
+            self._containment_info(record, running=True),
+        ])
+        runtime._run = AsyncMock(side_effect=[
+            BrokerError("runtime_operation_failed", "stop failed", 502),
+            BrokerError("runtime_operation_failed", "kill failed", 502),
+        ])
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "still_running")
+        self.assertEqual(runtime._run.await_count, 2)
+
+    async def test_containment_accepts_already_stopped_without_termination_command(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(
+            return_value=self._containment_info(record, running=False),
+        )
+        runtime._run = AsyncMock()
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "verified_stopped")
+        runtime._run.assert_not_awaited()
+
+    async def test_containment_reports_absent_only_after_exact_exists_check(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(side_effect=BrokerError(
+            "runtime_operation_failed", "inspect error", 502,
+        ))
+        runtime._container_exists = AsyncMock(return_value=False)
+        runtime._run = AsyncMock()
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "verified_absent")
+        runtime._container_exists.assert_awaited_once_with(record["container_id"])
+        runtime._run.assert_not_awaited()
+
+    async def test_containment_runtime_unavailable_is_not_absence(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(side_effect=BrokerError(
+            "runtime_operation_failed", "runtime unavailable", 503,
+        ))
+        runtime._container_exists = AsyncMock(side_effect=BrokerError(
+            "runtime_unavailable", "runtime unavailable", 503,
+        ))
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "runtime_unavailable")
+
+    async def test_containment_identity_mismatch_never_issues_runtime_command(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        runtime.inspect_recorded = AsyncMock(return_value=self._containment_info(
+            record, running=True,
+            labels={"synai.broker.task": "9" * 32},
+        ))
+        runtime._run = AsyncMock()
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "identity_mismatch")
+        runtime._run.assert_not_awaited()
+
+    async def test_containment_image_identity_mismatch_never_issues_runtime_command(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        info = self._containment_info(record, running=True)
+        info["Image"] = "unexpected-image-id"
+        runtime.inspect_recorded = AsyncMock(return_value=info)
+        runtime._run = AsyncMock()
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "identity_mismatch")
+        runtime._run.assert_not_awaited()
+
+    async def test_containment_container_id_mismatch_never_issues_runtime_command(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        info = self._containment_info(record, running=True)
+        info["Id"] = "c" * 64
+        runtime.inspect_recorded = AsyncMock(return_value=info)
+        runtime._run = AsyncMock()
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "identity_mismatch")
+        runtime._run.assert_not_awaited()
+
+    async def test_containment_rejects_partial_container_id(self) -> None:
+        record = self._register_owned_container(container_id="b" * 12)
+        runtime = self.service.runtime
+        runtime._run = AsyncMock()
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        result = await runtime.contain_recorded(record["task_id"])
+
+        self.assertEqual(result.state, "identity_mismatch")
+        runtime._run.assert_not_awaited()
+
+    async def test_containment_serializes_with_ordinary_task_cancellation(self) -> None:
+        record = self._register_owned_container()
+        runtime = self.service.runtime
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def inspect(_: str) -> dict[str, Any]:
+            entered.set()
+            await release.wait()
+            return self._containment_info(record, running=False)
+
+        runtime.inspect_recorded = AsyncMock(side_effect=inspect)
+        runtime._terminate_container = AsyncMock(return_value="terminated")
+        runtime.emergency_containment_available = Mock(return_value=True)
+
+        containment = asyncio.create_task(runtime.contain_recorded(record["task_id"]))
+        await entered.wait()
+        cancellation = asyncio.create_task(runtime.terminate_owned(record["task_id"]))
+        await asyncio.sleep(0)
+        runtime._terminate_container.assert_not_awaited()
+        release.set()
+
+        result, _ = await asyncio.gather(containment, cancellation)
+
+        self.assertEqual(result.state, "verified_stopped")
+        runtime._terminate_container.assert_awaited_once_with(
+            record["task_id"], recovery=False,
+        )
+
+    async def test_containment_missing_registry_record_is_unresolved(self) -> None:
+        runtime = self.service.runtime
+        runtime.emergency_containment_available = Mock(return_value=True)
+        with patch.object(self.service.registry, "container_record", return_value=None):
+            result = await runtime.contain_recorded("1" * 32)
+        self.assertEqual(result.state, "identity_mismatch")
+
+    async def test_assurance_loss_containment_does_not_require_quota_inspector(self) -> None:
+        record = self._register_owned_container()
+        self.service.quota_manager.runtime_containment_available = False
+        self.service.runtime.contain_recorded = AsyncMock(
+            return_value=runtime_module.ContainmentResult(
+                "verified_stopped", evidence="e" * 64,
+            ),
+        )
+
+        await self.service._handle_storage_assurance_loss(("inspector_unavailable",))
+
+        self.service.runtime.contain_recorded.assert_awaited_once_with(record["task_id"])
+        self.assertEqual(
+            self.service.registry.container_record(record["task_id"])["lifecycle_state"],
+            "terminated",
+        )
+        self.assertFalse(self.service.readiness.execution_available)
+
+    async def test_concurrent_storage_loss_notifications_share_one_containment_attempt(self) -> None:
+        record = self._register_owned_container()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def contain(_: str) -> runtime_module.ContainmentResult:
+            entered.set()
+            await release.wait()
+            return runtime_module.ContainmentResult("verified_stopped", evidence="1" * 64)
+
+        self.service.runtime.contain_recorded = AsyncMock(side_effect=contain)
+        first = asyncio.create_task(
+            self.service._handle_storage_assurance_loss(("inspector_unavailable",)),
+        )
+        await entered.wait()
+        second = asyncio.create_task(
+            self.service._handle_storage_assurance_loss(("inspector_unavailable",)),
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(self.service.runtime.contain_recorded.await_count, 1)
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(self.service.runtime.contain_recorded.await_count, 1)
+        self.assertEqual(
+            self.service.registry.container_record(record["task_id"])["lifecycle_state"],
+            "terminated",
+        )
+
+    async def test_cancelling_loss_handler_does_not_cancel_containment_or_skip_evidence(self) -> None:
+        record = self._register_owned_container()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def contain(_: str) -> runtime_module.ContainmentResult:
+            entered.set()
+            await release.wait()
+            return runtime_module.ContainmentResult("verified_stopped", evidence="2" * 64)
+
+        self.service.runtime.contain_recorded = AsyncMock(side_effect=contain)
+        handler = asyncio.create_task(
+            self.service._handle_storage_assurance_loss(("inspector_unavailable",)),
+        )
+        await entered.wait()
+        handler.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await handler
+        containment = self.service._containment_tasks[record["task_id"]]
+        self.assertFalse(containment.cancelled())
+        release.set()
+        result = await containment
+        self.assertEqual(result.state, "verified_stopped")
+        self.assertEqual(
+            self.service.registry.container_record(record["task_id"])["lifecycle_state"],
+            "terminated",
+        )
+        self.assertFalse(self.service.readiness.execution_available)
+
+    async def test_failed_quarantine_persistence_does_not_claim_containment_durable(self) -> None:
+        record = self._register_owned_container()
+        self.service.runtime.contain_recorded = AsyncMock(
+            return_value=runtime_module.ContainmentResult("verified_stopped", evidence="3" * 64),
+        )
+        with patch.object(
+            self.service.registry, "quarantine_all_for_storage_loss",
+            side_effect=sqlite3.OperationalError("state write failed"),
+        ):
+            await self.service._handle_storage_assurance_loss(("inspector_unavailable",))
+        self.service.runtime.contain_recorded.assert_awaited_once_with(record["task_id"])
+        self.assertEqual(
+            self.service.registry.container_record(record["task_id"])["lifecycle_state"],
+            "owned",
         )
         self.assertIn("storage_containment_unconfirmed", self.service.readiness.reasons)
+
+    async def test_unreadable_registry_never_claims_containment_confirmed(self) -> None:
+        self.service.registry.container_records = Mock(
+            side_effect=sqlite3.OperationalError("registry unavailable"),
+        )
+        self.service.registry.quarantine_all_for_storage_loss = Mock(
+            side_effect=sqlite3.OperationalError("registry unavailable"),
+        )
+        self.service.runtime.contain_recorded = AsyncMock()
+
+        await self.service._handle_storage_assurance_loss(("inspector_unavailable",))
+
+        self.service.runtime.contain_recorded.assert_not_awaited()
+        self.assertIn("storage_containment_unconfirmed", self.service.readiness.reasons)
+        self.assertFalse(self.service.readiness.execution_available)
+
+    async def test_unresolved_containment_survives_registry_restart_as_quarantined(self) -> None:
+        record = self._register_owned_container()
+        self.service.runtime.contain_recorded = AsyncMock(
+            return_value=runtime_module.ContainmentResult(
+                "runtime_unavailable", error_code="runtime_unavailable",
+            ),
+        )
+        await self.service._handle_storage_assurance_loss(("inspector_unavailable",))
+
+        restarted = BrokerRegistry(self.selected)
+        restarted.initialize()
+        persisted = restarted.container_record(record["task_id"])
+        self.assertEqual(persisted["lifecycle_state"], "quarantined")
+        self.assertIn("runtime_unavailable", persisted["reconciliation_evidence"])
+        self.assertFalse(self.service.readiness.execution_available)
 
     async def test_container_tmpfs_has_both_byte_and_inode_limits(self) -> None:
         runtime = RootlessPodmanRuntime(self.selected, self.service.registry)
         runtime.readiness = BrokerReadiness(True, True, {}, ())
+        request = claim("prepare", {})
+        self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
+        self.service.registry.transition(request.task_id, "ready")
         with patch.object(runtime, "_run", new_callable=AsyncMock) as run:
             run.return_value = "a" * 64
             await runtime.create_task(
-                "1" * 32, "2" * 32,
-                self.selected.quota_slots[0].path / ("1" * 32) / "workspace",
+                request.task_id, request.allocation_id,
+                self.selected.quota_slots[0].path / request.task_id / "workspace",
             )
 
         arguments = run.await_args.args
