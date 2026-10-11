@@ -1,8 +1,9 @@
 # SynAI 2.0 Architecture Baseline
 
-**Status:** Documentation baseline; execution architecture is not yet approved
-for Phase 13F-A implementation. See [the alignment assessment](#phase-13b-13e-alignment-assessment)
-and [Phase 13F-A entry and 13F-B acceptance gates](#phase-13f-a-entry-and-13f-b-acceptance-gates).
+**Status:** Phase 13F-A architecture/design approved by operator on
+2026-10-10; implementation and runtime security acceptance remain pending.
+See [the alignment assessment](#16-phase-13b13e-alignment-assessment)
+and [Phase 13F-A entry and 13F-B acceptance gates](#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
 
 This is the primary architecture reference for SynAI 2.0. It consolidates the
 checked-in Phase 13B–13E implementation notes, the existing agent architecture,
@@ -14,8 +15,8 @@ The supplied Phase 13A migration plan and subsequent distributed realignment
 are preserved verbatim in [the historical-plan archive](./history/README.md).
 The checked-in Phase 13B–13E documents report that the revised plan was
 unavailable during implementation. The supplied plans provide historical
-design context but are not separate evidence of formal approval. In
-particular, the rootless Podman proposal remains pending explicit approval;
+design context but are not separate evidence of formal approval. The current
+operator has approved the initial Broker architecture for Phase 13F-A design;
 see [ADR 0004](./adr/0004-rootless-podman-broker.md). Historical/current
 design differences are assessed in the archive index and below. The approved
 trust invariants supplied for this phase are recorded in [trust
@@ -183,7 +184,7 @@ establish the Broker never falls back to host execution.
 This describes required behavior, not a current implementation. Transport
 identity, durable claim ledger, snapshot retrieval, lease authority,
 container policy details and recovery are design-review items; see
-[protocol contracts](./protocols.md) and [Phase 13F-A entry gate](#phase-13f-a-entry-and-13f-b-acceptance-gates).
+[protocol contracts](./protocols.md) and [Phase 13F-A entry gate](#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
 
 ## 6. Browser and authentication/identity models
 
@@ -421,9 +422,9 @@ protocol support are not implemented.
 
 | ID | Severity | Finding | Evidence/status | Required resolution |
 |---|---|---|---|---|
-| A1 | Medium | The supplied Phase 13A plan and realignment are now archived verbatim, but no separate formal approval record was supplied. Checked-in Phase 13B explicitly says the revised plan was unavailable during implementation. | Historical design is traceable; approval provenance remains unverified. | Explicitly review and approve the baseline/ADR decisions; do not infer approval from the plans. |
-| A2 | Medium | Distributed task claims and fencing are not operational. `distributed_tasks` has claim/generation columns and a disabled task-contract helper, but no claim/renew/release/recover API or Broker enforcement exists. WorkspaceCoordinator operates on configured legacy workspace identities and is not wired to these records. | A detailed proposed contract is now documented; authority choice awaits approval and implementation is a 13F-A deliverable. | Approve the proposed claim authority and recovery protocol before implementation; implement and independently test in 13F-A. |
-| A3 | Medium | No Sandbox Broker exists. Reusing the local TUI `Sandbox` as a Broker would violate the intended separation: it calls the configured runtime CLI, accepts an image argument, uses bridge networking for created containers and binds the local selected workspace read-write. `HostExecution` is explicitly host execution. | No current distributed execution feature; local legacy behavior is not itself a distributed violation. Broker absence is an implementation deliverable, not an entry-gate failure. | Approve the separate Broker architecture; implement it in 13F-A and never route Broker failure to local backends. |
+| A1 | Low | The supplied Phase 13A plan and realignment are archived verbatim, but no separate historical approval record was supplied. Checked-in Phase 13B explicitly says the revised plan was unavailable during implementation. | Historical provenance remains unverified; the current operator's 2026-10-10 design approval is recorded in ADR 0004 and does not retroactively authenticate historical approval. | Retain the provenance distinction; no further entry-gate action is required. |
+| A2 | Medium | Distributed task claims and fencing are not operational. `distributed_tasks` has claim/generation columns and a disabled task-contract helper, but no claim/renew/release/recover API or Broker enforcement exists. WorkspaceCoordinator operates on configured legacy workspace identities and is not wired to these records. | Approved claim/fencing design is documented; implementation and independent tests remain 13F-A deliverables. | Implement the approved Core-authoritative ledger and Broker current-authority enforcement; pass stale/replay/recovery tests before 13F-B. |
+| A3 | Medium | No Sandbox Broker exists. Reusing the local TUI `Sandbox` as a Broker would violate the intended separation: it calls the configured runtime CLI, accepts an image argument, uses bridge networking for created containers and binds the local selected workspace read-write. `HostExecution` is explicitly host execution. | No current distributed execution feature; local legacy behavior is not itself a distributed violation. Broker absence is an implementation deliverable, not an entry-gate failure. | Implement the separately approved Broker in 13F-A; never route Broker failure to local backends. |
 | A4 | Medium | The 13B compatibility registry still represents configured host directories and validates their filesystem identity in the Core process. It is read-only metadata and must remain isolated from distributed logical-project/snapshot processing. | Implemented legacy compatibility surface; not a client path supplied by browser. | Keep it disabled from task execution and retain explicit tests that distributed APIs never resolve or mount these paths. |
 | A5 | Medium | The single-user service has no project ACL model. Authenticated browser operations are effectively operator-wide, not multi-tenant isolation. | Documented deployment assumption, not a multi-user guarantee. | Before multiple users/tenants, add explicit project authorization and object-level checks for every route and stream. |
 | A6 | Medium | Snapshot filters are heuristic; neither preview nor extension/path exclusions prove secret absence. Core intentionally receives and retains approved source content. | Documented and intrinsic limitation. | Keep transfer disclosure clear; consider optional secret-scanning/redaction only with explicit UX and no claim of completeness. |
@@ -431,18 +432,19 @@ protocol support are not implemented.
 | A8 | Low | Rootless Podman, Core/Broker identities, image digests and production deployment boundaries have no production manifests or integration evidence. | Design/deployment evidence absent. | Add deployment-specific acceptance tests and reviewed manifests before production claims. |
 
 No Critical source-code trust-boundary violation was confirmed in the reviewed
-13B–13E path. Historical plan content is now traceable and proposed claim and
-snapshot contracts are documented. No formal approval is established:
-rootless Podman selection, claim authority and deployment assumptions still
-require explicit design approval before implementation.
+13B–13E path. The initial Broker architecture and contract semantics received
+operator design approval on 2026-10-10. Historical plan approval provenance
+remains distinct and unverified. Broker implementation, runtime enforcement
+and security acceptance are not established and remain required before
+13F-B.
 
 ### Missing or unverified security guarantees
 
 - No production Core deployment/image/UID/mount review, Broker service
   identity or rootless Podman integration exists.
 - No task claim ledger, claim expiry/renewal, stale-fence rejection, result
-  validation or recovery proof is implemented. A detailed contract proposal
-  is recorded in [protocols.md](./protocols.md).
+  validation or recovery proof is implemented. The approved design is
+  recorded in [protocols.md](./protocols.md).
 - No distributed authorization/approval issuance model or multi-user ACL is
   present.
 - No guarantee exists that transferred source is free of secrets or malicious
@@ -456,16 +458,34 @@ require explicit design approval before implementation.
 
 ## 17. Phase 13F-A entry and 13F-B acceptance gates
 
-These gates distinguish design prerequisites from implementation work. The
-absence of a Broker is an implementation deliverable, not an entry-gate
-failure. The proposed contract in [protocols.md](./protocols.md) and Broker
-architecture in [ADR 0004](./adr/0004-rootless-podman-broker.md) require
-explicit design approval before implementation.
+These gates distinguish design approval from implementation and runtime
+security acceptance. The absence of a Broker is an implementation
+deliverable, not an entry-gate failure. The initial architecture and contract
+in [protocols.md](./protocols.md) and [ADR 0004](./adr/0004-rootless-podman-broker.md)
+received operator design approval on 2026-10-10. This does not establish
+implementation correctness or runtime security.
 
 ### Entry gate — before 13F-A implementation
 
-- Architecture and ADRs reviewed; record explicit approval of the selected
-  Broker direction. A historical plan or written ADR is not itself approval.
+**Design approval: satisfied** for the ten initial choices enumerated in ADR
+0004: separate dedicated unprivileged rootless Podman Broker; narrow
+mutually-authenticated Core–Broker API using mTLS (private service network
+preferred) and no Core runtime socket; Core-authoritative durable claim,
+revocation, fencing and recovery ledger; Broker authentication, replay
+rejection, short-lived claims and independent current-authority checks;
+fail-closed behavior on authority loss/expiry; exact immutable snapshot
+retrieval and independent digest verification; operator-approved
+digest-pinned images; default-disabled networking, no privileged execution or
+arbitrary host mounts, and verified resource limits; durable ownership,
+operation, cancellation/recovery and bounded result evidence; and no
+uncertain-operation replay, HostExecution fallback or Browser Chat tool
+execution.
+
+This is **architecture/design approval for Phase 13F-A only**, not approval
+of implementation or production security acceptance.
+
+- Architecture and ADRs reviewed; explicit design approval is recorded above.
+  No approval is inferred from historical plans.
 - Service trust boundary specified: dedicated unprivileged Broker identity;
   Core has no runtime socket, credentials, arbitrary host/client mounts or
   host-execution fallback.
@@ -519,10 +539,11 @@ Broker or passing integration tests before implementation starts.
 - No Critical security defects or unverified essential isolation controls
   remain.
 
-The exact entry design approvals still required are listed in the protocol
-and ADR. Passing this acceptance gate does not authorize client-side patch
-application or Phase 13F-B implementation beyond its separately reviewed
-scope.
+The initial architecture/design decisions are approved; concrete
+implementation parameters and test procedures remain to be specified and
+verified without weakening the approved contract. Passing this acceptance
+gate does not authorize client-side patch application or Phase 13F-B
+implementation beyond its separately reviewed scope.
 
 ## 18. Source and test evidence
 

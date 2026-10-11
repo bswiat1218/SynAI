@@ -52,11 +52,12 @@ phase/checkpoint and memory schemas are not changed by this document.
 
 The current 13F-A entry gate, implementation deliverables and 13F-B
 acceptance gate are defined in
-[the canonical architecture](./synai-2.0.md#phase-13f-a-entry-and-13f-b-acceptance-gates).
+[the canonical architecture](./synai-2.0.md#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
 The absence of an unimplemented Broker is a deliverable, not an entry failure.
-Before 13F-A, explicitly approve the architecture/ADR and unresolved service
-authentication, claim authority, snapshot grants, resource profile and
-Ubuntu runtime assumptions.
+The initial architecture and ADR 0004 received operator design approval on
+2026-10-10. Concrete implementation parameters and target-runtime evidence
+remain Phase 13F-A work; runtime security acceptance remains a gate before
+13F-B.
 
 **Not a 13F-A authorization:** client patch application, multi-user project
 ACLs, memory migration, Android, GPU, remote workers or historical schema

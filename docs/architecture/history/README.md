@@ -13,8 +13,12 @@ or implementation evidence. The current reference remains
 The supplied documents are plans, not independent approval records. The
 realignment describes rootless Podman as its initial supported Broker runtime,
 but the source material does not include a separate sign-off proving that
-specific implementation decision was formally approved. ADR 0004 therefore
-remains proposed pending explicit review.
+specific implementation decision was formally approved at that time. The
+operator subsequently approved the initial Broker architecture for Phase
+13F-A design on 2026-10-10; that current approval is recorded in
+[ADR 0004](../adr/0004-rootless-podman-broker.md) and does not retroactively
+change historical provenance or constitute implementation/security
+acceptance.
 
 ## Traceability and supersession notes
 
@@ -35,8 +39,8 @@ remains proposed pending explicit review.
 - The realignment specifies rootless Podman, a dedicated unprivileged Broker
   identity, private runtime ownership, no network by default, digest-pinned
   images, bounded task containers and no Core runtime socket. ADR 0004
-  carries these constraints forward, but remains proposed until approval
-  evidence is recorded.
+  carries these constraints forward and has separate current architecture
+  approval; the historical plan itself is not that approval evidence.
 - Both plans retain legacy TUI support, separate browser chat from tasks,
   prohibit silent host-execution fallback and require no replay of uncertain
   operations. These points align with the canonical current architecture.

@@ -46,7 +46,7 @@ host or container administration.
 No Broker exists. Before implementation: define service identity and transport,
 durable task claim/fencing authority, rootless Podman deployment, pinned
 images, mount/resource/network policy, ownership verification, cancellation
-and crash recovery. See [Phase 13F-A acceptance criteria](../synai-2.0.md#phase-13f-a-prerequisites).
+and crash recovery. See [Phase 13F-A acceptance criteria](../synai-2.0.md#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
 
 ## Historical input
 

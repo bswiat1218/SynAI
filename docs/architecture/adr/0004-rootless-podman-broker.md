@@ -1,19 +1,27 @@
 # ADR 0004: Rootless Podman Sandbox Broker
 
-- **Status:** Proposed; pending explicit design approval. Not Accepted and
-  not implemented.
-- **Date:** 2026-10-10 baseline documentation.
+- **Status:** Accepted for Phase 13F-A architecture/design only. Runtime
+  implementation and production security acceptance are not approved by this
+  decision.
+- **Decision date:** 2026-10-10.
+- **Approval evidence:** Operator authorization in the Phase 13F-A
+  Architecture Sign-Off request dated 2026-10-10. Scope is the ten initial
+  Sandbox Broker design choices recorded below; this is not implementation
+  approval, runtime isolation evidence, resource-enforcement evidence,
+  fencing-test acceptance, or production security acceptance.
 
 ## Decision
 
-The proposed Phase 13F-A Broker is a dedicated unprivileged Linux service
+The Phase 13F-A Broker is a dedicated unprivileged Linux service
 identity, separate from Core, TUI and client identities. Rootless Podman is
 managed only by this identity, using private runtime configuration, storage
 and socket permissions. SynAI Core receives neither Podman/Docker sockets nor
 runtime credentials.
 
-Core and Broker communicate over a narrow authenticated API. The Broker
-creates and manages only disposable task containers it allocated and can
+Core and Broker communicate over a narrow mutually authenticated API using
+mTLS, preferably over a private service network. The raw Podman/Docker API,
+socket and runtime credentials are never exposed to Core. The Broker creates
+and manages only disposable task containers it allocated and can
 independently verify as owned. Each operation is bound to an authenticated
 task claim and immutable task-scoped snapshot inputs. The container receives
 only a restricted writable task workspace; arbitrary host and client
@@ -25,8 +33,8 @@ CPU, memory, PID, storage, runtime and output limits, along with fixed
 operation, mount, namespace and privilege restrictions. There is no
 privileged execution and no silent fallback to Core or host execution.
 
-This is a proposed initial architecture, not an approved protocol, an
-operational Broker, or evidence that a particular runtime configuration
+This is the approved initial architecture for Phase 13F-A design. It is not
+an operational Broker or evidence that a particular runtime configuration
 enforces these restrictions.
 
 ## Rationale
@@ -52,8 +60,18 @@ policy even when Core issues an otherwise valid claim.
 
 ## Consequences
 
-- Claims, current lease generations, replay handling, snapshot grants,
-  ownership records and recovery state require durable, reviewed contracts.
+- Core's durable task-claim ledger is authoritative for claim issuance,
+  revocation, fencing generations and recovery. Claims have short,
+  implementation-enforced lifetimes; exact maximum TTL and renewal parameters
+  must be fixed and tested before deployment.
+- The Broker authenticates claims, rejects replay and independently checks
+  current Core authority before consequential operations. If current
+  authority cannot be verified, it fails closed; expired claims and Core
+  disconnection cannot authorize new execution.
+- Snapshot retrieval is limited to the exact task-authorized immutable
+  snapshot, with independent manifest and content digest verification.
+- Allocation ownership, operation states, cancellation/recovery evidence and
+  bounded validated result artifacts are durable Broker responsibilities.
 - A claim signature alone is insufficient: the Broker must check current
   authority and its fixed local restrictions before side effects.
 - Image selection, operation kinds, resources, mounts, networking and output
@@ -87,29 +105,36 @@ Server 26.04 environment and verify, rather than assume:
 If an essential restriction cannot be demonstrated, deployment must fail
 closed; configuration presence alone is not evidence of enforcement.
 
-## Remaining decisions requiring approval
+## Implementation details and acceptance evidence still required
 
-1. Approve this dedicated rootless Podman direction and its service boundary.
-2. Approve the Core/Broker authentication mechanism and identity lifecycle.
-3. Approve the claim issuer, durable lease-generation authority, fencing,
-   expiry, revocation and uncertain-operation recovery model.
-4. Approve snapshot-scoped retrieval grants, expiry and maximum transfer
-   limits.
-5. Approve allowed operation kinds, immutable image digest update/provenance
-   process, resource ceilings and any network exceptions.
-6. Approve writable staging/export layout, artifact validation and retention.
-7. Approve the Ubuntu verification plan, adversarial tests and deployment
-   monitoring/recovery evidence.
+The architecture choices above are approved; these implementation details
+must be specified without weakening those choices:
+
+1. Exact mTLS certificate issuance, rotation, revocation and service identity
+   lifecycle.
+2. Maximum claim/grant TTL, renewal behavior, durable transaction boundaries,
+   fencing checks at consequential operations and recovery evidence format.
+3. Snapshot transfer size/count limits, grant encoding, staging layout and
+   cleanup/retention parameters.
+4. Allowed operation kinds, approved image digest update/provenance process,
+   concrete resource ceilings and any separately reviewed network exception.
+5. Writable staging/export layout and artifact validation/retention details.
+6. Ubuntu verification plan, adversarial test cases, deployment monitoring
+   and operational recovery procedures.
+
+These are implementation specification and test obligations, not reversals
+of the approved architecture. Do not claim isolation, enforcement, fencing
+or recovery guarantees until target-runtime tests demonstrate them.
 
 ## Implementation dependencies
 
-Before implementation, review this ADR and the proposed
-[Core-to-Broker contract](../protocols.md#proposed-core-to-broker-claim-and-fencing-contract),
-[snapshot retrieval contract](../protocols.md#proposed-broker-snapshot-retrieval),
-and [Phase 13F gates](../synai-2.0.md#phase-13f-a-entry-and-13f-b-acceptance-gates).
+The approved design is captured by the
+[Core-to-Broker contract](../protocols.md#core-to-broker-claim-and-fencing-contract),
+[snapshot retrieval contract](../protocols.md#broker-snapshot-retrieval-contract),
+and [Phase 13F gates](../synai-2.0.md#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
 During 13F-A, implement and test the Broker, claim/fencing, retrieval,
-ownership, execution, artifact and recovery deliverables. Do not treat design
-approval as implementation/security-test acceptance.
+ownership, execution, artifact and recovery deliverables. Do not treat this
+design approval as implementation or security-test acceptance.
 
 ## Historical input
 
@@ -117,6 +142,5 @@ The supplied [Phase 13 architecture realignment](../history/Phase13ArchitectureR
 names rootless Podman, a dedicated unprivileged Broker identity, private
 runtime ownership, digest-pinned images, no network by default, bounded task
 containers and no Core runtime socket. The historical plan is archived for
-traceability, but no separate formal sign-off was supplied. It therefore
-supports the rationale and traceability of this proposal but does not make
-this ADR Accepted.
+traceability but is not the approval evidence for this ADR; the current
+operator sign-off above supplies the architecture/design approval.

@@ -215,19 +215,21 @@ production claim signer/ledger or independently enforcing Broker. Existing
 workspace lease generations are for Phase 13B configured workspace
 coordination and are not automatically the distributed task fencing source.
 
-## Proposed Core-to-Broker claim and fencing contract
+## Core-to-Broker claim and fencing contract
 
-**Status:** proposed `synai-broker/v1`; not implemented or approved. These
-fields and semantics specify a reviewable design baseline, not an existing
-wire format. Core/Broker requests use mutually authenticated service
-identities over a protected channel. Schemas are canonical, size-bounded and
-reject unknown fields. Every request carries protocol version and a unique
-request ID.
+**Status:** Architecture/design approved for Phase 13F-A on 2026-10-10;
+`synai-broker/v1` is not implemented. This approval covers the contract's
+security semantics, not a tested wire implementation or runtime acceptance.
+Core/Broker requests use mutually authenticated service identities with mTLS,
+preferably over a private service network. Schemas are canonical,
+size-bounded and reject unknown fields. Every request carries protocol version
+and a unique request ID.
 
 ### Claim payload
 
 Core issues a signed, short-lived, task-scoped execution claim after its
-policy/approval decision. The proposed v1 claim binds all of:
+policy/approval decision. The v1 design contract requires the claim to bind
+all of:
 
 ```json
 {
@@ -267,13 +269,15 @@ policy/approval decision. The proposed v1 claim binds all of:
 }
 ```
 
-This is a required binding list, not a finalized encoding or selected
+This is an approved binding list, not a finalized encoding or selected
 signature algorithm. Values including operation kind, policy/approval/plan
 references, resource profile and image profile must resolve to trusted,
 Core/Broker-controlled records; caller-provided free-form instructions cannot
-expand authority. The Core is the proposed issuer and durable source of
-authoritative task lease generations, issued claim IDs, revocations and
-operation states. Browser and Client Agent do not issue Broker claims.
+expand authority. Core is the issuer and its durable task-claim ledger is
+authoritative for issuance, revocation, fencing generations and recovery.
+The Broker durably records allocation/operation ownership and state. Browser
+Chat cannot execute tools or issue Broker claims; the Client Agent does not
+issue Broker claims.
 
 ### Current authority, fencing and operation semantics
 
@@ -335,13 +339,19 @@ operation states. Browser and Client Agent do not issue Broker claims.
   signed claim remains unexpired. Reconnect requires status reconciliation,
   not replay.
 
-These rules intentionally trade availability for single-writer safety.
-The exact durable transaction boundary, lease scope, signing/key-rotation
-mechanism, online-check caching policy (proposed default: no authorization
-caching for side effects), and recovery evidence format require design
-approval.
+Claims must have a short lifetime, with a strict implementation-enforced
+maximum TTL; the numeric ceiling, renewal behavior and clock-skew allowance
+must be fixed in the implementation specification and tested. These rules
+intentionally trade availability for single-writer safety. The exact durable
+transaction boundary, lease scope, signing/key-rotation mechanism,
+online-check caching policy (default: no authorization caching for
+consequential operations), and recovery evidence format remain implementation
+details. None may weaken the approved authority or fail-closed semantics.
 
-## Proposed Broker snapshot retrieval
+## Broker snapshot retrieval contract
+
+**Status:** Architecture/design approved for Phase 13F-A on 2026-10-10;
+not implemented or runtime-tested.
 
 There is no direct Client Agent-to-Broker upload and no arbitrary host
 filesystem retrieval. The Broker fetches input only through a narrow,
@@ -380,7 +390,10 @@ grant signing and whether integrity-checked transfer resume is allowed are
 deployment parameters requiring approval. They must be bounded in Broker and
 Core independently.
 
-## Proposed Broker allocation ownership and operation contract
+## Broker allocation ownership and operation contract
+
+**Status:** Architecture/design approved for Phase 13F-A on 2026-10-10;
+not implemented or runtime-tested.
 
 The Broker keeps a durable private allocation registry mapping operation and
 allocation IDs to the claim digest, fencing generation, snapshot digest,
@@ -427,8 +440,8 @@ artifact digest alone does not prove that intended filesystem changes
 occurred or that execution was benign. Distinguish byte integrity from
 behavioral correctness, which remains unproven without independent checks.
 
-All contract details in these subsections are proposed and require review;
-none are currently emitted or enforced by source code.
+All contract details in these subsections describe the approved Phase 13F-A
+design, not behavior currently emitted or enforced by source code.
 
 ## Artifact/result validation and future patch receipts
 
