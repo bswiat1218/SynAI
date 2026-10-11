@@ -27,8 +27,8 @@ class DataRootOwnership:
     """OS-backed single-process ownership for the shared ~/.synai data root."""
 
     def __init__(self, data_root: Path, mode: str) -> None:
-        if mode not in {"tui", "web"}:
-            raise ValueError("Data-root owner mode must be tui or web")
+        if mode != "web":
+            raise ValueError("Only the web service may own the SynAI data root")
         self.storage = ConversationStorage(data_root)
         self.path = checked_path(self.storage.root / "application.lock")
         self.mode = mode
@@ -97,6 +97,7 @@ class DataRootOwnership:
         try:
             value = json.loads(os.pread(descriptor, 4096, 0))
             pid, mode, started_at = value["pid"], value["mode"], value["started_at"]
+            # Read owner labels left in the lock file by older versions.
             if (
                 type(pid) is not int or pid < 1 or mode not in {"tui", "web"}
                 or type(started_at) is not int or started_at < 0

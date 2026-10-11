@@ -16,12 +16,12 @@ can create an Agent Task or dispatch execution.
 ## Rationale
 
 Chat identity and conversational input do not provide a validated plan,
-scoped approval or task claim. Separation also preserves the legacy local
-`CodingAgentRuntime` lifecycle and its authorization model.
+scoped approval or task claim. The retained local coding-agent runtime is not
+invoked by Browser Chat.
 
 ## Alternatives considered
 
-- Enable existing TUI tool schemas in browser chat: rejected.
+- Enable coding-agent tool schemas in Browser Chat: rejected.
 - Treat a project chat as a task: rejected.
 - Infer approval from session authentication: rejected.
 - Present metadata pages as operational task or sandbox controls: rejected.
@@ -43,5 +43,5 @@ Representative tests: `tests/test_web_chat.py`,
 
 ## Historical input
 
-Phase 13D explicitly describes tool-disabled chat and disabled execution.
-The original approved Phase 13A/realignment plan was unavailable.
+Phase 13D documents tool-disabled chat and disabled execution. Superseded
+Phase 13A source-plan copies are not included in the active documentation set.

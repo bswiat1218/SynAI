@@ -1,7 +1,8 @@
 # ADR 0001: Separate control plane from execution
 
-- **Status:** Accepted as a mandatory architecture constraint; Broker design
-  and implementation are pending. The historical approval record is absent.
+- **Status:** Accepted as a mandatory architecture constraint. The restricted
+  Broker implementation exists; Core integration and runtime security
+  acceptance remain incomplete.
 - **Date:** 2026-10-10 baseline documentation.
 
 ## Decision
@@ -9,15 +10,14 @@
 SynAI Core is an orchestration control plane and does not receive general
 host-execution authority. It has no unrestricted Docker/Podman socket and
 does not mount arbitrary host/client project directories. Distributed project
-execution, if approved, occurs in a separately identified and restricted
-Sandbox Broker. The Broker controls only its own authorized task containers.
-The legacy TUI keeps its pre-existing local execution backends under separate
-security semantics.
+execution occurs in a separately identified and restricted Sandbox Broker.
+The Broker controls only its own authorized task containers. The Core web
+request path does not dispatch through the standalone local container backend.
 
 ## Rationale
 
-The repository already separates web application APIs from the local TUI
-`Tools` and execution backends. Core handles chat, identity, metadata and
+The repository separates web application APIs from the retained agent `Tools`
+and execution-backend contracts. Core handles chat, identity, metadata and
 snapshot ingestion; browser chat has tool execution disabled. Keeping runtime
 control out of Core prevents a web/session compromise from becoming general
 host or container administration.
@@ -25,9 +25,11 @@ host or container administration.
 ## Alternatives considered
 
 - Give Core direct Docker/Podman access: rejected by the trust invariant.
-- Reuse the legacy TUI `Sandbox` or `HostExecution` as a server runner:
-  rejected; they are local TUI backends with different image, mount, network
-  and host-execution assumptions.
+- Reuse the standalone local `Sandbox` as a server runner: rejected; its
+  configurable runtime, image, bridge network and workspace mount do not meet
+  Broker isolation requirements.
+- Execute commands directly in Core: rejected; Core must have no general
+  host-execution authority.
 - Execute on Client Agent devices: rejected; device pairing and browser
   authentication do not grant local execution authority.
 
@@ -36,21 +38,23 @@ host or container administration.
 - Broker is a separate trust domain with a narrow authenticated API and own
   runtime identity.
 - Broker outage or invalid response must fail closed; no host fallback.
-- Existing Core and TUI remain distinct. This does not disable existing
-  explicitly configured local TUI host tools.
+- Existing local agent modules remain separate from the Core web request path;
+  their execution semantics are not Broker guarantees.
 - Production service identities, transport, deployment and runtime policy
   need additional design review.
 
 ## Implementation dependencies
 
-No Broker exists. Before implementation: define service identity and transport,
-durable task claim/fencing authority, rootless Podman deployment, pinned
-images, mount/resource/network policy, ownership verification, cancellation
-and crash recovery. See [Phase 13F-A acceptance criteria](../synai-2.0.md#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
+The restricted Broker service, claim-signature checks and rootless Podman
+adapter are implemented and tested. Before production use, verify service
+identity and transport, Core-authoritative claim/fencing integration, pinned
+images, mount/resource/network enforcement, ownership verification,
+cancellation and crash recovery in the deployment environment. See [Phase
+13F-A acceptance criteria](../synai-2.0.md#17-phase-13f-a-entry-and-13f-b-acceptance-gates).
 
 ## Historical input
 
-The original approved Phase 13A plan and subsequent realignment plan were not
-available in the repository. This record reflects the explicit trust
-invariants and checked-in Phase 13B/13C runner-boundary notes; it does not
-claim to reproduce a missing approval.
+The original Phase 13A plan copies are not included in the active documentation
+tree. This record reflects the explicit trust invariants and checked-in Phase
+13B/13C runner-boundary notes; it does not claim to reproduce a missing
+historical approval.

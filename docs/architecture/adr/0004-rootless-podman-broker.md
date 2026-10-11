@@ -13,7 +13,7 @@
 ## Decision
 
 The Phase 13F-A Broker is a dedicated unprivileged Linux service
-identity, separate from Core, TUI and client identities. Rootless Podman is
+identity, separate from Core and Client Agent identities. Rootless Podman is
 managed only by this identity, using private runtime configuration, storage
 and socket permissions. SynAI Core receives neither Podman/Docker sockets nor
 runtime credentials.
@@ -33,9 +33,9 @@ CPU, memory, PID, storage, runtime and output limits, along with fixed
 operation, mount, namespace and privilege restrictions. There is no
 privileged execution and no silent fallback to Core or host execution.
 
-This is the approved initial architecture for Phase 13F-A design. It is not
-an operational Broker or evidence that a particular runtime configuration
-enforces these restrictions.
+This is the approved initial architecture for Phase 13F-A design. A
+restricted Broker implementation exists, but this decision is not production
+runtime-enforcement evidence or security acceptance.
 
 ## Rationale
 
@@ -50,11 +50,11 @@ policy even when Core issues an otherwise valid claim.
 
 - Core uses an unrestricted runtime socket: rejected; violates control-plane
   separation.
-- Reuse legacy `synai.sandbox.Sandbox`: rejected; current behavior permits a
+- Reuse the standalone `synai.sandbox.Sandbox`: rejected; its behavior permits a
   selected image/runtime, bridge networking and a read-write local workspace
-  bind, and runs under the local TUI's authority.
-- Use host execution: rejected for distributed tasks; `HostExecution` is
-  explicitly unsandboxed.
+  bind, and runs under Core's process identity.
+- Execute commands directly in Core: rejected for distributed tasks; Core
+  must not have general host-execution authority.
 - Run workloads on client devices: rejected; local execution requires
   independent Client Agent authorization and is a separate future design.
 
@@ -138,9 +138,6 @@ design approval as implementation or security-test acceptance.
 
 ## Historical input
 
-The supplied [Phase 13 architecture realignment](../history/Phase13ArchitectureRealignment.md)
-names rootless Podman, a dedicated unprivileged Broker identity, private
-runtime ownership, digest-pinned images, no network by default, bounded task
-containers and no Core runtime socket. The historical plan is archived for
-traceability but is not the approval evidence for this ADR; the current
-operator sign-off above supplies the architecture/design approval.
+Superseded Phase 13A source-plan copies are not included in the active
+documentation tree. The operator sign-off above supplies this ADR's
+architecture/design approval.

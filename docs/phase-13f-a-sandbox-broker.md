@@ -2,9 +2,10 @@
 
 Phase 13F-A adds a separately launchable `synai-broker` process and its
 standalone package under `synai/broker/`. It does **not** connect the Broker
-to browser tasks, model-generated tool calls, `CodingAgentRuntime`, or the
-legacy TUI. No Core code receives Podman authority. The Core task records
-remain disabled until the follow-on integration has been reviewed.
+to browser tasks, model-generated tool calls, or `CodingAgentRuntime`. The
+Core web request path does not dispatch through the standalone local
+container backend or receive Podman authority. Core task records remain
+disabled until the follow-on integration has been reviewed.
 
 ## Reused architecture
 
@@ -13,8 +14,9 @@ adapt the existing `ExecutionBackend` contract and reuse `CodingAgentRuntime`,
 `Tools.call`, Phase 10 policy and per-operation approvals, plan validation,
 verification, repair/review bounds, `TaskChangeTracker`,
 `CheckpointManager`, and model-routing provenance. None of those paths is
-changed or invoked by this package. Legacy TUI sandbox and separately
-authorized host behavior remain on their existing paths.
+changed or invoked by this package. The standalone local container backend
+remains separate and is not a Broker fallback; direct host-execution code was
+removed.
 
 Dependency map: Phase 13C immutable snapshot store → exact task-scoped
 retrieval authorization → Broker validation and private immutable staging →

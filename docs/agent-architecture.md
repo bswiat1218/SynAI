@@ -1,25 +1,24 @@
-# SynAI legacy agent architecture
+# SynAI Coding-Agent Backend Architecture
 
 The authoritative SynAI 2.0 system baseline is
 [docs/architecture/synai-2.0.md](architecture/synai-2.0.md). This document
-retains the detailed legacy TUI and Phases 0–13E implementation history; it is
-not a replacement for the distributed trust boundaries, protocol contracts
-or Phase 13F-A prerequisites in the canonical baseline.
+describes retained agent and coding-agent backend components. It does not
+describe a supported local UI and is not a replacement for the distributed
+trust boundaries, protocol contracts, or Phase 13F-A prerequisites in the
+canonical baseline.
 
-This document records the current architecture before adding the opt-in
-coding-agent workflow. Existing components remain the authority for their
-respective responsibilities; the Phase 1 state model is additive.
+This document summarizes the retained architecture and its coding-agent
+workflow. Existing components remain authoritative for their respective
+responsibilities, and task-state extensions remain additive.
 
 ## Chat and streaming
 
-`CodingApp.action_send` validates that a conversation, model, workspace, and
-execution environment are available, then starts `CodingApp.run_turn`.
 `Agent.turn(session, model, prompt)` appends the user message and the persistent
 system instruction, saves history, and calls the configured `ModelProvider`.
 The Ollama provider streams `ChatEvent` values containing text, provider
 reasoning, native calls, and the completion marker. The agent updates the
-assistant message and UI during the stream and periodically saves partial
-output. A response with no tool calls ends the turn; normal chat does not
+assistant message and periodically saves partial output. A response with no
+tool calls ends the turn; normal chat does not
 require agent planning, repository indexing, or verification.
 
 The current execution-environment instruction is built into a separate copy
@@ -52,12 +51,11 @@ tool budget, cancellation, and history flow still apply.
 
 ## Approval flow
 
-`CodingApp.approve` presents one action at a time using the approval modal,
-records the request and decision in conversation activity, and resolves the
-waiting callback. A denied operation is returned as a denied tool result; it
-does not reach backend execution. Tool-budget extension also requires an
-explicit approval. Phase 1 adds no autonomy mode and changes no approval
-requirements.
+The injected approval callback presents or otherwise obtains explicit
+per-operation approval and resolves the waiting tool call. A denied operation
+is returned as a denied result; it does not reach backend execution.
+Tool-budget extension also requires explicit approval. The deterministic
+policy remains an independent check.
 
 ## Workspace and sandbox flow
 
@@ -68,10 +66,10 @@ read-only root filesystem, a single selected workspace bind mount, and
 resource limits. The helper rejects absolute/traversal/symlink paths and
 bounds command duration and output.
 
-Host tools are a separately selected Linux execution mode, refuse root, run
-through the isolated helper process with a workspace boundary and
-no-new-privileges, and are clearly identified as not sandboxed. Workspace
-matching, backend validation, and per-operation approvals remain mandatory.
+The standalone local container backend is not wired into Browser Chat or the
+Core web request path. Distributed execution must use the separate restricted
+Broker; host-mode values in old conversation records remain readable but have
+no direct-host execution backend.
 
 ## Repository intelligence (Phase 2)
 
@@ -337,12 +335,12 @@ pending executions as interrupted; no operation is automatically replayed.
 
 ## Cancellation and recovery
 
-Escape/STOP cancels the active `CodingApp` turn task. The agent retains partial
-output, marks the assistant message cancelled, resolves each unmatched native
-call with an explicit “not replayed” result, and records cancellation. Sandbox
-and host helpers attempt bounded process cleanup. On reopening a history,
-`Agent.recover` marks an interrupted running turn and resolves outstanding
-calls without invoking tools.
+Cancelling an active agent turn retains partial output, marks the assistant
+message cancelled, resolves each unmatched native call with an explicit “not
+replayed” result, and records cancellation. The local sandbox helper attempts
+bounded process cleanup. On reopening a history, `Agent.recover` marks an
+interrupted running turn and resolves outstanding calls without invoking
+tools.
 
 The Phase 1 task state machine has explicit terminal states. A recovered active
 task is marked `interrupted`; it is not resumed automatically. The normal chat
@@ -759,25 +757,24 @@ event and does not roll back the task, replay mutations, or rerun checks.
 
 ## Web foundation (Phase 13B)
 
-The opt-in browser foundation is additive; the TUI, existing history/task
-formats, Phase 0–12 authorization flow, `Tools` dispatcher, and Phase 12
-memory identity remain authoritative. The FastAPI API is versioned and
-read-only for projects, model discovery, and authentication; it does not run
-chat turns, dispatch tools, execute commands, or mutate project files. Web
-service and TUI startup share an OS-backed application-data-root ownership
-lock. Workspace lease/fencing primitives are future-writer contracts and are
-not connected to web mutation routes. The detailed API, deployment,
-authentication, runner boundary, recovery, and Phase 12 compatibility
-constraints are documented in [phase-13b-web.md](./phase-13b-web.md).
+The FastAPI API is versioned and supports authenticated Browser Chat,
+metadata and snapshot intake. Browser Chat uses the shared provider/history
+flow with tool execution disabled; it does not invoke the local
+`CodingAgentRuntime`, dispatch tools, execute commands, or mutate project
+files. Only the web service may acquire the shared data-root lock; prior owner
+labels remain readable for lock-conflict reporting. Workspace lease/fencing
+primitives are not connected to web mutation routes. See
+[phase-13b-web.md](./phase-13b-web.md) for API, deployment, authentication,
+recovery and Phase 12 compatibility details.
 
 ## Distributed architecture foundation (Phase 13C)
 
 Phase 13C adds separate server-owned logical project/device/binding identities,
 operator-authorized device enrollment contracts, bounded immutable source
 snapshot ingestion, and read-only Phase 2/3 access to verified snapshot
-contents. The path-based Phase 13B registry, TUI storage ownership, Phase 12
-memory identity, `CodingAgentRuntime`, approval system, and existing execution
-backends remain authoritative in their existing scope. Phase 13C does not
+contents. The path-based Phase 13B registry, Phase 12 memory identity,
+`CodingAgentRuntime`, approval system, and existing execution backends remain
+separate from distributed project processing. Phase 13C does not
 include a production Client Agent, Sandbox Broker, distributed task execution,
 or project mutation. See [phase-13c-distributed.md](./phase-13c-distributed.md)
 for protocol versions, storage bounds, privacy rules, API contracts, and

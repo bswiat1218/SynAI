@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
@@ -319,6 +319,34 @@ def create_app(
         redoc_url=None,
         lifespan=lifespan,
     )
+
+    generate_openapi = app.openapi
+
+    def deterministic_openapi() -> dict[str, Any]:
+        schema = generate_openapi()
+        canonical_descriptions = {
+            "413": ("Content Too Large", {"Content Too Large", "Request Entity Too Large"}),
+            "422": ("Unprocessable Content", {"Unprocessable Content", "Unprocessable Entity"}),
+        }
+        for path_item in schema.get("paths", {}).values():
+            if not isinstance(path_item, dict):
+                continue
+            for operation in path_item.values():
+                if not isinstance(operation, dict):
+                    continue
+                responses = operation.get("responses")
+                if not isinstance(responses, dict):
+                    continue
+                for status, (canonical, variants) in canonical_descriptions.items():
+                    response = responses.get(status)
+                    if (
+                        isinstance(response, dict)
+                        and response.get("description") in variants
+                    ):
+                        response["description"] = canonical
+        return schema
+
+    app.openapi = deterministic_openapi
     app.state.services = service
     app.add_middleware(
         RequestLimitsMiddleware,

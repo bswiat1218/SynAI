@@ -22,8 +22,8 @@ Implementation status is summarized in
    independently enforced.
 10. Project changes cannot be automatically applied to client devices.
 11. Uncertain operations must not replay automatically.
-12. The existing legacy TUI remains separately supported under its original
-   security semantics.
+12. Retired interfaces supply no execution fallback; compatibility data does
+    not grant execution authority.
 
 ## Authority matrix
 
@@ -36,14 +36,10 @@ authority. "Administer" is limited to the resource named in that column.
 | Browser | Its authenticated Core views; chat transcript/activity and project/device/snapshot metadata. No snapshot source bytes or local files. | Chat prompts and allowed metadata actions through authenticated/CSRF-protected APIs. No project source writes. | Browser rendering only; no tool, shell, task or container execution. | Authenticates the operator to Core. An operator can explicitly authorize paired-device metadata and request a snapshot; this is not local consent or execution approval. | No Core host, client, Broker or runtime administration. |
 | SynAI Core | Its authorized application state; validated immutable snapshots; configured legacy workspace identity/status metadata. | Private metadata, chat/history state, bounded upload staging and immutable snapshot objects. No arbitrary source-workspace mutation. | Own service logic and chat provider calls only; no distributed project code or general host commands. | Validates browser/device credentials and metadata actions. Cannot substitute for local consent or Broker policy/approval. | Its private metadata/snapshot storage and its own service lifecycle only; no client device or general container runtime administration. |
 | Linux Client Agent | Locally registered directory only after local binding authorization; its protected local identity/config. Per-capture consent gates transmission, not preview reads. | Its own protected state and local receipts; future changes only after a separately reviewed local policy and explicit consent. Current version writes no project content. | Its own bounded scan, hashing and network client. No shell, build/test or project-code execution. | Local user authorizes the directory for scoped reads and separately approves each upload after preview. Browser/Core requests cannot create either authorization. | Its local credential/binding state only; cannot administer Core/Broker/runtime. |
-| Sandbox Broker (planned) | Exact immutable task snapshot after authenticated task claim validation. | Only its own disposable task container/layer and bounded result objects. No client workspace writes. | Only approved task workload in task-scoped containers subject to independent policy/limits. | Enforces task claim, target, policy, approval, limits and cancellation independently; cannot create user approvals. | Only task containers it created and verifies as its own. No Core/TUI/foreign runtime objects. |
-| Task container (planned) | Its explicit task input and task-private filesystem. | Only task-private disposable writable storage. No host/client workspace. | Task code within Broker-imposed limits. | None. | None. |
-| Legacy TUI | Its selected conversation workspace, history and explicitly configured local execution environment. Phase 12 memory only if enabled and identity matches. | Workspace changes only through the existing dispatcher/backend and required approvals/policy. | Existing local Sandbox or explicitly configured HostExecution under the original TUI semantics. | Local interactive approval and Phase 10 policy. | Its conversation-owned sandbox only when ownership is verified; no Broker resources. |
-| Legacy TUI Sandbox / HostExecution | Selected local workspace; sandbox container or host helper context as configured. | Authorized selected workspace per existing tool semantics. | Local coding-agent tools; HostExecution is explicitly not sandboxed. | No independent task/broker authorization; relies on TUI dispatcher, policy and approval. | Existing local session/backend objects only. |
+| Sandbox Broker | Exact immutable task snapshot after authenticated task-claim validation. | Only its own disposable task container/layer and bounded result objects. No client workspace writes. | Only approved task workload in task-scoped containers subject to independent policy/limits. | Enforces Broker-side claim checks, fixed operation limits and cancellation; a current Core claim authority is not yet integrated. | Only task containers it created and verifies as its own. No Core/foreign runtime objects. |
+| Task container | Its explicit task input and task-private filesystem. | Only task-private disposable writable storage. No host/client workspace. | Task code within Broker-imposed limits. | None. | None. |
 
-The legacy TUI execution row is an explicit compatibility carve-out under
-invariant 12; it must not be reused as evidence that Core or the planned
-Broker has equivalent isolation.
+Retired local execution backends have no authority in the distributed design.
 
 ## Data and identity boundaries
 
@@ -87,8 +83,8 @@ Broker has equivalent isolation.
 - Storage protection assumes private ownership/modes and operating-system
   access controls. Disk theft, privileged host access and backups require
   separate protections.
-- A single data-root owner process is assumed. Current shared web/TUI data
-  root ownership is not a horizontally scalable multi-writer design.
+- A single data-root owner process is assumed. Only the web service can
+  acquire the lock; old owner labels remain readable for conflict reporting.
 
 ## Known limitations
 
@@ -99,12 +95,12 @@ Broker has equivalent isolation.
   they are not separately signed by a Core signing key.
 - The existing task table and identity contract do not establish a durable
   claim/fencing authority.
-- No production Broker, rootless Podman identity, runtime policy, image
-  digest allowlist or deployment manifest exists.
-- Existing TUI Sandbox can use a configured container runtime and selected
-  image, binds a local workspace read-write and creates with bridge
-  networking; HostExecution explicitly runs outside a container. These are
-  legacy local semantics, not Broker guarantees.
+- The Broker has a restricted service/runtime implementation, but production
+  service identity, deployment evidence and security acceptance are missing.
+- Standalone local `Sandbox` code can use a configured runtime and image,
+  bridge networking and a read-write workspace mount. It is not used by Core
+  web dispatch and is not a Broker guarantee; direct host execution was
+  removed.
 - The existing architecture does not guarantee atomic multi-file restoration
   or mutation; it reports per-file state and does not replay uncertain work.
 - There is no distributed patch format, client-side application protocol or
@@ -118,7 +114,7 @@ Broker has equivalent isolation.
 | No arbitrary project mount | Broker request schema and fixed mount policy; Core only stores snapshots | Broker-side path/mount rejection and runtime inspect tests. |
 | Local read/write consent | Client registry, preview, explicit capture consent; future patch consent | Client tests for binding revocation, noninteractive denial, path races and consent replay. |
 | Browser/device separation | Separate auth dependencies and credentials | Cross-namespace negative tests for every route/socket. |
-| Task/approval/policy boundary | Existing local dispatcher for TUI; future Core/Broker claim protocol | Broker repeats all checks; tampered/stale authorization tests. |
+| Task/approval/policy boundary | Existing local dispatcher for retired local interface; future Core/Broker claim protocol | Broker repeats all checks; tampered/stale authorization tests. |
 | Task-scoped disposable execution | Future Broker container construction | Inspect namespaces, mounts, capabilities, network and resource quotas on real rootless runtime. |
 | Ownership | Future Broker-created owner labels/ID ledger plus runtime verification | Reject foreign/replaced containers before every control action. |
 | No replay | Existing recovery states and device snapshot behavior; future durable claim ledger | Crash injection around every side effect and lost acknowledgment. |
