@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import sqlite3
 import stat
@@ -61,6 +62,7 @@ class BrokerRegistry:
                     project_id TEXT NOT NULL,
                     snapshot_id TEXT NOT NULL,
                     snapshot_digest TEXT NOT NULL,
+                    allocation_id TEXT NOT NULL,
                     target_id TEXT NOT NULL,
                     profile TEXT NOT NULL,
                     image_digest TEXT NOT NULL,
@@ -76,10 +78,15 @@ class BrokerRegistry:
                 );
                 CREATE TABLE IF NOT EXISTS broker_operations (
                     operation_id TEXT PRIMARY KEY,
+                    claim_id TEXT NOT NULL UNIQUE,
+                    replay_nonce TEXT NOT NULL UNIQUE,
+                    request_id TEXT NOT NULL UNIQUE,
                     task_id TEXT NOT NULL REFERENCES broker_tasks(task_id),
                     kind TEXT NOT NULL,
                     state TEXT NOT NULL,
                     request_digest TEXT NOT NULL,
+                    claim_json TEXT,
+                    claim_signature TEXT,
                     result_json TEXT,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
@@ -94,18 +101,48 @@ class BrokerRegistry:
                     created_at INTEGER NOT NULL,
                     lifecycle_state TEXT NOT NULL,
                     termination_evidence TEXT,
-                    cleanup_evidence TEXT
+                    cleanup_evidence TEXT,
+                    reconciliation_evidence TEXT
                 );
                 CREATE TABLE IF NOT EXISTS broker_request_nonces (
                     nonce TEXT PRIMARY KEY,
                     expires_at INTEGER NOT NULL
                 );
             """)
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(broker_operations)")
+            }
+            for column in (
+                "claim_id", "replay_nonce", "request_id", "claim_json", "claim_signature",
+            ):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE broker_operations ADD COLUMN {column} TEXT")
+            container_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(broker_containers)")
+            }
+            if "reconciliation_evidence" not in container_columns:
+                connection.execute("ALTER TABLE broker_containers ADD COLUMN reconciliation_evidence TEXT")
+            task_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(broker_tasks)")
+            }
+            if "allocation_id" not in task_columns:
+                connection.execute("ALTER TABLE broker_tasks ADD COLUMN allocation_id TEXT")
+            connection.executescript("""
+                CREATE UNIQUE INDEX IF NOT EXISTS broker_operation_claim_id
+                    ON broker_operations(claim_id) WHERE claim_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS broker_operation_replay_nonce
+                    ON broker_operations(replay_nonce) WHERE replay_nonce IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS broker_operation_request_id
+                    ON broker_operations(request_id) WHERE request_id IS NOT NULL;
+            """)
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
                     "UPDATE broker_operations SET state = 'uncertain', updated_at = ? "
-                    "WHERE state = 'claimed'",
+                        "WHERE state IN ('claimed', 'running')",
                     (int(time.time()),),
                 )
                 connection.execute(
@@ -187,8 +224,9 @@ class BrokerRegistry:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 replay = connection.execute(
-                    "SELECT 1 FROM broker_operations WHERE operation_id = ?",
-                    (claim.operation_id,),
+                    "SELECT 1 FROM broker_operations WHERE operation_id = ? OR claim_id = ? "
+                    "OR replay_nonce = ? OR request_id = ?",
+                    (claim.operation_id, claim.claim_id, claim.replay_nonce, claim.request_id),
                 ).fetchone()
                 if replay is not None:
                     raise BrokerError("operation_replayed", "Task operation identity was already used.", 409)
@@ -199,12 +237,13 @@ class BrokerRegistry:
                     if task is not None:
                         raise BrokerError("task_exists", "Task identity is already registered.", 409)
                     connection.execute(
-                        "INSERT INTO broker_tasks(task_id, project_id, snapshot_id, snapshot_digest, "
+                        "INSERT INTO broker_tasks(task_id, project_id, snapshot_id, snapshot_digest, allocation_id, "
                         "target_id, profile, image_digest, plan_digest, policy_decision_id, policy_version, "
                         "approval_id, lease_generation, fencing_token_hash, state, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)",
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)",
                         (
                             claim.task_id, claim.project_id, claim.snapshot_id, claim.snapshot_digest,
+                            claim.allocation_id,
                             claim.target_id, claim.profile, claim.image_digest, claim.plan_digest,
                             claim.policy_decision_id, claim.policy_version, claim.approval_id,
                             claim.lease_generation,
@@ -214,9 +253,15 @@ class BrokerRegistry:
                 else:
                     self._validate_task(task, claim)
                 connection.execute(
-                    "INSERT INTO broker_operations(operation_id, task_id, kind, state, request_digest, "
-                    "created_at, updated_at) VALUES (?, ?, ?, 'claimed', ?, ?, ?)",
-                    (claim.operation_id, claim.task_id, claim.tool_kind, request_digest, timestamp, timestamp),
+                    "INSERT INTO broker_operations(operation_id, claim_id, replay_nonce, request_id, "
+                    "task_id, kind, state, request_digest, claim_json, claim_signature, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?, ?, ?, ?)",
+                    (
+                        claim.operation_id, claim.claim_id, claim.replay_nonce,
+                        claim.request_id, claim.task_id, claim.tool_kind,
+                        request_digest, json.dumps(claim.to_dict(), sort_keys=True, separators=(",", ":")),
+                        signature, timestamp, timestamp,
+                    ),
                 )
                 connection.commit()
             except sqlite3.IntegrityError as exc:
@@ -227,6 +272,16 @@ class BrokerRegistry:
                 raise
         return request_digest
 
+    def begin_operation(self, operation_id: str) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE broker_operations SET state = 'running', updated_at = ? "
+                "WHERE operation_id = ? AND state = 'claimed'",
+                (int(time.time()), operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise BrokerError("operation_state_invalid", "Operation is not claimable for dispatch.", 409)
+
     @staticmethod
     def _validate_task(task: sqlite3.Row | None, claim: TaskClaim) -> None:
         if task is None:
@@ -234,6 +289,7 @@ class BrokerRegistry:
         if any(task[name] != value for name, value in (
             ("project_id", claim.project_id), ("snapshot_id", claim.snapshot_id),
             ("snapshot_digest", claim.snapshot_digest), ("target_id", claim.target_id),
+            ("allocation_id", claim.allocation_id),
             ("profile", claim.profile), ("image_digest", claim.image_digest),
             ("plan_digest", claim.plan_digest), ("policy_decision_id", claim.policy_decision_id),
             ("policy_version", claim.policy_version), ("approval_id", claim.approval_id),
@@ -272,7 +328,10 @@ class BrokerRegistry:
         timestamp = int(time.time()) if now is None else now
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM broker_tasks WHERE task_id = ?", (task_id,)).fetchone()
-            if row is None or row["state"] != "ready":
+            if (
+                row is None or row["state"] != "ready"
+                or row["allocation_id"] != allocation_id
+            ):
                 raise BrokerError("task_state_invalid", "Task is not ready to start.", 409)
             connection.execute(
                 "INSERT INTO broker_containers(task_id, allocation_id, container_id, image_digest, "
@@ -311,17 +370,50 @@ class BrokerRegistry:
                 (task_id,),
             ).fetchone()
 
+    def container_records(self) -> tuple[sqlite3.Row, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT c.*, t.project_id, t.snapshot_id, t.state AS task_state "
+                "FROM broker_containers c JOIN broker_tasks t USING(task_id) "
+                "ORDER BY c.created_at, c.task_id",
+            ).fetchall()
+        return tuple(rows)
+
+    def record_reconciliation(
+        self,
+        task_id: str,
+        lifecycle_state: str,
+        evidence: str,
+    ) -> None:
+        if lifecycle_state not in {"owned", "terminated", "quarantined", "removed"}:
+            raise ValueError("Invalid reconciled container state")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE broker_containers SET lifecycle_state = ?, "
+                "reconciliation_evidence = ? WHERE task_id = ?",
+                (lifecycle_state, evidence, task_id),
+            )
+            if cursor.rowcount != 1:
+                raise BrokerError("container_not_owned", "No private container ownership record exists.", 404)
+
     def complete_operation(self, operation_id: str, state: str, result_json: str | None = None) -> None:
-        if state not in {"completed", "failed", "uncertain"}:
+        if state not in {"completed", "failed_before_effects", "uncertain"}:
             raise ValueError("Invalid Broker operation terminal state")
         with self.connect() as connection:
             cursor = connection.execute(
                 "UPDATE broker_operations SET state = ?, result_json = ?, updated_at = ? "
-                "WHERE operation_id = ? AND state = 'claimed'",
+                "WHERE operation_id = ? AND state IN ('claimed', 'running')",
                 (state, result_json, int(time.time()), operation_id),
             )
             if cursor.rowcount != 1:
                 raise BrokerError("operation_state_invalid", "Operation is not in a claimable state.", 409)
+
+    def uncertain_operations(self) -> tuple[sqlite3.Row, ...]:
+        with self.connect() as connection:
+            return tuple(connection.execute(
+                "SELECT * FROM broker_operations WHERE state = 'uncertain' "
+                "ORDER BY updated_at, operation_id",
+            ).fetchall())
 
     def task(self, task_id: str) -> sqlite3.Row:
         with self.connect() as connection:

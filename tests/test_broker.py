@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,7 +21,6 @@ from synai.broker.protocol import (
     BrokerError,
     TaskClaim,
     canonical_json,
-    request_mac,
     sign_claim,
     verify_claim,
 )
@@ -36,7 +36,6 @@ from synai.broker.snapshots import (
 
 IMAGE_DIGEST = "sha256:" + "a" * 64
 HASH = "b" * 64
-KEY = b"service-key-" + b"s" * 32
 CLAIM_PRIVATE = bytes(range(32))
 CLAIM_PUBLIC = Ed25519PrivateKey.from_private_bytes(CLAIM_PRIVATE).public_key().public_bytes(
     serialization.Encoding.Raw, serialization.PublicFormat.Raw,
@@ -53,9 +52,10 @@ def config(root: Path, *, podman: str = "podman") -> BrokerConfig:
         image_digest=IMAGE_DIGEST,
         core_uid=os.geteuid() + 1,
         service_uid=os.geteuid(),
-        service_key=KEY,
         claim_key=CLAIM_PUBLIC,
-        socket_gid=os.getgid(),
+        core_ca_file=root / "core-ca.pem",
+        broker_cert_file=root / "broker.pem",
+        broker_key_file=root / "broker.key",
     )
 
 
@@ -70,13 +70,17 @@ def claim(
     now: int | None = None,
 ) -> TaskClaim:
     current = int(time.time()) if now is None else now
+    operation_id = hashlib.md5(f"{kind}:{current}:{os.urandom(4).hex()}".encode()).hexdigest()
+    claim_id = hashlib.sha256(f"claim:{operation_id}".encode()).hexdigest()[:32]
+    request_id = hashlib.sha256(f"request:{operation_id}".encode()).hexdigest()[:32]
+    replay_nonce = hashlib.sha256(f"nonce:{operation_id}".encode()).hexdigest()[:32]
     return TaskClaim(
         schema_version=1,
         task_id=task_id,
         project_id=project_id,
         snapshot_id=snapshot_id,
         snapshot_digest=HASH,
-        operation_id=hashlib.md5(f"{kind}:{current}:{os.urandom(4).hex()}".encode()).hexdigest(),
+        operation_id=operation_id,
         arguments_digest=hashlib.sha256(canonical_json(arguments)).hexdigest(),
         deadline=current + 120,
         target_id="4" * 32,
@@ -91,6 +95,16 @@ def claim(
         image_digest=IMAGE_DIGEST.removeprefix("sha256:"),
         resource_profile="python-small",
         issued_at=current,
+        claim_id=claim_id,
+        issuer="synai-core:" + "9" * 32,
+        audience="synai-broker:" + "a" * 32,
+        allocation_id="a" * 32,
+        plan_id="b" * 32,
+        policy_id="c" * 32,
+        decision_digest="d" * 64,
+        approval_digest="e" * 64,
+        replay_nonce=replay_nonce,
+        request_id=request_id,
     )
 
 
@@ -124,9 +138,11 @@ class FakeSnapshotRetriever:
         self.digest = hashlib.sha256(canonical_json(self.manifest)).hexdigest()
         return self.digest
 
-    async def fetch_exact(self, *, task_id: str, project_id: str, snapshot_id: str,
-                          snapshot_digest: str, deadline: int) -> tuple[dict[str, object], dict[str, bytes]]:
-        del task_id, deadline
+    async def fetch_exact(self, *, claim: TaskClaim, signature: str,
+                          grant_token: str) -> tuple[dict[str, object], dict[str, bytes]]:
+        del signature, grant_token
+        task_id, project_id, snapshot_id = claim.task_id, claim.project_id, claim.snapshot_id
+        snapshot_digest = claim.snapshot_digest
         if not self.manifest or self.manifest["snapshot_id"] != snapshot_id:
             self.prepare_manifest(snapshot_id)
         if snapshot_digest != self.digest or project_id != self.project_id:
@@ -153,12 +169,6 @@ class BrokerProtocolTests(unittest.TestCase):
             TaskClaim.from_dict({**request.to_dict(), "schema_version": 2}).validate(current)
         with self.assertRaises(BrokerError):
             TaskClaim.from_dict({**request.to_dict(), "lease_generation": True}).validate(current)
-
-    def test_service_request_mac_is_bound_to_exact_path_and_body(self) -> None:
-        body = b'{"schema_version":1}'
-        signature = request_mac("POST", "/v1/tasks", 100, "a" * 32, body, KEY)
-        self.assertNotEqual(signature, request_mac("POST", "/v1/other", 100, "a" * 32, body, KEY))
-        self.assertNotEqual(signature, request_mac("POST", "/v1/tasks", 100, "a" * 32, b"{}", KEY))
 
     def test_registry_rejects_operation_replay_and_stale_or_cross_project_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -195,8 +205,8 @@ class BrokerProtocolTests(unittest.TestCase):
             prepared = claim("prepare", {})
             registry.authorize(prepared, sign_claim(prepared, CLAIM_PRIVATE))
             registry.transition(prepared.task_id, "ready")
-            registry.reserve_container(prepared.task_id, "d" * 32)
-            registry.bind_container(prepared.task_id, "d" * 32, "e" * 64)
+            registry.reserve_container(prepared.task_id, prepared.allocation_id)
+            registry.bind_container(prepared.task_id, prepared.allocation_id, "e" * 64)
             registry.transition(prepared.task_id, "running")
             restarted = BrokerRegistry(registry.config)
             restarted.initialize()
@@ -204,6 +214,31 @@ class BrokerProtocolTests(unittest.TestCase):
             with self.assertRaises(BrokerError) as quarantined:
                 restarted.owned_container(prepared.task_id)
             self.assertEqual(quarantined.exception.code, "container_quarantined")
+
+    def test_restart_reports_durable_uncertainty_without_replaying_operation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            broker_config = config(Path(directory) / "broker")
+            registry = BrokerRegistry(broker_config)
+            registry.initialize()
+            request = claim("prepare", {})
+            registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
+            registry.begin_operation(request.operation_id)
+            registry.initialize()
+            recorded: list[tuple[str, str]] = []
+
+            async def record_outcome(task: TaskClaim, signature: str, state: str) -> None:
+                self.assertEqual(task.operation_id, request.operation_id)
+                self.assertEqual(signature, sign_claim(request, CLAIM_PRIVATE))
+                recorded.append((task.operation_id, state))
+
+            service = BrokerService(
+                broker_config, operation_outcome_recorder=record_outcome,
+            )
+            asyncio.run(service.recover())
+            self.assertEqual(recorded, [(request.operation_id, "uncertain")])
+            operation = registry.uncertain_operations()[0]
+            self.assertEqual(operation["state"], "uncertain")
+            self.assertEqual(registry.task(request.task_id)["state"], "uncertain")
 
 
 class SnapshotStagingTests(unittest.TestCase):
@@ -331,7 +366,9 @@ class TypedOperationTests(unittest.TestCase):
                 BrokerConfig(
                     state_dir=Path(directory), podman="podman", image="unapproved:latest",
                     image_digest=IMAGE_DIGEST, core_uid=1, service_uid=2,
-                    service_key=KEY, claim_key=CLAIM_PUBLIC, socket_gid=os.getgid(),
+                    claim_key=CLAIM_PUBLIC, core_ca_file=Path(directory) / "ca.pem",
+                    broker_cert_file=Path(directory) / "broker.pem",
+                    broker_key_file=Path(directory) / "broker.key",
                 ).validate()
 
     def test_runtime_and_storage_limits_are_fail_closed_without_acceptance(self) -> None:
@@ -346,7 +383,9 @@ class TypedOperationTests(unittest.TestCase):
                 BrokerConfig(
                     state_dir=selected.state_dir, podman="podman", image=selected.image,
                     image_digest=selected.image_digest, core_uid=1, service_uid=1,
-                    service_key=KEY, claim_key=CLAIM_PUBLIC, socket_gid=os.getgid(),
+                    claim_key=CLAIM_PUBLIC, core_ca_file=selected.core_ca_file,
+                    broker_cert_file=selected.broker_cert_file,
+                    broker_key_file=selected.broker_key_file,
                 ).validate()
 
 
@@ -384,6 +423,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             operation_id="a" * 32,
             tool_kind="read_file",
             arguments_digest=hashlib.sha256(canonical_json(read_args)).hexdigest(),
+            claim_id="1" * 32, replay_nonce="2" * 32, request_id="3" * 32,
         )
         response = await self.service.dispatch(OperationRequest(
             schema_version=1, claim=read.to_dict(),
@@ -416,6 +456,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             operation_id="c" * 32,
             tool_kind="remove",
             arguments_digest=hashlib.sha256(canonical_json({})).hexdigest(),
+            claim_id="4" * 32, replay_nonce="5" * 32, request_id="6" * 32,
         )
         result = await service.dispatch(OperationRequest(
             schema_version=1, claim=remove.to_dict(),
@@ -439,6 +480,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             operation_id="d" * 32,
             tool_kind="cancel",
             arguments_digest=hashlib.sha256(canonical_json({})).hexdigest(),
+            claim_id="7" * 32, replay_nonce="8" * 32, request_id="9" * 32,
         )
         result = await self.service.dispatch(OperationRequest(
             schema_version=1, claim=cancel.to_dict(),
@@ -477,57 +519,36 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.registry.task(prepared.task_id)["state"], "uncertain")
 
 
-class BrokerHTTPAuthenticationTests(unittest.TestCase):
-    def test_forged_and_replayed_service_requests_are_rejected(self) -> None:
+class BrokerMtlsBoundaryTests(unittest.TestCase):
+    def test_cleartext_service_requests_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             selected = config(Path(directory) / "broker")
             service = BrokerService(selected)
             service.registry.initialize()
             app = create_app(service)
             client = TestClient(app)
-            timestamp = int(time.time())
-            nonce = "a" * 32
-            signature = request_mac("GET", "/v1/ready", timestamp, nonce, b"", KEY)
-            headers = {
-                "X-SynAI-Broker-Timestamp": str(timestamp),
-                "X-SynAI-Broker-Nonce": nonce,
-                "X-SynAI-Broker-Signature": signature,
-            }
-            self.assertEqual(client.get("/v1/ready", headers=headers).status_code, 200)
-            replay = client.get("/v1/ready", headers=headers)
-            self.assertEqual(replay.status_code, 409)
-            forged = client.get("/v1/ready", headers={**headers, "X-SynAI-Broker-Signature": "0" * 64})
-            self.assertEqual(forged.status_code, 401)
+            response = client.get("/v1/ready")
+            self.assertEqual(response.status_code, 426)
+            self.assertEqual(response.json()["error"]["code"], "mtls_required")
 
-    def test_unsupported_request_version_is_rejected(self) -> None:
+    def test_unsupported_request_version_is_rejected_over_tls_scheme(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             selected = config(Path(directory) / "broker")
             service = BrokerService(selected)
             service.registry.initialize()
-            client = TestClient(create_app(service))
+            client = TestClient(create_app(service), base_url="https://testserver")
             body = json.dumps({
                 "schema_version": 2, "claim": {}, "claim_signature": "0" * 128,
                 "kind": "prepare", "arguments": {},
             }, separators=(",", ":")).encode()
-            timestamp = int(time.time())
-            nonce = "c" * 32
-            headers = {
-                "content-type": "application/json",
-                "X-SynAI-Broker-Timestamp": str(timestamp),
-                "X-SynAI-Broker-Nonce": nonce,
-                "X-SynAI-Broker-Signature": request_mac(
-                    "POST", "/v1/tasks/" + "1" * 32 + "/operations",
-                    timestamp, nonce, body, KEY,
-                ),
-            }
             response = client.post(
                 "/v1/tasks/" + "1" * 32 + "/operations",
-                content=body, headers=headers,
+                content=body, headers={"content-type": "application/json"},
             )
             self.assertEqual(response.status_code, 422)
 
 
-async def _valid_lease(_: TaskClaim) -> bool:
+async def _valid_lease(_: TaskClaim, __: str) -> bool:
     return True
 
 

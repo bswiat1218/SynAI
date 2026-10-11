@@ -601,7 +601,7 @@ class DistributedFoundationTests(unittest.TestCase):
         os.chmod(path, 0o600)
         legacy_database.initialize()
         with legacy_database.connect() as migrated:
-            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(migrated.execute("PRAGMA user_version").fetchone()[0], 6)
             self.assertIn(
                 "project_activity_events",
                 {

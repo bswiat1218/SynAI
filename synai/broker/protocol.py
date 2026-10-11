@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import re
 import time
@@ -77,13 +76,30 @@ class TaskClaim:
     image_digest: str
     resource_profile: str
     issued_at: int
+    claim_id: str
+    issuer: str
+    audience: str
+    allocation_id: str
+    plan_id: str
+    policy_id: str
+    decision_digest: str
+    approval_digest: str
+    replay_nonce: str
+    request_id: str
 
     def validate(self, now: int | None = None) -> None:
         timestamp = int(time.time()) if now is None else now
-        for name in ("task_id", "project_id", "snapshot_id", "operation_id", "target_id", "policy_decision_id", "approval_id"):
+        for name in (
+            "task_id", "project_id", "snapshot_id", "operation_id", "target_id",
+            "policy_decision_id", "approval_id", "claim_id", "allocation_id",
+            "plan_id", "policy_id", "request_id",
+        ):
             if not isinstance(getattr(self, name), str) or not _ID.fullmatch(getattr(self, name)):
                 raise BrokerError("claim_invalid", f"Invalid {name}.", 422)
-        for name in ("snapshot_digest", "arguments_digest", "plan_digest", "image_digest"):
+        for name in (
+            "snapshot_digest", "arguments_digest", "plan_digest", "image_digest",
+            "decision_digest", "approval_digest",
+        ):
             value = getattr(self, name)
             if not isinstance(value, str) or not _HASH.fullmatch(value):
                 raise BrokerError("claim_invalid", f"Invalid {name}.", 422)
@@ -92,6 +108,9 @@ class TaskClaim:
             or type(self.deadline) is not int or type(self.issued_at) is not int
             or not self.issued_at <= timestamp < self.deadline
             or self.deadline - self.issued_at > 900
+            or not isinstance(self.issuer, str) or not re.fullmatch(r"synai-core:[a-f0-9]{32}", self.issuer)
+            or not isinstance(self.audience, str) or self.audience != f"synai-broker:{self.allocation_id}"
+            or not isinstance(self.replay_nonce, str) or not _ID.fullmatch(self.replay_nonce)
             or not isinstance(self.fencing_token, str) or not 32 <= len(self.fencing_token) <= 128
             or any(ord(ch) < 33 or ord(ch) > 126 for ch in self.fencing_token)
             or type(self.lease_generation) is not int or self.lease_generation < 1
@@ -149,22 +168,3 @@ def verify_claim(claim: TaskClaim, signature: str, key: bytes, now: int | None =
         )
     except (InvalidSignature, ValueError) as exc:
         raise BrokerError("claim_auth_invalid", "Task claim authentication failed.", 401) from exc
-
-
-def request_mac(method: str, path: str, timestamp: int, nonce: str, body: bytes, key: bytes) -> str:
-    if len(body) > MAX_REQUEST_BYTES or not path.startswith("/") or "\n" in path:
-        raise BrokerError("request_invalid", "Broker request is outside its size or path limits.", 413)
-    payload = b"synai-broker-request-v1\n" + b"\n".join((
-        method.upper().encode("ascii"), path.encode("ascii"), str(timestamp).encode("ascii"),
-        nonce.encode("ascii"), hashlib.sha256(body).hexdigest().encode("ascii"),
-    ))
-    return hmac.new(key, payload, hashlib.sha256).hexdigest()
-
-
-def validate_nonce(nonce: str, timestamp: int, now: int | None = None) -> None:
-    current = int(time.time()) if now is None else now
-    if (
-        not isinstance(nonce, str) or not re.fullmatch(r"[a-f0-9]{32}", nonce)
-        or type(timestamp) is not int or abs(current - timestamp) > 30
-    ):
-        raise BrokerError("request_auth_invalid", "Broker request authentication is invalid or expired.", 401)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import os
 import re
@@ -169,11 +170,17 @@ def load_staged_manifest(root: Path, task_id: str, expected_digest: str) -> dict
         raise BrokerError("snapshot_integrity_error", "Staged immutable snapshot failed integrity validation.", 409) from exc
 
 
-def changed_files(workspace: Path, manifest: dict[str, Any], maximum: int = MAX_SNAPSHOT_BYTES) -> list[dict[str, object]]:
+def changed_files(
+    workspace: Path,
+    manifest: dict[str, Any],
+    maximum: int = MAX_SNAPSHOT_BYTES,
+    output_limit: int = 1024 * 1024,
+) -> list[dict[str, object]]:
     before = {entry["path"]: entry for entry in manifest["files"]}
     seen: set[str] = set()
     changes: list[dict[str, object]] = []
     total = 0
+    encoded_output = 0
     for current, dirs, files in os.walk(workspace, followlinks=False):
         for name in tuple(dirs):
             item = Path(current) / name
@@ -205,14 +212,23 @@ def changed_files(workspace: Path, manifest: dict[str, Any], maximum: int = MAX_
             old = before.get(relative)
             seen.add(relative)
             if old is None or digest != old["sha256"]:
-                changes.append({
+                encoded = base64.b64encode(data).decode("ascii")
+                entry = {
                     "path": relative, "preimage_sha256": None if old is None else old["sha256"],
                     "postimage_sha256": digest, "size_bytes": len(data),
-                })
+                    "artifact_base64": encoded,
+                }
+                encoded_output += len(canonical_json(entry))
+                if encoded_output > output_limit:
+                    raise BrokerError("artifact_output_limit", "Changed-file artifacts exceed the operation output limit.", 413)
+                changes.append(entry)
     for path, entry in before.items():
         if path not in seen:
             changes.append({
                 "path": path, "preimage_sha256": entry["sha256"],
                 "postimage_sha256": None, "size_bytes": 0,
             })
+            encoded_output += len(canonical_json(changes[-1]))
+            if encoded_output > output_limit:
+                raise BrokerError("artifact_output_limit", "Changed-file manifest exceeds the operation output limit.", 413)
     return sorted(changes, key=lambda item: str(item["path"]))

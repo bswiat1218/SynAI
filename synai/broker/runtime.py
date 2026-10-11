@@ -137,6 +137,15 @@ class RootlessPodmanRuntime:
 
     async def inspect_owned(self, task_id: str) -> dict[str, Any]:
         owned = self.registry.owned_container(task_id)
+        return await self._inspect_record(task_id, owned)
+
+    async def inspect_recorded(self, task_id: str) -> dict[str, Any]:
+        owned = self.registry.container_record(task_id)
+        if owned is None or not owned["container_id"]:
+            raise BrokerError("container_not_owned", "No recorded container identity is available.", 404)
+        return await self._inspect_record(task_id, owned)
+
+    async def _inspect_record(self, task_id: str, owned: Any) -> dict[str, Any]:
         raw = await self._run("inspect", owned["container_id"], timeout=10, maximum=64 * 1024)
         try:
             details = json.loads(raw)
@@ -158,6 +167,7 @@ class RootlessPodmanRuntime:
                 self.config.state_dir / "tasks" / task_id / "workspace",
             )
             expected_image_id = self.image_id
+            security_options = host.get("SecurityOpt", [])
             if (
                 info["Id"] != owned["container_id"]
                 or labels.get("synai.broker.allocation") != owned["allocation_id"]
@@ -171,7 +181,11 @@ class RootlessPodmanRuntime:
                 or host.get("ReadonlyRootfs") is not True
                 or host.get("CapAdd")
                 or "ALL" not in {str(value).upper() for value in host.get("CapDrop", [])}
-                or not any("no-new-privileges" in option for option in host.get("SecurityOpt", []))
+                or not any("no-new-privileges" in option for option in security_options)
+                or not any(
+                    option == "seccomp=/usr/share/containers/seccomp.json"
+                    for option in security_options
+                )
                 or host.get("Memory") != self.config.profile.memory_bytes
                 or host.get("PidsLimit") != self.config.profile.pids
                 or host.get("NanoCpus") != int(self.config.profile.cpus * 1_000_000_000)
@@ -194,12 +208,30 @@ class RootlessPodmanRuntime:
             raise BrokerError("container_inspection_invalid", "Runtime returned invalid task container evidence.", 502) from exc
 
     async def terminate_owned(self, task_id: str) -> str:
-        owned = self.registry.owned_container(task_id)
-        info = await self.inspect_owned(task_id)
+        return await self._terminate_container(task_id, recovery=False)
+
+    async def terminate_recorded(self, task_id: str) -> str:
+        return await self._terminate_container(task_id, recovery=True)
+
+    async def _terminate_container(self, task_id: str, *, recovery: bool) -> str:
+        owned = (
+            self.registry.container_record(task_id)
+            if recovery else self.registry.owned_container(task_id)
+        )
+        if owned is None or not owned["container_id"]:
+            raise BrokerError("container_not_owned", "No recorded container identity is available.", 404)
+        info = (
+            await self.inspect_recorded(task_id)
+            if recovery else await self.inspect_owned(task_id)
+        )
         raw = json.dumps([info], sort_keys=True, separators=(",", ":"))
         if info["State"]["Running"] is True:
             await self._run("kill", owned["container_id"], timeout=10, maximum=4096)
-            raw = await self._run("inspect", owned["container_id"], timeout=10, maximum=64 * 1024)
+            info = (
+                await self.inspect_recorded(task_id)
+                if recovery else await self.inspect_owned(task_id)
+            )
+            raw = json.dumps([info], sort_keys=True, separators=(",", ":"))
         try:
             items = json.loads(raw)
             if len(items) != 1 or items[0]["State"]["Running"] is not False:
@@ -208,7 +240,10 @@ class RootlessPodmanRuntime:
             self.registry.mark_container(task_id, "quarantined")
             raise BrokerError("termination_unconfirmed", "Task container termination could not be verified.", 409) from exc
         evidence = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        self.registry.mark_container(task_id, "terminated", termination=evidence)
+        if recovery:
+            self.registry.record_reconciliation(task_id, "terminated", evidence)
+        else:
+            self.registry.mark_container(task_id, "terminated", termination=evidence)
         return evidence
 
     async def remove_owned(self, task_id: str) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,11 +50,13 @@ class BrokerConfig:
     image_digest: str
     core_uid: int
     service_uid: int
-    service_key: bytes
     claim_key: bytes
-    socket_gid: int
+    core_ca_file: Path
+    broker_cert_file: Path
+    broker_key_file: Path
+    listen_port: int = 8766
+    core_port: int = 8767
     profile: ResourceProfile = DEFAULT_PROFILE
-    socket_path: Path | None = None
     allowed_tools: frozenset[str] = frozenset({
         "read_file", "list_files", "write_file", "patch_file", "delete_file",
         "command", "verify", "collect",
@@ -66,10 +69,19 @@ class BrokerConfig:
             raise ValueError("Broker configuration service identity does not match the current process")
         if not self.state_dir.is_absolute() or "," in str(self.state_dir):
             raise ValueError("Broker state path must be absolute and compatible with the fixed mount grammar")
-        if len(self.service_key) < 32 or len(self.claim_key) < 32:
-            raise ValueError("Broker service key and Core Ed25519 public key must each contain at least 32 bytes")
         if len(self.claim_key) != 32:
             raise ValueError("Broker Core Ed25519 public key must contain exactly 32 bytes")
+        for name, path in (
+            ("Core CA", self.core_ca_file), ("Broker certificate", self.broker_cert_file),
+            ("Broker private key", self.broker_key_file),
+        ):
+            if not isinstance(path, Path) or not path.is_absolute():
+                raise ValueError(f"{name} path must be absolute")
+        if (
+            type(self.listen_port) is not int or not 1 <= self.listen_port <= 65535
+            or type(self.core_port) is not int or not 1 <= self.core_port <= 65535
+        ):
+            raise ValueError("Broker/Core private listener port is invalid")
         if not _DIGEST.fullmatch(self.image_digest):
             raise ValueError("Broker image digest must be a pinned sha256 digest")
         if (
@@ -94,18 +106,13 @@ class BrokerConfig:
             "command", "verify", "collect",
         }:
             raise ValueError("Broker tool allowlist contains an unsupported operation")
-        if self.socket_path is not None and not self.socket_path.is_absolute():
-            raise ValueError("Broker socket path must be absolute")
-        if type(self.socket_gid) is not int or self.socket_gid < 0:
-            raise ValueError("Broker socket group ID must be a non-negative integer")
-
     @classmethod
     def from_env(cls) -> BrokerConfig:
         required = (
             "SYNAI_BROKER_CORE_UID", "SYNAI_BROKER_IMAGE",
-            "SYNAI_BROKER_IMAGE_DIGEST", "SYNAI_BROKER_SERVICE_KEY",
-            "SYNAI_BROKER_CLAIM_PUBLIC_KEY", "SYNAI_BROKER_STATE_DIR",
-            "SYNAI_BROKER_SOCKET_GID",
+            "SYNAI_BROKER_IMAGE_DIGEST", "SYNAI_BROKER_CLAIM_PUBLIC_KEY",
+            "SYNAI_BROKER_STATE_DIR", "SYNAI_BROKER_CORE_CA",
+            "SYNAI_BROKER_CERT", "SYNAI_BROKER_KEY",
         )
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
@@ -118,11 +125,12 @@ class BrokerConfig:
             image_digest=image_digest,
             core_uid=int(os.environ["SYNAI_BROKER_CORE_UID"]),
             service_uid=os.geteuid(),
-            service_key=_decode_key(os.environ["SYNAI_BROKER_SERVICE_KEY"]),
             claim_key=_decode_key(os.environ["SYNAI_BROKER_CLAIM_PUBLIC_KEY"]),
-            socket_gid=int(os.environ["SYNAI_BROKER_SOCKET_GID"]),
-            socket_path=Path(os.environ["SYNAI_BROKER_SOCKET"])
-            if os.environ.get("SYNAI_BROKER_SOCKET") else None,
+            core_ca_file=Path(os.environ["SYNAI_BROKER_CORE_CA"]),
+            broker_cert_file=Path(os.environ["SYNAI_BROKER_CERT"]),
+            broker_key_file=Path(os.environ["SYNAI_BROKER_KEY"]),
+            listen_port=int(os.environ.get("SYNAI_BROKER_PORT", "8766")),
+            core_port=int(os.environ.get("SYNAI_CORE_BROKER_PORT", "8767")),
         )
         config.validate()
         return config
@@ -134,6 +142,14 @@ class BrokerConfig:
             and self.image.endswith(f"@{self.image_digest}"),
             "state_directory_private": _private_state_directory(self.state_dir),
             "podman_available": shutil.which(self.podman) is not None,
+            "mtls_material": all(
+                _private_file(path, private=private)
+                for path, private in (
+                    (self.core_ca_file, False),
+                    (self.broker_cert_file, False),
+                    (self.broker_key_file, True),
+                )
+            ),
             "rootless_podman": False,
             "cgroup_v2": Path("/sys/fs/cgroup/cgroup.controllers").is_file(),
             "seccomp_profile": Path("/usr/share/containers/seccomp.json").is_file(),
@@ -170,5 +186,17 @@ def _active_lsm() -> bool:
     try:
         return any(item in {"apparmor", "selinux"} for item in
                    Path("/sys/kernel/security/lsm").read_text().strip().split(","))
+    except OSError:
+        return False
+
+
+def _private_file(path: Path, *, private: bool) -> bool:
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_size <= 0:
+            return False
+        return not private or (
+            info.st_uid == os.geteuid() and info.st_mode & 0o077 == 0
+        )
     except OSError:
         return False

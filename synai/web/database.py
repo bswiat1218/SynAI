@@ -13,7 +13,7 @@ from synai.storage import ConversationStorage, checked_path
 class MetadataDatabase:
     """Private, versioned browser-service metadata, separate from conversation history."""
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(self, data_root: Path) -> None:
         self.storage = ConversationStorage(data_root)
@@ -30,7 +30,7 @@ class MetadataDatabase:
                 raise ValueError("Web metadata must be a private regular file owned by this user")
         with self.connect() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, 3, self.SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, 4, 5, self.SCHEMA_VERSION}:
                 raise ValueError("Unsupported web metadata schema version")
             if version == 0:
                 connection.executescript(
@@ -113,6 +113,9 @@ class MetadataDatabase:
                 current_version = connection.execute("PRAGMA user_version").fetchone()[0]
             if current_version == 4:
                 self._migrate_to_project_activity_v5(connection)
+                current_version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if current_version == 5:
+                self._migrate_to_broker_authority_v6(connection)
             elif current_version != self.SCHEMA_VERSION:
                 raise ValueError("Web metadata migration did not reach the current schema version")
         os.chmod(self.path, 0o600)
@@ -313,6 +316,118 @@ class MetadataDatabase:
                     PRIMARY KEY(project_id, sequence)
                 );
                 PRAGMA user_version = 5;
+                COMMIT;
+                """
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_to_broker_authority_v6(connection: sqlite3.Connection) -> None:
+        try:
+            connection.executescript(
+                """
+                BEGIN EXCLUSIVE;
+                CREATE TABLE broker_task_authorizations (
+                    task_id TEXT PRIMARY KEY
+                        REFERENCES distributed_tasks(task_id) ON DELETE CASCADE,
+                    project_id TEXT NOT NULL
+                        REFERENCES logical_projects(project_id),
+                    snapshot_id TEXT NOT NULL
+                        REFERENCES immutable_snapshots(snapshot_id),
+                    snapshot_digest TEXT NOT NULL,
+                    allocation_id TEXT NOT NULL UNIQUE,
+                    target_id TEXT NOT NULL,
+                    plan_id TEXT NOT NULL,
+                    plan_digest TEXT NOT NULL,
+                    policy_id TEXT NOT NULL,
+                    policy_version INTEGER NOT NULL CHECK(policy_version > 0),
+                    decision_digest TEXT NOT NULL,
+                    approval_id TEXT NOT NULL,
+                    approval_digest TEXT NOT NULL,
+                    image_digest TEXT NOT NULL,
+                    image_profile_id TEXT NOT NULL,
+                    resource_profile_id TEXT NOT NULL,
+                    allowed_operations_json TEXT NOT NULL,
+                    authorization_kind TEXT NOT NULL,
+                    authorized_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    revoked_at INTEGER
+                );
+                CREATE TABLE broker_task_leases (
+                    task_id TEXT PRIMARY KEY
+                        REFERENCES broker_task_authorizations(task_id) ON DELETE CASCADE,
+                    generation INTEGER NOT NULL CHECK(generation > 0),
+                    fencing_token TEXT NOT NULL,
+                    fencing_token_hash TEXT NOT NULL,
+                    allocation_id TEXT NOT NULL,
+                    issued_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    revoked_at INTEGER
+                );
+                CREATE TABLE broker_claims (
+                    claim_id TEXT PRIMARY KEY CHECK(length(claim_id) = 32),
+                    operation_id TEXT NOT NULL UNIQUE CHECK(length(operation_id) = 32),
+                    task_id TEXT NOT NULL REFERENCES broker_task_authorizations(task_id),
+                    project_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    allocation_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    claim_digest TEXT NOT NULL,
+                    claim_json TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN
+                        ('issued', 'running', 'completed', 'failed', 'uncertain', 'revoked')),
+                    issued_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    revoked_at INTEGER
+                );
+                CREATE INDEX broker_claims_task_state
+                    ON broker_claims(task_id, state, expires_at);
+                CREATE TABLE broker_snapshot_grants (
+                    grant_id TEXT PRIMARY KEY CHECK(length(grant_id) = 32),
+                    claim_id TEXT NOT NULL UNIQUE REFERENCES broker_claims(claim_id),
+                    task_id TEXT NOT NULL REFERENCES broker_task_authorizations(task_id),
+                    project_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    snapshot_digest TEXT NOT NULL,
+                    allocation_id TEXT NOT NULL,
+                    token_hash TEXT NOT NULL,
+                    replay_nonce TEXT NOT NULL UNIQUE,
+                    max_files INTEGER NOT NULL,
+                    max_bytes INTEGER NOT NULL,
+                    issued_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    consumed_at INTEGER,
+                    revoked_at INTEGER
+                );
+                CREATE TABLE broker_operation_provenance (
+                    operation_id TEXT PRIMARY KEY REFERENCES broker_claims(operation_id),
+                    claim_id TEXT NOT NULL UNIQUE REFERENCES broker_claims(claim_id),
+                    task_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    claim_digest TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN
+                        ('issued', 'running', 'completed', 'failed', 'uncertain', 'revoked')),
+                    outcome_json TEXT,
+                    outcome_digest TEXT,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE broker_task_results (
+                    operation_id TEXT PRIMARY KEY REFERENCES broker_claims(operation_id),
+                    claim_id TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    snapshot_id TEXT NOT NULL,
+                    snapshot_digest TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    result_digest TEXT NOT NULL,
+                    validated_at INTEGER NOT NULL
+                );
+                PRAGMA user_version = 6;
                 COMMIT;
                 """
             )
