@@ -27,8 +27,7 @@ status are recorded in [the ADRs](./adr/).
 
 ### Goals
 
-- Keep the established Linux TUI and its task, approval, execution and
-  historical-memory behavior supported.
+- Preserve historical user data and shared coding-agent algorithms without restoring retired local interfaces.
 - Provide an authenticated browser control plane for chat and metadata.
 - Represent a distributed project independently from a host path, and bind
   source snapshots to the authorized device and workspace binding that
@@ -72,16 +71,16 @@ flowchart LR
     Broker -. "owns only authorized task containers" .-> Runtime["Rootless Podman task containers"]
     Runtime -. "task output / bounded artifacts" .-> Broker
     Broker -. "validated result + provenance" .-> Core
-    TUI["Legacy SynAI TUI"] --> Agent["Agent / Tools / CodingAgentRuntime"]
+    
     Agent --> LocalExec["Existing local Sandbox or HostExecution"]
     Agent --> Memory["Phase 12 project memory"]
-    TUI --> History["Managed conversation history"]
+
     Core --> History
 ```
 
 Solid paths represent functionality present in the current repository;
 dashed paths are intended architecture, not available runtime features.
-Core and TUI share an exclusive OS data-root lock, so they cannot use the same
+Core retains an exclusive OS data-root lock, so they cannot use the same
 data root concurrently. The development Playwright container is test
 infrastructure, not a production Core or Broker deployment.
 
@@ -94,7 +93,6 @@ infrastructure, not a production Core or Broker deployment.
 | Sandbox Broker | Separate unprivileged service identity; narrow Core-facing task protocol; task container lifecycle, resource enforcement, claim/fencing checks, cancellation/reaping, result validation. | Planned. No Broker process, Podman integration, or production service identity exists. |
 | Task container | Disposable task-scoped execution environment, no network by default, strict filesystem and resource policy. | Planned for distributed tasks. Not the existing legacy TUI Sandbox, whose current network default is bridge and whose selected image/runtime flow is local. |
 | Browser | Login, project/device/binding/snapshot metadata, consent-request signaling, chat and activity display. | Implemented. It has no source bytes, local device authority, task execution, patch-apply, or approval-to-execute power. |
-| Legacy TUI | Existing chat/tool loop and Phases 1–12 coding-agent workflow through the configured local execution backend. | Implemented and separately supported under its existing security semantics. |
 | Core snapshot adapter | Verify manifest and object digests, create/read a Core-owned source view, and expose it to the existing bounded index/context engine. | Implemented as a read-only adapter; not connected to the distributed task runtime. |
 
 Core modules include `synai/web/app.py`, `auth.py`, `chat.py`,
@@ -280,7 +278,7 @@ Authorization is layered and independent:
    request a snapshot; these are Core metadata permissions only.
 3. A local user authorizes a directory and approves the exact snapshot preview
    before local reads and upload.
-4. Legacy TUI tool calls use its `Tools` dispatcher, strict schemas, backend
+4. retired local interface tool calls use its `Tools` dispatcher, strict schemas, backend
    identity, Phase 10 policy, per-action approval, task plan/scope and
    preimage checks.
 5. Future distributed execution requires separately validated task
@@ -347,26 +345,9 @@ process exit alone. Recovery evidence must bind the exact prior task, claim,
 generation and container, and prove the previous writer is stopped before
 new authority is issued.
 
-## 13. Legacy TUI, Phase 12 memory and compatibility
+## 13. Retired interfaces and preserved historical data
 
-The TUI remains a separate supported application under its existing
-semantics. It uses its existing conversation `Agent`, `Tools`, sandbox or
-explicit HostExecution backend, task policies, approvals and memory. Those
-local execution backends are not the future Broker. Browser and TUI share a
-single-process data-root lock; simultaneous use of one data root is rejected.
-
-Phase 12 project memory remains opt-in, local and workspace-identity-bound.
-Its ID derives from user, device/inode and canonical path; a Core snapshot
-logical project is not an alias. Phase 13C includes a preview-only memory
-association contract, not a migration or live memory integration. Do not
-change historical conversation, checkpoint, task or memory schemas as part of
-this architecture baseline. No automatic migration, namespace merge or
-historical evidence reclassification is authorized.
-
-The Phase 13B path-based project registry remains a legacy compatibility
-domain; logical distributed projects are separate records and are not
-backfilled from it. See [phase compatibility](./phase-compatibility.md) and
-the ADR on historical memory.
+The former interactive local interface and bundled editor are retired and provide no launch path, runtime authority, or supported fallback. Historical conversation/task schemas, opt-in Phase 12 memory, data-root locking and transactional persistence remain supported as data integrity obligations. Migrating or associating legacy data requires explicit approval and verified backups.
 
 ## 14. Docker deployment and runtime boundaries
 

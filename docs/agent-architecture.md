@@ -1,8 +1,8 @@
-# SynAI legacy agent architecture
+# SynAI Coding-Agent Backend Architecture
 
 The authoritative SynAI 2.0 system baseline is
 [docs/architecture/synai-2.0.md](architecture/synai-2.0.md). This document
-retains the detailed legacy TUI and Phases 0–13E implementation history; it is
+retains the detailed legacy retired interface and Phases 0–13E implementation history; it is
 not a replacement for the distributed trust boundaries, protocol contracts
 or Phase 13F-A prerequisites in the canonical baseline.
 
@@ -759,12 +759,12 @@ event and does not roll back the task, replay mutations, or rerun checks.
 
 ## Web foundation (Phase 13B)
 
-The opt-in browser foundation is additive; the TUI, existing history/task
+The opt-in browser foundation is additive; the retired interface, existing history/task
 formats, Phase 0–12 authorization flow, `Tools` dispatcher, and Phase 12
 memory identity remain authoritative. The FastAPI API is versioned and
 read-only for projects, model discovery, and authentication; it does not run
 chat turns, dispatch tools, execute commands, or mutate project files. Web
-service and TUI startup share an OS-backed application-data-root ownership
+service and retired interface startup share an OS-backed application-data-root ownership
 lock. Workspace lease/fencing primitives are future-writer contracts and are
 not connected to web mutation routes. The detailed API, deployment,
 authentication, runner boundary, recovery, and Phase 12 compatibility
@@ -775,7 +775,7 @@ constraints are documented in [phase-13b-web.md](./phase-13b-web.md).
 Phase 13C adds separate server-owned logical project/device/binding identities,
 operator-authorized device enrollment contracts, bounded immutable source
 snapshot ingestion, and read-only Phase 2/3 access to verified snapshot
-contents. The path-based Phase 13B registry, TUI storage ownership, Phase 12
+contents. The path-based Phase 13B registry, retired interface storage ownership, Phase 12
 memory identity, `CodingAgentRuntime`, approval system, and existing execution
 backends remain authoritative in their existing scope. Phase 13C does not
 include a production Client Agent, Sandbox Broker, distributed task execution,

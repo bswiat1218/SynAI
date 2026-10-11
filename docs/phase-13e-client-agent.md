@@ -9,7 +9,7 @@ client-confirmed snapshot requests; snapshot bytes still travel only through
 the existing signed HTTP upload API. The WebSocket is not a command channel.
 
 The Agent runs as the invoking user, opens no listening socket, imports no
-Textual/TUI, tool-dispatch, sandbox, container, or host-execution modules, and
+Textual/retired interface, tool-dispatch, sandbox, container, or host-execution modules, and
 does not modify a project. Browser chat remains tool-disabled. No Broker,
 runtime, task execution, shell, patch, project write, or automatic service
 installation is included.
@@ -28,7 +28,7 @@ python3 -m venv ~/.local/venvs/synai-client
 The dedicated environment and `synai-client` executable are independent of the
 Core process. The Client Agent's module imports are limited to Python standard
 library code, `cryptography`, `httpx`, and `websockets`; it does not import the
-TUI or execution stack. The installation does not request root privileges or
+retired interface or execution stack. The installation does not request root privileges or
 change system configuration.
 
 ## Configure and pair

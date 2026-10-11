@@ -1,53 +1,13 @@
-# ADR 0007: Preserve legacy TUI and historical memory compatibility
+# ADR 0007: Retired User Interfaces and Historical Data Compatibility
 
-- **Status:** Accepted compatibility invariant; existing formats and
-  behavior retained. Historical approval record is absent.
-- **Date:** 2026-10-10 baseline documentation.
+Status: Superseded by the operator decision on 2026-10-10 to retire the original interactive interface and bundled editor.
 
 ## Decision
 
-The existing Linux TUI and Phases 0–12 behavior remain separately supported
-under their original security semantics. Conversation, task/checkpoint and
-Phase 12 memory schemas are not changed by the distributed architecture
-baseline. The web service and TUI share the existing exclusive data-root
-ownership lock. No automatic history migration, memory merge, identity alias
-or checkpoint reinterpretation is allowed.
-
-## Rationale
-
-The existing local workflow has established execution, approval, recovery
-and memory behavior. Distributed identities and Core storage have different
-trust and path semantics; transparent merging risks changing authorization or
-historical provenance.
-
-## Alternatives considered
-
-- Replace TUI with Browser Chat: rejected.
-- Allow concurrent Core/TUI writes against the same data root: rejected by
-  existing ownership lock.
-- Rewrite stored task/checkpoint/memory records: rejected in this phase.
-- Automatically associate a Core project with a Phase 12 memory namespace:
-  rejected.
+Only the React web application and the Linux Client Agent administration CLI are supported interactive interfaces. The old interface and editor have no supported launchers, imports, execution fallbacks or release assets. Preserve historical conversation and task data formats and opt-in Phase 12 memory through explicit, verified migration only.
 
 ## Consequences
 
-- Legacy execution can remain available locally, but is not evidence of
-  Broker isolation.
-- Web and TUI cannot own the same data root concurrently.
-- Phase 12 memory stays opt-in and path/device/inode/user-bound.
-- Any future memory association requires a separate reviewed, backed-up,
-  copied-database dry run and rollback plan.
+Remove interface-specific dependencies, source, tests, packaged assets, and stale documentation. Preserve shared agent, history, indexing, planning, review, verification, policy and data integrity logic, including data-root ownership and recovery protections. Core may not gain host execution authority as a side effect of this retirement.
 
-## Implementation dependencies
-
-Implemented in TUI entrypoint, `synai/web/ownership.py`,
-`synai/coding_agent/memory.py` and history/checkpoint validators.
-Representative tests: `tests/test_storage.py`,
-`tests/test_coding_agent_memory.py`, `tests/test_agent_state.py`,
-`tests/test_web_container_memory_identity.py`.
-
-## Historical input
-
-The checked-in architecture baseline documents existing Phases 0–12 and 13B
-compatibility. No original approval record was present. No historical schema
-was modified to create this ADR.
+The previous co-existence decision is superseded and remains visible in Git history.

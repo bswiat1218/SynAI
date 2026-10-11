@@ -21,7 +21,7 @@ scoped approval or task claim. Separation also preserves the legacy local
 
 ## Alternatives considered
 
-- Enable existing TUI tool schemas in browser chat: rejected.
+- Enable existing retired interface tool schemas in browser chat: rejected.
 - Treat a project chat as a task: rejected.
 - Infer approval from session authentication: rejected.
 - Present metadata pages as operational task or sandbox controls: rejected.

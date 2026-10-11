@@ -11,12 +11,12 @@ host-execution authority. It has no unrestricted Docker/Podman socket and
 does not mount arbitrary host/client project directories. Distributed project
 execution, if approved, occurs in a separately identified and restricted
 Sandbox Broker. The Broker controls only its own authorized task containers.
-The legacy TUI keeps its pre-existing local execution backends under separate
+The legacy retired interface keeps its pre-existing local execution backends under separate
 security semantics.
 
 ## Rationale
 
-The repository already separates web application APIs from the local TUI
+The repository already separates web application APIs from the local retired interface
 `Tools` and execution backends. Core handles chat, identity, metadata and
 snapshot ingestion; browser chat has tool execution disabled. Keeping runtime
 control out of Core prevents a web/session compromise from becoming general
@@ -25,8 +25,8 @@ host or container administration.
 ## Alternatives considered
 
 - Give Core direct Docker/Podman access: rejected by the trust invariant.
-- Reuse the legacy TUI `Sandbox` or `HostExecution` as a server runner:
-  rejected; they are local TUI backends with different image, mount, network
+- Reuse the legacy retired interface `Sandbox` or `HostExecution` as a server runner:
+  rejected; they are local retired interface backends with different image, mount, network
   and host-execution assumptions.
 - Execute on Client Agent devices: rejected; device pairing and browser
   authentication do not grant local execution authority.
@@ -36,8 +36,8 @@ host or container administration.
 - Broker is a separate trust domain with a narrow authenticated API and own
   runtime identity.
 - Broker outage or invalid response must fail closed; no host fallback.
-- Existing Core and TUI remain distinct. This does not disable existing
-  explicitly configured local TUI host tools.
+- Existing Core and retired interface remain distinct. This does not disable existing
+  explicitly configured local retired interface host tools.
 - Production service identities, transport, deployment and runtime policy
   need additional design review.
 

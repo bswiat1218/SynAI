@@ -3,7 +3,7 @@
 Phase 13B introduced a read-only browser/API foundation alongside the existing
 Textual/GTK application. Phase 13D has since added authenticated browser chat
 and project activity streaming; those later capabilities are documented in
-[Phase 13D browser chat](phase-13d-web-chat.md). Neither phase replaces the TUI,
+[Phase 13D browser chat](phase-13d-web-chat.md). The former terminal interface was subsequently retired,
 dispatches tools, executes commands, edits project files, or starts a task runner. The
 approved revised Phase 13A plan was not present in the checked-out repository
 when this work was implemented; the detailed Phase 13B requirements are the
@@ -106,14 +106,14 @@ editing endpoints.
 
 ## Shared data-root ownership
 
-Both the legacy TUI entrypoint and web-service lifespan acquire an exclusive
+The web-service lifespan acquires an exclusive
 OS `flock` on `~/.synai/application.lock` before using the shared
 application-data root. The lock is the authority; PID/mode/start-time metadata
 is diagnostic only and can be stale or malformed without granting ownership.
 The lock file is private, opened without following symlinks, and held by file
 descriptor. Process termination releases the kernel lock automatically.
 Starting the other application while one owns the root fails with an explicit
-conflict. This prevents simultaneous web/TUI writes without changing legacy
+conflict. This prevents simultaneous competing process writes without changing legacy
 conversation formats.
 
 ## Workspace coordinator contract
@@ -276,7 +276,7 @@ out of scope.
 
 ## Compatibility and phase boundary
 
-The existing Python TUI, history and task formats, storage, and Phase 12
+Historical conversation and task formats, storage, and Phase 12
 memory schema remain authoritative. No historical JSON conversations are
 bulk-migrated. Web mode has no chat streaming, WebSocket, task execution,
 tool-enabled chat, arbitrary filesystem browser, project mutation, terminal

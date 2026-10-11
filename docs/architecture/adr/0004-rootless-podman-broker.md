@@ -13,7 +13,7 @@
 ## Decision
 
 The Phase 13F-A Broker is a dedicated unprivileged Linux service
-identity, separate from Core, TUI and client identities. Rootless Podman is
+identity, separate from Core, retired interface and client identities. Rootless Podman is
 managed only by this identity, using private runtime configuration, storage
 and socket permissions. SynAI Core receives neither Podman/Docker sockets nor
 runtime credentials.
@@ -52,7 +52,7 @@ policy even when Core issues an otherwise valid claim.
   separation.
 - Reuse legacy `synai.sandbox.Sandbox`: rejected; current behavior permits a
   selected image/runtime, bridge networking and a read-write local workspace
-  bind, and runs under the local TUI's authority.
+  bind, and runs under the local retired interface's authority.
 - Use host execution: rejected for distributed tasks; `HostExecution` is
   explicitly unsandboxed.
 - Run workloads on client devices: rejected; local execution requires
