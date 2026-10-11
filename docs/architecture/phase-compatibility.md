@@ -2,11 +2,12 @@
 
 This matrix maps the historical SynAI phases to the distributed architecture
 baseline. "Existing" describes code in this checkout; "planned" is not a
-feature claim. The checked-in repository does not contain the original
-approved Phase 13A plan or subsequent realignment approval record. Phase 13B
-documentation says that the revised plan was unavailable during its
-implementation. Historical phase/checkpoint and memory schemas are not
-changed by this document.
+feature claim. Supplied copies of the original Phase 13A migration plan and
+subsequent architecture realignment are archived
+[here](./history/README.md). Phase 13B documentation says that the revised
+plan was unavailable during its implementation. The plans are historical
+design references, not proof of separate approval. Historical
+phase/checkpoint and memory schemas are not changed by this document.
 
 ## Phase 0–13E matrix
 
@@ -25,7 +26,8 @@ changed by this document.
 | 10 — Autonomy policy | Deterministic `AutonomyPolicy` integrated with Tools/runtime, mandatory operation approvals and strict trusted config. | Keep the policy as local enforcement and design input. | Broker must independently enforce execution limitations; define trust/translation of policy and approval references across domains. | `test_coding_agent_policies.py`, `test_coding_agent_runtime.py`. | Browser and device authentication are not this approval or policy system. |
 | 11 — Model routing | Deterministic local `ModelRouter` and task provenance. | May inform future worker capability selection, never authority. | Define how worker/model identity enters distributed result provenance if needed. | `test_coding_agent_routing.py`, `test_coding_agent_runtime.py`. | No distributed target/model routing exists. |
 | 12 — Persistent project memory | Opt-in SQLite project memory bound to local user, canonical path and filesystem identity. | Existing local TUI memory remains supported. Phase 13C memory-association endpoint is preview-only. | Any logical-project association needs separate operator-reviewed copy/backup/dry-run/rollback; no alias or migration in 13F-A. | `test_coding_agent_memory.py`, `test_web_container_memory_identity.py`, `test_web_distributed.py`. | Host path and `/workspace` container path produced different IDs in disposable probe; deployed image/old DB compatibility is unverified. |
-| 13A — Distributed architecture plan | No original approved plan or realignment plan checked in. Existing source has partial foundation but cannot establish historical approval. | This baseline assembles observable decisions and explicit trust invariants. | Recover/approve source plan and any decision record before asserting historical approval. | Phase docs `docs/phase-13b-web.md` and `docs/phase-13c-distributed.md` record plan unavailability. | Approval record and missing details remain unverified. |
+| 13A — Web migration plan | Supplied original migration plan now preserved in `history/`; it describes read-only Core mounts of registered host roots and a separate runner's selected workspace read-write mount. | Historical design context only; not the current distributed source model. | Current baseline follows later immutable snapshots and Broker-managed task storage. Preserve old text without treating it as an allowed fallback. | `history/README.md` records source hashes and the design difference. | Plan content is recovered; separate formal approval evidence is not. |
+| 13A realignment — Distributed architecture | Supplied realignment now preserved in `history/`; it describes rootless Podman, dedicated Broker identity, no Core runtime socket, immutable snapshots and task containers. | Provides the closest historical basis for current constraints. | Explicit approval remains necessary; roadmap was subsequently decomposed into current phases. | `history/README.md`, ADR 0004, `tests/test_web_distributed.py` (snapshot only; no Broker test exists). | It is a plan, not proof that each implementation choice was formally accepted. |
 | 13B — Web foundation | FastAPI, single-user auth, legacy configured project metadata, shared data-root lock, coordinator primitive, React foundation. | Reuses existing provider/history; API project IDs remain separate from logical projects. | Keep read-only compatibility registry separate; do not route arbitrary configured paths to Broker. | `test_web_foundation.py`, `test_web_coordination.py`, `test_web_container_isolation.py`. | Production Core image/deployment not defined; coordinator not wired to a writer. |
 | 13C — Distributed foundation | Logical project/device/binding IDs; pairing, signed device HTTP auth, snapshots, database contracts, read-only index/context adapter, disabled task metadata. | Reuses Phase 2 index/Phase 3 context over immutable snapshots; preserves Phase 12 namespace. | Implement independently authenticated Broker and task claim/fencing only after design; no claim API exists. | `test_web_distributed.py`, `test_web_coordination.py`, `test_web_container_isolation.py`, `test_web_container_memory_identity.py`. | No production Client Agent at the time of 13C; no Broker/task execution; source filtering is heuristic. |
 | 13D — Browser Chat | Cookie/CSRF chat API; persisted event streams; React Workbench, Devices, Agent Tasks and Sandboxes metadata pages. | Uses existing `Agent` and provider, explicitly with tools disabled; event stream is cursor/resync metadata. | Keep chat/task separation; implement Broker as separate surface when approved. | `test_web_chat.py`, `test_conversation_browser.py`, `test_web_openapi.py`, browser tests under `web/e2e/`. | UI Agent Tasks/Sandboxes are informational; no execution, source browse, review or patch apply. |
@@ -46,15 +48,15 @@ changed by this document.
 | Project memory/checkpoints | Phase 12 identity-bound memory; Phase 1+ checkpoint data in history. | 13C includes association preview only and separate metadata database. | Reviewed operator-led copy/migration only if later authorized. | Do not change historical checkpoint/memory schemas or auto-rekey. | `test_coding_agent_memory.py`, checkpoint tests, `test_web_container_memory_identity.py`. |
 | Docker/deployment | Test-only Playwright image; optional isolation fixtures; no production Core/Broker image. | Isolation tests demonstrate fixture assertions, not production deployment. | Define reviewed Core and Broker identities/mounts/sockets/limits and integration test on actual rootless Podman. | Never mount arbitrary client directories or expose unrestricted runtime socket to Core. | `test_web_container_isolation.py` opt-in; does not validate intended production image. |
 
-## Phase 13F-A blockers versus later work
+## Phase 13F-A entry, deliverables and 13F-B acceptance
 
-**Must precede Phase 13F-A implementation:** resolve the missing approval
-provenance (recover/review the plan or explicitly approve a new baseline);
-specify authenticated service identities, durable claims and independent
-fencing authority; constrain Core-to-Broker requests; define Broker-owned
-rootless Podman/runtime policy; prove no Core runtime socket or unauthorized
-mount; define cancellation/recovery and no-replay semantics; pin image
-digests; and settle resource/result integrity requirements.
+The current 13F-A entry gate, implementation deliverables and 13F-B
+acceptance gate are defined in
+[the canonical architecture](./synai-2.0.md#phase-13f-a-entry-and-13f-b-acceptance-gates).
+The absence of an unimplemented Broker is a deliverable, not an entry failure.
+Before 13F-A, explicitly approve the architecture/ADR and unresolved service
+authentication, claim authority, snapshot grants, resource profile and
+Ubuntu runtime assumptions.
 
 **Not a 13F-A authorization:** client patch application, multi-user project
 ACLs, memory migration, Android, GPU, remote workers or historical schema

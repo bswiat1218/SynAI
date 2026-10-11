@@ -215,36 +215,220 @@ production claim signer/ledger or independently enforcing Broker. Existing
 workspace lease generations are for Phase 13B configured workspace
 coordination and are not automatically the distributed task fencing source.
 
-## Planned Core-to-Broker protocol (not implemented; no version is approved)
+## Proposed Core-to-Broker claim and fencing contract
 
-The 13F-A protocol must not silently broaden authority. Before a wire version
-is approved, design review must specify:
+**Status:** proposed `synai-broker/v1`; not implemented or approved. These
+fields and semantics specify a reviewable design baseline, not an existing
+wire format. Core/Broker requests use mutually authenticated service
+identities over a protected channel. Schemas are canonical, size-bounded and
+reject unknown fields. Every request carries protocol version and a unique
+request ID.
 
-- mutually authenticated Core/Broker service identities and transport;
-- canonical versioned request/response schemas that reject unknown fields;
-- a durable, one-shot task claim bound to task ID, project ID, exact snapshot
-  ID and manifest digest, source binding/device, execution target and
-  Broker-owned allocation;
-- claim issue/expiry, unique request/idempotency ID, fencing generation,
-  policy decision and scoped approval references, exact allowed operations,
-  server-controlled resource profile and absolute deadline;
-- authenticated cancellation bound to the claim, plus status lookup for
-  ambiguous results; no retry of a request that may have started;
-- Broker-side independent validation immediately before container side
-  effects and at supported mutation boundaries;
-- retrieval of only the exact immutable Core snapshot over a narrow
-  read-only interface, with manifest/object re-hash before use;
-- bounded typed results/artifacts with request/task/claim/generation/snapshot
-  correlation, digest and provenance checks;
-- explicit interrupted/indeterminate status and recovery evidence proving
-  previous writers are reaped before a new fence/claim;
-- server-side image allowlist with pinned digests, no caller runtime flags,
-  no Core socket, network disabled by default, and fixed mount/limit policy.
+### Claim payload
 
-No proposed JSON field list in this paragraph is an implemented field or
-approved contract. In particular, an ID, generation number or approval
-reference in a payload is not authority unless Broker verifies its source,
-scope, freshness and current status independently.
+Core issues a signed, short-lived, task-scoped execution claim after its
+policy/approval decision. The proposed v1 claim binds all of:
+
+```json
+{
+  "protocol_version": "synai-broker/v1",
+  "issuer": "synai-core:<deployment-id>",
+  "audience": "synai-broker:<allocation-id>",
+  "claim_id": "<opaque-id>",
+  "project_id": "<logical-project-id>",
+  "task_id": "<task-id>",
+  "snapshot_id": "<immutable-snapshot-id>",
+  "snapshot_manifest_sha256": "<64-hex>",
+  "broker_allocation_id": "<broker-allocation-id>",
+  "operation_id": "<unique-operation-id>",
+  "operation_kind": "<allowlisted-kind>",
+  "policy_provenance": {
+    "policy_id": "<trusted-policy-id>",
+    "policy_version": "<version>",
+    "decision_digest": "<digest>"
+  },
+  "approval_provenance": {
+    "approval_id": "<approval-id-or-null>",
+    "approval_digest": "<digest-or-null>"
+  },
+  "plan_provenance": {
+    "plan_id": "<trusted-plan-id>",
+    "plan_digest": "<digest>"
+  },
+  "resource_profile_id": "<broker-configured-profile>",
+  "image_profile_id": "<operator-approved-profile>",
+  "lease_generation": 1,
+  "fencing_token": "<unpredictable-token>",
+  "issued_at": "<unix-time>",
+  "expires_at": "<unix-time>",
+  "replay_nonce": "<unique-random-value>",
+  "request_id": "<unique-id>",
+  "signature": "<signature-over-canonical-claims>"
+}
+```
+
+This is a required binding list, not a finalized encoding or selected
+signature algorithm. Values including operation kind, policy/approval/plan
+references, resource profile and image profile must resolve to trusted,
+Core/Broker-controlled records; caller-provided free-form instructions cannot
+expand authority. The Core is the proposed issuer and durable source of
+authoritative task lease generations, issued claim IDs, revocations and
+operation states. Browser and Client Agent do not issue Broker claims.
+
+### Current authority, fencing and operation semantics
+
+1. Before issuing a claim, Core atomically allocates the next durable lease
+   generation for the project/task execution scope and records its snapshot,
+   operation ID, allocation identity, expiry and trusted authorization
+   provenance. It does not grant a new generation while an earlier writer
+   might still be running.
+2. Before any dispatch or side effect, Broker verifies signature, issuer,
+   audience/allocation, expiry, replay nonce, schema, scope and its own fixed
+   policy. It then performs an authenticated online current-authority check
+   with Core and confirms the generation is current and not revoked. A valid
+   signature alone never proves current authorization.
+3. Broker persists the highest accepted generation and operation ledger
+   durably before side effects. Lower generations and revoked/expired claims
+   fail closed. If Core cannot confirm current authority, Broker must not
+   start or resume dispatch. Broker restrictions remain independently
+   enforced regardless of Core authorization.
+4. The same operation ID/request ID with identical canonical claim content
+   returns its durable current state/result and does not repeat side effects.
+   Reuse with different content is a conflict. Distinct operation IDs do not
+   make an uncertain operation safe to replay.
+5. Proposed lifecycle: `issued -> accepted -> running -> completed`,
+   `cancelled`, `failed` or `uncertain`. Terminal states do not return to
+   running. A cancel request is authenticated, claim/operation/generation-
+   bound and durably revokes future dispatch before process termination is
+   attempted. Cancellation response distinguishes cancellation requested
+   from termination verified.
+6. A newer generation cannot authorize a competing writer until the old
+   operation is terminal and its processes/container are verified stopped.
+   If stop status cannot be established, old and new execution remain fenced
+   from mutation; escalate for operator recovery rather than allowing
+   concurrent writers.
+7. Only operations proven not to have started may be retried automatically.
+   Idempotent reads/status queries may be retried. Create/start/exec,
+   mutation, cancellation with ambiguous outcome, result commit and removal
+   are not automatically retried after an uncertain response. Query durable
+   status and reconcile; never replay the side effect based only on timeout.
+
+### Restart and partition behavior
+
+- **Core restart:** durable generations, revocations and operation records
+  are authoritative and must recover before issuing claims. If integrity or
+  freshness cannot be established, issuance is disabled.
+- **Broker restart:** load its durable operation/allocation registry; verify
+  runtime identity and ownership and reconcile actual state before acting.
+  An operation whose execution state cannot be proved becomes `uncertain`;
+  do not re-execute it.
+- **Podman restart/crash:** inspect only Broker-owned allocations and
+  containers. Reconcile stopped/completed evidence; any ambiguous process or
+  writable state remains fenced until verified stopped and recorded.
+- **Core disconnect/partition:** no new claims, current-authority checks,
+  snapshot grants or side-effect dispatch. An already running operation may
+  be terminated under local fixed policy/deadline, but its status remains
+  uncertain until reconciled. Core must not issue a higher generation while
+  a prior writer could survive the partition.
+- **Cancellation:** Core records revocation before sending cancellation.
+  Broker rejects later dispatch for that operation even if a previously
+  signed claim remains unexpired. Reconnect requires status reconciliation,
+  not replay.
+
+These rules intentionally trade availability for single-writer safety.
+The exact durable transaction boundary, lease scope, signing/key-rotation
+mechanism, online-check caching policy (proposed default: no authorization
+caching for side effects), and recovery evidence format require design
+approval.
+
+## Proposed Broker snapshot retrieval
+
+There is no direct Client Agent-to-Broker upload and no arbitrary host
+filesystem retrieval. The Broker fetches input only through a narrow,
+read-only Core service interface after claim validation:
+
+1. Broker authenticates as its dedicated service identity using mutually
+   authenticated transport and a service credential independent of browser
+   sessions/device keys.
+2. Core issues a short-lived retrieval grant scoped to one claim, project,
+   task, snapshot ID, manifest digest, Broker allocation and byte/file limits.
+   Grant ID, issue/expiry times and replay nonce are recorded. Grant does not
+   authorize other Core state or other snapshots.
+3. Broker fetches only manifest-listed immutable objects through opaque
+   snapshot object IDs; no path, arbitrary file URL, database, upload
+   staging directory or host path is accepted as a retrieval selector.
+4. Broker validates the canonical manifest digest against the claim, enforces
+   file/count/total-byte/path/depth limits, then recomputes every object
+   digest and size. Any mismatch, unexpected object or limit violation
+   rejects the whole input before execution.
+5. Transfer stages in a private per-allocation directory with restrictive
+   permissions and no shared writable paths. Partial transfers are
+   discarded on error, expiry, cancellation or restart unless an
+   integrity-checked resumable scheme is separately approved. Staged input
+   becomes immutable to the workload; writable task data is a distinct
+   bounded layer.
+6. Grants expire, are claim/allocation-bound, and are revocable. Revocation
+   prevents further object fetches. Core disconnect or failed current-
+   authority check fails closed; no fallback to a client, host path, newer
+   snapshot or unrelated Core store is permitted.
+7. Broker removes partial/staged inputs on failure, expiry, cancellation and
+   retention deadline, preserving only explicitly authorized bounded result
+   artifacts and audit evidence.
+
+Transfer concurrency, chunk size, per-file/aggregate caps, retention period,
+grant signing and whether integrity-checked transfer resume is allowed are
+deployment parameters requiring approval. They must be bounded in Broker and
+Core independently.
+
+## Proposed Broker allocation ownership and operation contract
+
+The Broker keeps a durable private allocation registry mapping operation and
+allocation IDs to the claim digest, fencing generation, snapshot digest,
+runtime identity, container ID, expected image digest, configured limits,
+state and timestamps. The registry is private to the Broker identity and is
+not derived from caller-controlled container names or labels.
+
+Before every runtime operation—create, inspect, command execution, result
+collection, cancellation or removal—the Broker independently verifies the
+configured rootless runtime identity, private storage/socket location,
+allocation record, container ID, ownership metadata, expected image digest
+and current operation state. Missing, conflicting or foreign ownership
+evidence fails closed; never inspect/control an arbitrary runtime object.
+Creation uses fixed Broker-generated names/labels and only approved image,
+mount, namespace, network and resource profiles. Command invocation accepts
+only a claim-authorized operation kind and bounded validated arguments.
+
+On restart, reconcile registry records with runtime state before accepting
+work. Verify process termination and container ownership before cleanup.
+Remove only verified Broker-owned task containers and staged data. If
+ownership or execution status is ambiguous, quarantine/fence the allocation
+for operator reconciliation; do not remove an unrelated object or dispatch a
+replacement writer.
+
+The proposed bounded result to Core binds protocol version, project/task,
+claim and operation IDs, lease generation/fencing token, snapshot ID and
+manifest digest, Broker allocation identity, and includes:
+
+- terminal/interrupted status and exit/result status;
+- bounded stdout/stderr with truncation indicators and encodings;
+- changed-file manifest with normalized relative paths, file types and sizes;
+- preimage/postimage hashes for each reported path;
+- proposed diff/artifact references with content digests and size bounds;
+- input manifest/object verification status;
+- artifact and provenance validation status;
+- resource-limit observations/violations, timeout, cancellation and
+  interruption evidence;
+- runtime/container ownership and cleanup/recovery evidence.
+
+Core verifies claim/operation/snapshot correlation, authorization freshness,
+response bounds, object hashes, manifest consistency and artifact references
+before recording results. A returned success string, exit code, or valid
+artifact digest alone does not prove that intended filesystem changes
+occurred or that execution was benign. Distinguish byte integrity from
+behavioral correctness, which remains unproven without independent checks.
+
+All contract details in these subsections are proposed and require review;
+none are currently emitted or enforced by source code.
 
 ## Artifact/result validation and future patch receipts
 

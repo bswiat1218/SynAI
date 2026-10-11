@@ -2,7 +2,7 @@
 
 **Status:** Documentation baseline; execution architecture is not yet approved
 for Phase 13F-A implementation. See [the alignment assessment](#phase-13b-13e-alignment-assessment)
-and [Phase 13F-A prerequisites](#phase-13f-a-prerequisites).
+and [Phase 13F-A entry and 13F-B acceptance gates](#phase-13f-a-entry-and-13f-b-acceptance-gates).
 
 This is the primary architecture reference for SynAI 2.0. It consolidates the
 checked-in Phase 13B–13E implementation notes, the existing agent architecture,
@@ -10,13 +10,17 @@ and code inspected in this repository. It distinguishes implemented behavior
 from intended future behavior; source code and tests, not UI labels or plans,
 are the evidence for implementation status.
 
-The original approved Phase 13A plan and the subsequent distributed
-realignment plan were not present in the repository at the time of this
-baseline. The checked-in Phase 13B–13E documents report that the revised plan
-was unavailable during implementation. No approval record or missing plan is
-reconstructed here. The approved trust invariants supplied for this phase are
-recorded in [trust boundaries](./trust-boundaries.md); proposed decisions and
-their evidence status are recorded in [the ADRs](./adr/).
+The supplied Phase 13A migration plan and subsequent distributed realignment
+are preserved verbatim in [the historical-plan archive](./history/README.md).
+The checked-in Phase 13B–13E documents report that the revised plan was
+unavailable during implementation. The supplied plans provide historical
+design context but are not separate evidence of formal approval. In
+particular, the rootless Podman proposal remains pending explicit approval;
+see [ADR 0004](./adr/0004-rootless-podman-broker.md). Historical/current
+design differences are assessed in the archive index and below. The approved
+trust invariants supplied for this phase are recorded in [trust
+boundaries](./trust-boundaries.md); proposed decisions and their evidence
+status are recorded in [the ADRs](./adr/).
 
 ## 1. Goals and non-goals
 
@@ -179,7 +183,7 @@ establish the Broker never falls back to host execution.
 This describes required behavior, not a current implementation. Transport
 identity, durable claim ledger, snapshot retrieval, lease authority,
 container policy details and recovery are design-review items; see
-[protocol contracts](./protocols.md) and [Phase 13F-A prerequisites](#phase-13f-a-prerequisites).
+[protocol contracts](./protocols.md) and [Phase 13F-A entry gate](#phase-13f-a-entry-and-13f-b-acceptance-gates).
 
 ## 6. Browser and authentication/identity models
 
@@ -417,9 +421,9 @@ protocol support are not implemented.
 
 | ID | Severity | Finding | Evidence/status | Required resolution |
 |---|---|---|---|---|
-| A1 | High | The repository does not contain the original approved Phase 13A plan or later realignment approval record. Checked-in Phase 13B explicitly says the revised plan was unavailable. Therefore approval provenance and any unrecorded decision details cannot be verified. | Documentation gap; not a claim of code violation. | Recover and version the actual plan/approval record, or explicitly approve this baseline before implementation. |
-| A2 | High | Distributed task claims and fencing are not operational. `distributed_tasks` has claim/generation columns and a disabled task-contract helper, but no claim/renew/release/recover API or Broker enforcement exists. WorkspaceCoordinator operates on configured legacy workspace identities and is not wired to these records. | Blocks safe 13F-A implementation until the authority and recovery protocol are specified and independently tested. | Design and review the authenticated durable claim, fencing authority, mutation enforcement and crash-recovery protocol. |
-| A3 | High | No Sandbox Broker exists. Reusing the local TUI `Sandbox` as a Broker would violate the intended separation: it calls the configured runtime CLI, accepts an image argument, uses bridge networking for created containers and binds the local selected workspace read-write. `HostExecution` is explicitly host execution. | No current distributed execution feature; local legacy behavior is not itself a distributed violation. | Implement the separate unprivileged rootless-Podman Broker under all prerequisites; never route Broker failure to these local backends. |
+| A1 | Medium | The supplied Phase 13A plan and realignment are now archived verbatim, but no separate formal approval record was supplied. Checked-in Phase 13B explicitly says the revised plan was unavailable during implementation. | Historical design is traceable; approval provenance remains unverified. | Explicitly review and approve the baseline/ADR decisions; do not infer approval from the plans. |
+| A2 | Medium | Distributed task claims and fencing are not operational. `distributed_tasks` has claim/generation columns and a disabled task-contract helper, but no claim/renew/release/recover API or Broker enforcement exists. WorkspaceCoordinator operates on configured legacy workspace identities and is not wired to these records. | A detailed proposed contract is now documented; authority choice awaits approval and implementation is a 13F-A deliverable. | Approve the proposed claim authority and recovery protocol before implementation; implement and independently test in 13F-A. |
+| A3 | Medium | No Sandbox Broker exists. Reusing the local TUI `Sandbox` as a Broker would violate the intended separation: it calls the configured runtime CLI, accepts an image argument, uses bridge networking for created containers and binds the local selected workspace read-write. `HostExecution` is explicitly host execution. | No current distributed execution feature; local legacy behavior is not itself a distributed violation. Broker absence is an implementation deliverable, not an entry-gate failure. | Approve the separate Broker architecture; implement it in 13F-A and never route Broker failure to local backends. |
 | A4 | Medium | The 13B compatibility registry still represents configured host directories and validates their filesystem identity in the Core process. It is read-only metadata and must remain isolated from distributed logical-project/snapshot processing. | Implemented legacy compatibility surface; not a client path supplied by browser. | Keep it disabled from task execution and retain explicit tests that distributed APIs never resolve or mount these paths. |
 | A5 | Medium | The single-user service has no project ACL model. Authenticated browser operations are effectively operator-wide, not multi-tenant isolation. | Documented deployment assumption, not a multi-user guarantee. | Before multiple users/tenants, add explicit project authorization and object-level checks for every route and stream. |
 | A6 | Medium | Snapshot filters are heuristic; neither preview nor extension/path exclusions prove secret absence. Core intentionally receives and retains approved source content. | Documented and intrinsic limitation. | Keep transfer disclosure clear; consider optional secret-scanning/redaction only with explicit UX and no claim of completeness. |
@@ -427,16 +431,18 @@ protocol support are not implemented.
 | A8 | Low | Rootless Podman, Core/Broker identities, image digests and production deployment boundaries have no production manifests or integration evidence. | Design/deployment evidence absent. | Add deployment-specific acceptance tests and reviewed manifests before production claims. |
 
 No Critical source-code trust-boundary violation was confirmed in the reviewed
-13B–13E path. The High findings are nonetheless blocking discrepancies for
-Phase 13F-A; this baseline is **not approved** as an implementation-ready
-execution architecture until they are resolved.
+13B–13E path. Historical plan content is now traceable and proposed claim and
+snapshot contracts are documented. No formal approval is established:
+rootless Podman selection, claim authority and deployment assumptions still
+require explicit design approval before implementation.
 
 ### Missing or unverified security guarantees
 
 - No production Core deployment/image/UID/mount review, Broker service
   identity or rootless Podman integration exists.
 - No task claim ledger, claim expiry/renewal, stale-fence rejection, result
-  validation or recovery proof is implemented.
+  validation or recovery proof is implemented. A detailed contract proposal
+  is recorded in [protocols.md](./protocols.md).
 - No distributed authorization/approval issuance model or multi-user ACL is
   present.
 - No guarantee exists that transferred source is free of secrets or malicious
@@ -448,55 +454,75 @@ execution architecture until they are resolved.
 - No automated tests can prove security of a future production deployment
   from the current test-only containers.
 
-## 17. Phase 13F-A prerequisites
+## 17. Phase 13F-A entry and 13F-B acceptance gates
 
-Before implementation is accepted, the Broker design and tests must meet
-every required criterion in [trust boundaries](./trust-boundaries.md) and
-[protocol contracts](./protocols.md):
+These gates distinguish design prerequisites from implementation work. The
+absence of a Broker is an implementation deliverable, not an entry-gate
+failure. The proposed contract in [protocols.md](./protocols.md) and Broker
+architecture in [ADR 0004](./adr/0004-rootless-podman-broker.md) require
+explicit design approval before implementation.
 
-1. Dedicated unprivileged Broker OS identity, separated from Core and TUI.
-2. Rootless Podman ownership boundary; Broker controls only its own
-   task-scoped containers.
-3. No Core access to an unrestricted Docker/Podman socket or runtime
-   administration API.
-4. Server-side allowlisted images pinned by immutable digest; no caller-
-   selected image or mutable tag.
-5. Task-scoped authenticated claims binding task, claim, project, snapshot
-   digest, target, approval/policy references, expiry and fencing generation.
-6. Retrieval only of the exact immutable Core snapshot; verify manifest and
-   every object digest before execution.
-7. Independent Broker enforcement of tool/action, mount, target and execution
-   limitations; Core checks alone are insufficient.
-8. Network disabled by default; any exception must be explicit, narrow and
-   separately approved.
-9. Enforced CPU, memory, PID, storage, wall-time and output ceilings.
-10. Verify container ownership before inspect/exec/cancel/remove; never target
-    a foreign runtime object.
-11. Authenticated cancellation, process/container reaping, crash recovery
-    evidence and no automatic replay of uncertain operations.
-12. Validate bounded results and artifact provenance against the exact
-    request/claim/snapshot before reporting success.
-13. No unauthorized host workspace mount, client path, device, host namespace,
-    privileged mode or host-execution fallback.
-14. Broker outage, invalid result, timeout or uncertain state fails closed;
-    never fall back silently to Core or `HostExecution`.
+### Entry gate — before 13F-A implementation
 
-**Approved invariants:** control/execution separation, no unrestricted Core
-runtime socket, no arbitrary Core host/client workspace mounts, immutable
-authorized snapshot storage, independent local Client Agent authorization,
-no browser-to-device authority, task-scoped disposable execution,
-independent policy/approval/target checks, no automatic patch application,
-no replay of uncertain operations, and separate legacy TUI compatibility.
+- Architecture and ADRs reviewed; record explicit approval of the selected
+  Broker direction. A historical plan or written ADR is not itself approval.
+- Service trust boundary specified: dedicated unprivileged Broker identity;
+  Core has no runtime socket, credentials, arbitrary host/client mounts or
+  host-execution fallback.
+- Versioned claim/fencing protocol and authority/recovery rules reviewed.
+- Snapshot retrieval grant, exact digest binding, staging and cleanup contract
+  reviewed.
+- Rootless runtime and Ubuntu Server 26.04 assumptions documented; any
+  unsupported enforcement must fail closed.
+- Resource, image, network, filesystem, output, time and ownership
+  restrictions defined, including operator-approved pinned image digests.
+- Adversarial acceptance test plan specified for stale/replayed claims,
+  authority loss, malicious IDs/labels, snapshot tampering, cross-task
+  retrieval, unauthorized mounts, resource exhaustion, cancellation and
+  restart recovery.
 
-**Still requiring design review:** exact Core/Broker transport and identities;
-claim ledger durability and fencing authority; expiry/renewal and cancellation
-semantics; snapshot fetch authorization and digest envelope; pinned-image
-build/provenance/refresh process; concrete resource ceilings; mount layout
-and writable-layer/export policy; network exceptions; container labels and
-ownership verification; result/artifact schema, integrity and retention;
-crash reaping/recovery evidence; production deployment/monitoring and
-acceptance tests. Approval of the invariants is not approval of these
-implementation details.
+These are design and test-plan prerequisites. They do not require a working
+Broker or passing integration tests before implementation starts.
+
+### Implementation deliverables — during 13F-A
+
+- Operational Broker service and narrow authenticated Core API.
+- Durable task claim, operation ledger and current-authority fencing checks.
+- Dedicated rootless Podman integration and private Broker configuration,
+  storage and allocation registry.
+- Immutable task-scoped snapshot retrieval, digest verification and isolated
+  staging.
+- Restricted operation execution in disposable containers with pinned
+  operator-approved images, default-disabled networking and enforced limits.
+- Container ownership verification before create/inspect/exec/collect/
+  cancel/remove, plus cleanup and restart reconciliation.
+- Validated bounded artifacts/results and provenance records.
+- Cancellation, failure, uncertainty and crash recovery with no automatic
+  replay and no host-execution fallback.
+- Disposable rootless runtime integration and adversarial tests on the
+  supported platform.
+
+### Acceptance gate — before 13F-B
+
+- Independent Broker authorization and fixed-policy tests pass.
+- Stale, revoked and replayed claims/operations are rejected; duplicates
+  return recorded operation state without repeating side effects.
+- Isolation and configured resource limits are demonstrated on the supported
+  runtime, not inferred from configuration.
+- Core has no runtime socket, Podman/Docker credentials or host execution
+  access.
+- No unauthorized host mounts, caller-selected images or privileged settings
+  are possible.
+- Artifact bytes/manifests are independently validated; restart and
+  cancellation recovery distinguish completed, cancelled, failed and
+  uncertain outcomes.
+- No Critical security defects or unverified essential isolation controls
+  remain.
+
+The exact entry design approvals still required are listed in the protocol
+and ADR. Passing this acceptance gate does not authorize client-side patch
+application or Phase 13F-B implementation beyond its separately reviewed
+scope.
 
 ## 18. Source and test evidence
 
