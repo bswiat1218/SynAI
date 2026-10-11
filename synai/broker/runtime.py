@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -17,6 +18,7 @@ from synai.broker.config import BrokerConfig, BrokerReadiness
 from synai.broker.protocol import BrokerError
 from synai.broker.registry import BrokerRegistry
 from synai.broker.filesystem import Directory
+from synai.broker.runtime_storage import RuntimeStoragePolicy
 
 
 ContainmentState = Literal[
@@ -49,6 +51,10 @@ class RootlessPodmanRuntime:
         self.workspace_authority: Callable[[str], Directory] | None = None
         self.storage_containment_check: Callable[[], bool] | None = None
         self._containment_locks: dict[str, asyncio.Lock] = {}
+        self.storage_policy = RuntimeStoragePolicy(config)
+        self.storage_authority: Callable[[str], Directory] | None = None
+        self.storage_path_verifier: Callable[[str, Path], None] | None = None
+        self.storage_observer: Callable[[], Awaitable[object]] | None = None
 
     async def verify_startup(self, base_readiness: BrokerReadiness | None = None) -> BrokerReadiness:
         base = base_readiness or self.config.readiness()
@@ -59,7 +65,15 @@ class RootlessPodmanRuntime:
             "approved_image_present", "storage_layout",
         }
         reasons = [reason for reason in base.reasons if reason not in runtime_checks]
-        if checks["podman_available"]:
+        checks["runtime_storage_configured"] = False
+        try:
+            if self.storage_authority is None:
+                raise BrokerError("runtime_storage_authority_missing", "Runtime storage authority is missing.", 503)
+            await self._storage_worker(lambda: self.storage_policy.verify_configuration(self.storage_authority))
+            checks["runtime_storage_configured"] = True
+        except (BrokerError, OSError, ValueError) as exc:
+            reasons.append(getattr(exc, "code", "runtime_storage_configuration_invalid"))
+        if checks["podman_available"] and checks["runtime_storage_configured"]:
             try:
                 info = await self._run(
                     "info", "--format", "json", timeout=10, maximum=256 * 1024,
@@ -139,42 +153,83 @@ class RootlessPodmanRuntime:
                 checks["approved_image_present"] = False
             if not checks["approved_image_present"] and "approved_image_present" not in reasons:
                 reasons.append("approved_image_present")
+        checks["runtime_storage_accepted"] = False
+        reasons.append("runtime_storage_acceptance_pending")
         self.readiness = BrokerReadiness(
             not reasons, not reasons, checks, tuple(reasons),
         )
         return self.readiness
 
     def _verify_reported_storage_layout(self, store: dict[str, Any]) -> bool:
-        roles = {role.kind: role for role in self.config.storage_roles}
-        expected_fields = {
-            "podman_graph": ("graphRoot", "GraphRoot"),
-            "podman_runtime": ("runRoot", "RunRoot"),
-            "image_scratch": ("imageCopyTmpDir", "ImageCopyTmpDir"),
-        }
-        for kind, names in expected_fields.items():
-            role = roles.get(kind)
-            actual = next((store.get(name) for name in names if name in store), None)
-            if role is None or not isinstance(actual, str):
-                return False
-            if Path(actual) != role.path:
-                return False
-        state = roles.get("broker_state")
-        if state is None or state.path != self.config.state_dir:
-            return False
-        temporary = roles.get("temporary")
-        if not roles.get("broker_logs") or temporary is None:
-            return False
         try:
-            for kind in (
-                "podman_graph", "podman_runtime", "image_scratch",
-                "broker_logs", "temporary", "broker_state",
+            expected = self.storage_policy.paths()
+            if set(store) - {
+                "graphRoot", "runRoot", "imageCopyTmpDir", "volumePath",
+                "graphDriverName", "graphOptions", "configFile", "imageStore",
+                "additionalImageStores", "graphRootAllocated", "graphRootUsed",
+                "containerStore", "graphStatus", "transientStore", "runtimePaths",
+            } or store.get("transientStore") is True:
+                return False
+            for field, purpose in (
+                ("graphRoot", "graph_root"), ("runRoot", "run_root"),
+                ("imageCopyTmpDir", "image_copy_tmp"), ("volumePath", "volume_path"),
             ):
-                role = roles[kind]
-                if not role.path.is_dir() or role.path.is_symlink():
+                if store.get(field) != str(expected[purpose]):
                     return False
-        except OSError:
+            if (
+                store.get("graphDriverName") != "overlay"
+                or store.get("graphOptions") != {}
+                or store.get("configFile") != self._runtime_environment()["CONTAINERS_STORAGE_CONF"]
+                or store.get("imageStore") not in (None, "")
+                or store.get("additionalImageStores") not in (None, [])
+                or self.storage_path_verifier is None
+            ):
+                return False
+            self.storage_policy.verify_observation(store.get("runtimePaths"), self.storage_path_verifier)
+        except (BrokerError, OSError, ValueError):
             return False
         return True
+
+    async def verify_storage_assurance(self) -> tuple[bool, tuple[str, ...]]:
+        if self.storage_policy.failure_code is not None:
+            return False, (self.storage_policy.failure_code,)
+        # An absent observer never becomes acceptance evidence from configuration.
+        if self.storage_policy.observed is None:
+            return False, ("runtime_storage_observation_missing", "runtime_storage_acceptance_pending")
+        try:
+            if self.storage_authority is None or self.storage_path_verifier is None:
+                raise BrokerError("runtime_storage_authority_missing", "Runtime storage authority is missing.", 503)
+            await self._storage_worker(lambda: self.storage_policy.verify_configuration(self.storage_authority))
+            if self.storage_observer is None:
+                raise BrokerError("runtime_storage_observation_missing", "Effective runtime observation is unavailable.", 503)
+            observation = await asyncio.wait_for(self.storage_observer(), timeout=2)
+            await self._storage_worker(
+                lambda: self.storage_policy.verify_observation(observation, self.storage_path_verifier),
+            )
+        except (BrokerError, OSError, ValueError, TimeoutError) as exc:
+            code = getattr(exc, "code", "runtime_storage_observation_unavailable")
+            self.storage_policy.failure_code = code
+            return False, (code,)
+        return True, ()
+
+    @staticmethod
+    async def _storage_worker(check: Callable[[], object]) -> None:
+        worker = asyncio.create_task(asyncio.to_thread(check))
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except (BrokerError, OSError, ValueError):
+                    break
+            try:
+                worker.result()
+            except (BrokerError, OSError, ValueError):
+                logging.getLogger(__name__).error("Runtime storage verification failed while joining shutdown worker")
+            raise
 
     async def create_task(self, task_id: str, allocation_id: str, workspace: Path) -> str:
         self.registry.require_execution_authority()
@@ -214,6 +269,7 @@ class RootlessPodmanRuntime:
             "--memory", str(self.config.profile.memory_bytes),
             "--cpus", str(self.config.profile.cpus),
             "--pids-limit", str(self.config.profile.pids),
+            "--log-driver", "none",
             "--mount", f"type=bind,src={workspace},dst=/workspace,rw,rprivate,nodev,nosuid",
             "--workdir", "/workspace",
             self.config.image,
@@ -235,7 +291,15 @@ class RootlessPodmanRuntime:
 
     async def inspect_owned(self, task_id: str) -> dict[str, Any]:
         owned = self.registry.owned_container(task_id)
-        return await self._inspect_record(task_id, owned)
+        info = await self._inspect_record(task_id, owned)
+        try:
+            if self.storage_path_verifier is None:
+                raise BrokerError("runtime_storage_authority_missing", "Runtime storage authority is missing.", 503)
+            self.storage_policy.verify_container(info, self.storage_path_verifier)
+        except (BrokerError, OSError, ValueError):
+            self.registry.mark_container(task_id, "quarantined")
+            raise
+        return info
 
     async def inspect_recorded(self, task_id: str) -> dict[str, Any]:
         owned = self.registry.container_record(task_id)
@@ -594,6 +658,7 @@ class RootlessPodmanRuntime:
         )
 
     async def _container_exists(self, container_id: str) -> bool:
+        self._require_storage_launch_acceptance()
         executable = shutil.which(self.config.podman)
         if executable is None:
             raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
@@ -633,6 +698,7 @@ class RootlessPodmanRuntime:
     ) -> dict[str, Any]:
         self.registry.require_execution_authority()
         self._require_accepted_execution_source(task_id)
+        self._require_storage_launch_acceptance()
         owned = self.registry.owned_container(task_id)
         await self.inspect_owned(task_id)
         workdir = "/workspace" if cwd == "." else f"/workspace/{cwd}"
@@ -712,6 +778,7 @@ class RootlessPodmanRuntime:
     async def _run(self, *args: str, timeout: float, maximum: int) -> str:
         if any(not isinstance(arg, str) or "\x00" in arg for arg in args):
             raise BrokerError("runtime_argument_invalid", "Broker runtime argument is invalid.", 500)
+        self._require_storage_launch_acceptance()
         executable = shutil.which(self.config.podman)
         if executable is None:
             raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
@@ -743,16 +810,16 @@ class RootlessPodmanRuntime:
         return stdout.decode("utf-8", errors="strict")
 
     def _runtime_environment(self) -> dict[str, str]:
-        temporary = next(
-            role for role in self.config.storage_roles
-            if role.kind == "temporary"
+        return self.storage_policy.environment()
+
+    def _require_storage_launch_acceptance(self) -> None:
+        # Even `info` can initialize runtime storage. No accepted launch handoff
+        # or complete version-qualified path observer exists in this phase.
+        raise BrokerError(
+            "runtime_storage_acceptance_pending",
+            "Runtime subprocess storage and configuration resolution require live acceptance.",
+            503,
         )
-        return {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(self.config.state_dir),
-            "TMPDIR": str(temporary.path),
-            "XDG_RUNTIME_DIR": str(temporary.path),
-        }
 
 
 async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:

@@ -135,6 +135,15 @@ class BrokerRegistry:
             "claim_key": self.config.claim_key.hex(),
             "image": self.config.image, "profile": repr(self.config.profile),
         }
+        if self.config.runtime_storage_config_digest is not None or self.config.runtime_containers_config_digest is not None:
+            policy["runtime_storage"] = {
+                "storage_config": self.config.runtime_storage_config_digest,
+                "containers_config": self.config.runtime_containers_config_digest,
+                "reserve_bytes": self.config.quota_reserve_bytes,
+                "reserve_inodes": self.config.quota_reserve_inodes,
+                "volume_bytes": self.config.quota_volume_bytes,
+                "volume_inodes": self.config.quota_volume_inodes,
+            }
         return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
 
     def _identity(self) -> dict[str, object]:

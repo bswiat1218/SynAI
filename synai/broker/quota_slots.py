@@ -96,6 +96,7 @@ class QuotaSlotManager:
         self._verification_lock = threading.RLock()
         self._role_identities: dict[str, tuple[int, int, int]] = {}
         self._task_identities: dict[tuple[str, str], tuple[int, int, int]] = {}
+        self._runtime_path_identities: dict[tuple[str, Path], tuple[int, int, int]] = {}
         self._role_identity_lock = threading.Lock()
 
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
@@ -229,6 +230,35 @@ class QuotaSlotManager:
         with self._verification_lock:
             return self._verify_storage_role(role_id)
 
+    def verify_runtime_path(self, role_id: str, path: Path) -> None:
+        with self._verification_lock:
+            role = next((role for role in self.config.storage_roles if role.role_id == role_id), None)
+            if role is None or not path.is_absolute() or path != Path(os.path.normpath(path)):
+                raise BrokerError("runtime_storage_path_invalid", "Runtime path is not canonical.", 503)
+            if not path.is_relative_to(role.path):
+                raise BrokerError("runtime_storage_path_escape", "Runtime storage escapes its quota domain.", 503)
+            with self.open_storage_role(role_id) as root:
+                relative = path.relative_to(role.path)
+                descriptor = root.open(str(relative), os.O_RDONLY | os.O_NONBLOCK)
+                try:
+                    info = os.fstat(descriptor)
+                    project_id, flags = _project_attributes(descriptor)
+                    if (
+                        not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                        or info.st_uid != role.owner_uid or info.st_gid != role.owner_gid
+                        or info.st_mode & 0o022 or project_id != role.project_id
+                        or stat.S_ISDIR(info.st_mode) and not flags & _FS_XFLAG_PROJINHERIT
+                        or mount_identity(descriptor)[2] != mount_identity(root.fd)[2]
+                    ):
+                        raise BrokerError("runtime_storage_path_identity", "Runtime quota path identity is inconsistent.", 503)
+                    identity = mount_identity(descriptor)
+                    key = (role_id, path)
+                    if self._runtime_path_identities.setdefault(key, identity) != identity:
+                        raise BrokerError("runtime_storage_path_drift", "Runtime storage path was substituted.", 503)
+                    root.revalidate()
+                finally:
+                    os.close(descriptor)
+
     def _verify_storage_role(self, role_id: str) -> bool:
         if (
             not self._production_inspector
@@ -316,7 +346,14 @@ class QuotaSlotManager:
     @staticmethod
     def _verify_observation(role: StorageRole, observation: StorageObservation) -> None:
         if (
-            observation.role_id != role.role_id
+            any(type(value) is not int or value < 0 for value in (
+                observation.bytes_used, observation.inodes_used,
+                observation.filesystem_bytes, observation.filesystem_bytes_available,
+                observation.filesystem_inodes, observation.filesystem_inodes_available,
+            ))
+            or observation.filesystem_bytes_available > observation.filesystem_bytes
+            or observation.filesystem_inodes_available > observation.filesystem_inodes
+            or observation.role_id != role.role_id
             or observation.filesystem_uuid != role.filesystem_uuid
             or observation.mount_target != str(role.mount_path)
             or observation.filesystem_type != "ext4"
@@ -341,6 +378,11 @@ class QuotaSlotManager:
         try:
             mount = _mount_for_fd(mount_fd)
             actual = _mount_for_fd(role_fd)
+            root_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                host_root = _mount_for_fd(root_fd)
+            finally:
+                os.close(root_fd)
             if (
                 mount.target != str(role.mount_path)
                 or actual.target != str(role.mount_path)
@@ -348,6 +390,7 @@ class QuotaSlotManager:
                 or actual.mount_id != observation.mount_id
                 or actual.filesystem != observation.filesystem_type
                 or actual.device != mount.device
+                or actual.device == host_root.device
                 or not ({"prjquota", "pquota"} & (actual.mount_options | actual.super_options))
             ):
                 raise ValueError("Local storage path mount identity differs from inspector evidence")
@@ -649,6 +692,19 @@ def aggregate_storage_reasons(
         role.role_id for role in config.storage_roles
     }:
         return ("storage_observations_incomplete",)
+    if (
+        len({(role.filesystem_uuid, role.project_id) for role in config.storage_roles})
+        != len(config.storage_roles)
+        or any(left.path.is_relative_to(right.path)
+               for left in config.storage_roles for right in config.storage_roles
+               if left.role_id != right.role_id)
+    ):
+        return ("storage_quota_domain_conflict",)
+    try:
+        for role in config.storage_roles:
+            QuotaSlotManager._verify_observation(role, observations[role.role_id])
+    except ValueError:
+        return ("storage_quota_observation_conflict",)
     first = observations[config.storage_roles[0].role_id]
     identity = (
         first.filesystem_uuid, first.mount_target, first.mount_id,
@@ -674,9 +730,9 @@ def aggregate_storage_reasons(
         first.filesystem_bytes < config.quota_volume_bytes
         or first.filesystem_inodes < config.quota_volume_inodes
         or min(item.filesystem_bytes_available for item in observations.values())
-        < remaining_bytes + config.quota_reserve_bytes
+        < remaining_bytes + config.quota_reserve_bytes + 256 * 1024**2
         or min(item.filesystem_inodes_available for item in observations.values())
-        < remaining_inodes + config.quota_reserve_inodes
+        < remaining_inodes + config.quota_reserve_inodes + 4096
     ):
         return ("storage_aggregate_headroom",)
     return ()

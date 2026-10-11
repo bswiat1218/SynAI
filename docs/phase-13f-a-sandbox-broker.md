@@ -211,8 +211,9 @@ watchdog before closing the Core client. The Python watchdog and fake-runtime
 tests do not establish privileged-inspector freshness, kernel quota
 enforcement, or real-container containment.
 
-For a 16 GiB candidate volume, total role entitlements and the 8 GiB /
-16,384-inode reserves must fit the observed capacity; live free capacity is
+For a 16 GiB candidate volume, total role entitlements, the 8 GiB /
+16,384-inode reserves, and 256 MiB / 4,096-inode operational allowance must
+fit the observed usable capacity; live free capacity is
 rechecked at startup and before operations. Each task's snapshot, writable
 copy, manifests, and artifacts consume the same per-slot project quota. The
 initial one-active-container limit remains in force.
@@ -329,8 +330,8 @@ SQLite databases, injected I/O/transaction failures, and fake runtimes.
 Production recovery/provisioning approval tooling, authentic historical
 baseline evidence, actual crash/power-loss durability, quota exhaustion under
 the kernel, and real-container reconciliation remain acceptance blockers.
-Path-use races (HIGH-4), complete runtime storage accounting (HIGH-5), and
-preexisting-file project-ID checks (MEDIUM-1) are deliberately not implemented.
+HIGH-4 and HIGH-5 follow-up controls are described below. Preexisting task-file
+project-ID checks (MEDIUM-1) remain deliberately unimplemented.
 The seal is Broker-owned corruption/replacement detection, not protection
 against a compromised Broker identity rewriting both database and seal.
 
@@ -410,8 +411,8 @@ mocked quota/runtime evidence, and local Unix sockets. Only `openat2`, no-follow
 resolution, descriptor identity, and local socket behavior are exercised against
 the current kernel. No project quota, remount, privileged inspector, live Podman
 mount, or power-loss acceptance is claimed. HIGH-4 remains **partially resolved**
-pending the SQLite/runtime boundary and dedicated-host acceptance. HIGH-5 and
-MEDIUM-1 remain out of scope.
+pending the SQLite/runtime boundary and dedicated-host acceptance. MEDIUM-1
+remains out of scope; HIGH-5 is addressed separately below.
 
 ### CLI/watchdog lifecycle correction (A.5.1a.4.1)
 
@@ -442,6 +443,115 @@ registry descriptors: cancelling an asyncio waiter alone cannot stop a
 ordering. Inspector and registry waits retain their existing bounds, but an
 underlying stalled kernel filesystem operation remains a deployment limitation;
 this change does not claim that Python can forcibly terminate such a thread.
+
+### Bounded runtime storage accounting (A.5.1a.5 / HIGH-5)
+
+HIGH-5 is **partially resolved**, with code-level policy, observation, quota-domain,
+and drift checks, but no complete version-qualified live runtime observer or
+accepted launch-time pathname handoff. All real Broker runtime subprocesses,
+including `info`, image inspection, exact-ID existence, stop, and removal, are
+refused with `runtime_storage_acceptance_pending`. Even read-like Podman commands
+can initialize storage. This is explicit refusal, not proof that an existing
+container has stopped. HIGH-2 ownership/containment state handling is preserved;
+unavailable runtime evidence remains unresolved and requires operator assistance.
+HIGH-4 bind-source refusal is independent and remains unchanged.
+
+The inventory distinguishes these growth-capable destinations:
+
+| Destination/purpose | Approved domain or policy |
+|---|---|
+| graphRoot; images/extracted layers; writable layers; overlay upper/work/lower backing directories | `podman_graph`, 4 GiB / 131,072 inodes |
+| Persistent libpod database, container static metadata, hostname/hosts/resolv files | Within the same graph quota, not an additional entitlement |
+| Volume storage directory | graphRoot/volumes is accounted for; named/external volumes are unsupported |
+| Rootless runRoot, XDG_RUNTIME_DIR, OCI configuration/runtime state | `podman_runtime`, at most 512 MiB / 16,384 inodes |
+| Engine temporary/per-boot state | runRoot/libpod/tmp; actual persistence/tmpfs semantics remain acceptance-pending |
+| Image download/copy/extraction scratch, effective subprocess TMPDIR | `image_scratch`, at most 512 MiB / 16,384 inodes |
+| TMP/TEMP, cache, separately inventoried host temporary domain | `temporary`, 512 MiB / 16,384 inodes |
+| HOME, XDG_CONFIG_HOME, approved configuration, Broker SQLite/WAL/seal/interruption evidence | `broker_state`, 512 MiB / 16,384 inodes |
+| XDG_DATA_HOME, rootless network configuration metadata | Graph quota; networking remains disabled |
+| Podman container logs and event logs | Explicit `none` drivers; nonempty log destination or alternate driver is refused |
+| Broker service logs | Existing `broker_logs`, 512 MiB / 8,192 inodes |
+| Task snapshots, workspaces, artifacts | Four independently assigned slots, each 256 MiB / 4,096 inodes |
+| Container /tmp | Private ephemeral tmpfs, 64 MiB / 4,096 inodes per container, within the container memory boundary |
+| Extra image stores, storage driver options/helpers, config modules, hooks, alternate paths | Unsupported; refuse rather than infer a boundary |
+
+`RuntimeStorageLayout` is a strict typed observation contract, not a constructor
+of evidence from configured paths. It requires every listed root purpose, exact
+driver/logging choices, and approved configuration digests. The native storage
+report verifier checks graphRoot, runRoot, imageCopyTmpDir, volumePath, driver,
+configFile, options, and unexpected fields. Its `runtimePaths` member denotes
+**supplemental observer evidence**, not an ordinary Podman info field. No production
+adapter currently supplies that evidence; missing data cannot pass. Container
+inspection separately checks upper/work/lower paths, merged-path spelling,
+static/OCI metadata, log destination, volumes, and exact /tmp limits.
+Merged overlay mount identity is not accepted from its spelling: live mounted
+filesystem checks remain blocked. Native inspection formats/options also require
+version-qualified acceptance; deterministic fixtures are not native runtime proof.
+
+Every observed backing path is checked through the existing role opener and
+`openat2` descriptor-relative access: fresh privileged-inspector UUID/mount/quota
+identity, ownership, permissions, local project ID/inheritance, no symlink or
+cross-mount traversal, and pinned device/inode/mount identity. Different `st_dev`
+values alone never establish boundaries. Independent project domains on one
+dedicated ext4 filesystem remain supported. Nested/overlapping roles and reused
+project IDs are refused. A bounded tmpfs for rootless engine state, if required
+by the accepted Podman version, needs separately authenticated byte/inode and
+memory-budget evidence; the current ext4-only inspector contract cannot supply
+that. No permissive tmpfs fallback is implemented.
+
+Operator-approved configuration must exist as read-only bounded regular files
+`runtime-storage.conf` and `runtime-containers.conf` under the state role.
+`SYNAI_BROKER_STORAGE_CONFIG_DIGEST` and
+`SYNAI_BROKER_CONTAINERS_CONFIG_DIGEST` supply their SHA-256 approvals. Files
+are read through one descriptor, have pinned inode identity, and are compared
+to a strict supported TOML policy. No files are provisioned automatically.
+Approvals, aggregate capacity, and reserves are included in the HIGH-3 seal
+fingerprint when runtime configuration is approved. Changing/adopting that
+policy for historical state requires the separate operator recovery procedure;
+the Broker never rewrites a historical seal to make new configuration pass.
+
+Upstream precedence matters: storage configuration, STORAGE_DRIVER/STORAGE_OPTS,
+CLI root/runroot/driver options, containers.conf system/user/drop-in files,
+CONTAINERS_CONF_OVERRIDE/modules, HOME/XDG defaults, and TMPDIR can change
+destinations independently. The Broker emits an explicit environment (never
+merges the host environment), selects the two approved configuration files,
+and excludes remote/runtime overrides. Strict TOML rejects additional stores,
+driver options, mounts, hooks, and extra settings. This establishes configured
+policy only: external Podman reopening those files and interpreting defaults
+requires live acceptance and currently cannot authorize a subprocess.
+
+Aggregate accounting counts each quota domain once:
+`remaining = sum(hard_limit - observed_usage)`.
+The minimum simultaneously observed available bytes/inodes must cover remaining
+entitlements + reserve + operational allowance. Four full task slots and all
+other maximum roles total 7.5 GiB / 221,184 inodes; with reserve and allowance,
+the initial requirement is 15.75 GiB / 241,664 inodes of usable capacity.
+Quota caps are never added to free capacity. Actual filesystem totals and
+available capacity come from independent observations and local filesystem
+checks, not the nominal volume size. A formatted nominal 16 GiB filesystem may
+fail. The allowance is a conservative policy floor, not a measured guarantee
+of sufficient production metadata overhead.
+
+Once a complete observation exists, startup/admission, active-operation checks,
+and the independent ASGI-owned watchdog check configuration and runtime evidence
+again. Drift, missing observer, timeout, quota/path failure, or inconsistent
+evidence latches loss and invokes existing uncertainty/quarantine/containment
+handling. Workers are joined on cancellation before descriptor closure.
+Without observation there is no active runtime authority; readiness explicitly
+remains acceptance-pending. Later successful mocks cannot enable execution.
+
+Tests use disposable files, controlled inode/symlink substitutions, synthetic
+quota observations and fake runtime callbacks. They do not prove project quota
+enforcement, overlay accounting, engine tmpfs lifecycle, real Podman log/storage
+semantics, external configuration TOCTOU resistance, or kernel crash durability.
+No host Podman command, container/image operation, inspector implementation,
+storage provisioning, or MEDIUM-1 remediation was performed.
+
+Reference semantics: [Podman global options/environment](https://docs.podman.io/en/latest/markdown/podman.1.html),
+[storage.conf](https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md),
+and [containers.conf](https://github.com/containers/common/blob/main/docs/containers.conf.5.md).
+Live acceptance must pin and verify the deployed versions rather than infer
+their behavior from these current upstream documents.
 
 These controls are unit-tested with fake runtime and registry adapters only.
 They do not establish real Podman stop/kill behavior, privileged-inspector

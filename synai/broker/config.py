@@ -208,6 +208,8 @@ class BrokerConfig:
     quota_reserve_bytes: int = 8 * 1024 * 1024 * 1024
     quota_reserve_inodes: int = 16_384
     max_active_tasks: int = 1
+    runtime_storage_config_digest: str | None = None
+    runtime_containers_config_digest: str | None = None
     allowed_tools: frozenset[str] = frozenset({
         "read_file", "list_files", "write_file", "patch_file", "delete_file",
         "command", "verify", "collect",
@@ -250,6 +252,12 @@ class BrokerConfig:
             raise ValueError("Storage role identifiers must be unique")
         if len({role.path for role in self.storage_roles}) != len(self.storage_roles):
             raise ValueError("Storage role paths must be unique")
+        if any(
+            left.path.is_relative_to(right.path)
+            for left in self.storage_roles for right in self.storage_roles
+            if left.role_id != right.role_id
+        ):
+            raise ValueError("Storage quota domains must not overlap")
         if len({
             (role.filesystem_uuid, role.project_id) for role in self.storage_roles
         }) != len(self.storage_roles):
@@ -314,8 +322,8 @@ class BrokerConfig:
         role_bytes = sum(role.byte_limit for role in self.storage_roles)
         role_inodes = sum(role.inode_limit for role in self.storage_roles)
         if self.storage_roles and (
-            role_bytes + self.quota_reserve_bytes > self.quota_volume_bytes
-            or role_inodes + self.quota_reserve_inodes > self.quota_volume_inodes
+            role_bytes + self.quota_reserve_bytes + 256 * 1024**2 > self.quota_volume_bytes
+            or role_inodes + self.quota_reserve_inodes + 4096 > self.quota_volume_inodes
         ):
             raise ValueError("Storage-role entitlements exceed the configured aggregate policy")
         if self.quota_slots and any(
@@ -329,13 +337,16 @@ class BrokerConfig:
             or type(self.quota_volume_inodes) is not int
             or not 204_800 <= self.quota_volume_inodes <= 4_194_304
             or type(self.quota_reserve_bytes) is not int
-            or self.quota_reserve_bytes < 0
+            or self.quota_reserve_bytes < 8 * 1024**3
             or type(self.quota_reserve_inodes) is not int
-            or self.quota_reserve_inodes < 0
+            or self.quota_reserve_inodes < 16_384
             or type(self.max_active_tasks) is not int
             or not 1 <= self.max_active_tasks <= 4
         ):
             raise ValueError("Broker aggregate quota or active-task policy is invalid")
+        for digest in (self.runtime_storage_config_digest, self.runtime_containers_config_digest):
+            if digest is not None and not re.fullmatch(r"[a-f0-9]{64}", digest):
+                raise ValueError("Runtime configuration requires an operator-approved SHA-256 digest")
         if not _DIGEST.fullmatch(self.image_digest):
             raise ValueError("Broker image digest must be a pinned sha256 digest")
         if (
@@ -410,6 +421,8 @@ class BrokerConfig:
                 "SYNAI_BROKER_QUOTA_RESERVE_INODES", "16384",
             )),
             max_active_tasks=int(os.environ.get("SYNAI_BROKER_MAX_ACTIVE_TASKS", "1")),
+            runtime_storage_config_digest=os.environ.get("SYNAI_BROKER_STORAGE_CONFIG_DIGEST"),
+            runtime_containers_config_digest=os.environ.get("SYNAI_BROKER_CONTAINERS_CONFIG_DIGEST"),
         )
         config.validate()
         return config

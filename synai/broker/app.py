@@ -100,6 +100,8 @@ class BrokerService:
             task_id, allow_quarantined=True,
         ).workspace
         self.runtime.workspace_authority = self._workspace_authority
+        self.runtime.storage_authority = lambda role_id: self.quota_manager.open_storage_role(role_id)
+        self.runtime.storage_path_verifier = lambda role_id, path: self.quota_manager.verify_runtime_path(role_id, path)
         self.core_client = None
         if config.readiness().checks.get("mtls_material") is True:
             from synai.broker.core_client import CoreBrokerClient
@@ -189,6 +191,7 @@ class BrokerService:
             if self.registry.failure_code is not None or self.registry.trust != RegistryTrust.COMPLETE:
                 self._registry_failure(self.registry.failure_code or "recovery_incomplete")
             self._invalidate_storage_readiness("external_filesystem_resolution_unaccepted")
+            self._invalidate_storage_readiness("runtime_storage_acceptance_pending")
         except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
             if self.registry.failure_code is None:
                 self.registry._access_failed(exc)
@@ -268,6 +271,10 @@ class BrokerService:
             async with self._storage_assurance_lock:
                 try:
                     storage_ready, reasons = await self._watchdog_storage_check()
+                    if self.runtime.storage_policy.observed is not None or self.runtime.storage_policy.failure_code:
+                        runtime_ready, runtime_reasons = await self.runtime.verify_storage_assurance()
+                        storage_ready = storage_ready and runtime_ready
+                        reasons = (*reasons, *runtime_reasons)
                 except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                     self._invalidate_storage_readiness("storage_watchdog_failed")
                     logger.error(
@@ -476,6 +483,10 @@ class BrokerService:
             storage_ready, storage_reasons = await asyncio.to_thread(
                 self.quota_manager.verify_startup,
             )
+            if self.runtime.storage_policy.observed is not None or self.runtime.storage_policy.failure_code:
+                runtime_ready, runtime_reasons = await self.runtime.verify_storage_assurance()
+                storage_ready = storage_ready and runtime_ready
+                storage_reasons = (*storage_reasons, *runtime_reasons)
             if not storage_ready:
                 await self._handle_storage_assurance_loss(storage_reasons)
                 raise BrokerError(
@@ -863,6 +874,10 @@ class BrokerService:
                         storage_ready, storage_reasons = await asyncio.to_thread(
                             self.quota_manager.verify_startup,
                         )
+                        if self.runtime.storage_policy.observed is not None or self.runtime.storage_policy.failure_code:
+                            runtime_ready, runtime_reasons = await self.runtime.verify_storage_assurance()
+                            storage_ready = storage_ready and runtime_ready
+                            storage_reasons = (*storage_reasons, *runtime_reasons)
                     except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error):
                         storage_ready = False
                         storage_reasons = ("storage_verification_failed",)

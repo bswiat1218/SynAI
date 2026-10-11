@@ -1740,7 +1740,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             "/tmp:rw,noexec,nosuid,nodev,size=64m,nr_inodes=4096,mode=1777",
         )
 
-    async def test_runtime_startup_replaces_probe_placeholders_with_live_results(self) -> None:
+    async def test_configured_path_mock_cannot_establish_runtime_storage_acceptance(self) -> None:
         runtime = RootlessPodmanRuntime(self.selected, self.service.registry)
         checks = {
             "podman_available": True,
@@ -1795,8 +1795,9 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(runtime_module.Path, "exists", return_value=True),
         ):
             readiness = await runtime.verify_startup(base)
-        self.assertTrue(readiness.execution_available, (readiness.reasons, readiness.checks))
-        self.assertTrue(readiness.checks["storage_layout"])
+        self.assertFalse(readiness.execution_available)
+        self.assertFalse(readiness.checks["storage_layout"])
+        self.assertIn("runtime_storage_acceptance_pending", readiness.reasons)
 
     async def test_prepare_and_scoped_read_uses_exact_immutable_snapshot(self) -> None:
         initial = claim("prepare", {})
