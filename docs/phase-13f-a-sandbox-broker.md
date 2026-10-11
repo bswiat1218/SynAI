@@ -413,11 +413,35 @@ mount, or power-loss acceptance is claimed. HIGH-4 remains **partially resolved*
 pending the SQLite/runtime boundary and dedicated-host acceptance. HIGH-5 and
 MEDIUM-1 remain out of scope.
 
-Separate pre-existing lifecycle concern: the CLI bootstraps `service.start()`
-with `asyncio.run()` before entering Uvicorn's event loop. This phase does not
-redesign that bootstrap; production acceptance must also establish that the
-watchdog remains attached to the serving lifecycle. No successful filesystem
-test is evidence that the CLI deployment lifecycle has passed acceptance.
+### CLI/watchdog lifecycle correction (A.5.1a.4.1)
+
+The prior CLI called `asyncio.run(service.start())` before Uvicorn, placing the
+watchdog on a temporary loop that closed before HTTP serving. This was a real
+lifecycle defect. The CLI now only constructs the service and app and invokes
+Uvicorn with lifespan explicitly enabled. FastAPI lifespan awaits service startup
+and normal registry reconciliation on Uvicorn's serving loop, then configures
+verified bounded logging before admitting HTTP requests. Its `finally` closes the
+service, cancels/joins the watchdog, and waits for independent containment under
+the existing bounded shutdown policy. Startup exceptions also run that cleanup;
+failed storage/registry checks retain fail-closed diagnostics and never authorize
+execution. No quota, inspector, identity, or runtime acceptance gate is relaxed.
+
+One service instance owns one loop/lifespan. Concurrent application lifespans,
+cross-loop reuse, and restarting a closed instance are rejected; a restart needs
+a fresh service instance and normal verification/reconciliation. Unexpected
+watchdog cancellation still revokes readiness before restarting monitoring on
+the same live loop. Shutdown suppresses monitoring restart and marks the service
+unavailable. Tests exercise the CLI-created application through ASGI lifespan
+and a disposable loopback Uvicorn server, verifying idle ticks, expiry/failure,
+startup admission barriers, shared loop identity, containment joining, and no
+watchdog orphan after shutdown. These tests use fake storage/runtime adapters
+and do not establish production inspector or real-container acceptance.
+Shutdown also joins an in-flight inspector/filesystem worker before closing
+registry descriptors: cancelling an asyncio waiter alone cannot stop a
+`to_thread` operation. Tests use a controlled worker barrier to verify this
+ordering. Inspector and registry waits retain their existing bounds, but an
+underlying stalled kernel filesystem operation remains a deployment limitation;
+this change does not claim that Python can forcibly terminate such a thread.
 
 These controls are unit-tested with fake runtime and registry adapters only.
 They do not establish real Podman stop/kill behavior, privileged-inspector

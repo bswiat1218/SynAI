@@ -19,24 +19,22 @@ def main() -> None:
     try:
         config = BrokerConfig.from_env()
         service = BrokerService(config)
-        import asyncio
-        asyncio.run(service.start())
-        log_role = next(
-            (role for role in config.storage_roles if role.kind == "broker_logs"),
-            None,
-        )
-        if (
-            log_role is None
-            or not service.quota_manager.verify_storage_role(log_role.role_id)
-        ):
-            raise RuntimeError("Bounded Broker log storage could not be verified")
-        authority = service.quota_manager.open_storage_role(log_role.role_id)
-        _configure_bounded_logging(
-            config, authority=authority,
-            on_failure=lambda: service._invalidate_storage_readiness("logging_authority_lost"),
-        )
+        def configure_logging() -> None:
+            log_role = next(
+                (role for role in config.storage_roles if role.kind == "broker_logs"),
+                None,
+            )
+            if log_role is None or not service.quota_manager.verify_storage_role(log_role.role_id):
+                raise RuntimeError("Bounded Broker log storage could not be verified")
+            authority = service.quota_manager.open_storage_role(log_role.role_id)
+            _configure_bounded_logging(
+                config, authority=authority,
+                on_failure=lambda: service._invalidate_storage_readiness("logging_authority_lost"),
+            )
+
         uvicorn.run(
-            create_app(service), host="127.0.0.1", port=config.listen_port,
+            create_app(service, startup_callback=configure_logging),
+            host="127.0.0.1", port=config.listen_port,
             ssl_certfile=str(config.broker_cert_file),
             ssl_keyfile=str(config.broker_key_file),
             ssl_ca_certs=str(config.core_ca_file),
@@ -44,6 +42,7 @@ def main() -> None:
             log_level="info",
             log_config=None,
             access_log=False,
+            lifespan="on",
         )
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"synai-broker: {exc}", file=sys.stderr)

@@ -125,6 +125,9 @@ class BrokerService:
         self._containment_tasks: dict[str, asyncio.Task[ContainmentResult]] = {}
         self._startup_lock = asyncio.Lock()
         self._recovery_lock = asyncio.Lock()
+        self._lifecycle_loop: asyncio.AbstractEventLoop | None = None
+        self._closed = False
+        self._lifespan_active = False
         self.registry.failure_callback = self._registry_failure
         self.registry.storage_check = self._registry_storage_verified
         self.registry.directory_factory = self._registry_directory
@@ -151,6 +154,11 @@ class BrokerService:
         logger.error("Broker registry authority revoked: %s; containment unresolved", code)
 
     async def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._closed or self._lifecycle_loop is not None and self._lifecycle_loop is not loop:
+            self._invalidate_storage_readiness("service_lifecycle_invalid")
+            raise BrokerError("service_lifecycle_invalid", "Broker service requires a fresh verified lifecycle.", 503)
+        self._lifecycle_loop = loop
         async with self._startup_lock:
             await self._start()
 
@@ -214,6 +222,8 @@ class BrokerService:
         self.registry.release_slot(task_id, evidence)
 
     async def close(self) -> None:
+        self._closed = True
+        self._invalidate_storage_readiness("service_stopped")
         watchdog = self._storage_watchdog_task
         self._storage_watchdog_task = None
         if watchdog is not None:
@@ -243,7 +253,7 @@ class BrokerService:
             self.registry.close()
 
     def _start_storage_watchdog(self) -> None:
-        if self._storage_watchdog_task is None:
+        if not self._closed and self._storage_watchdog_task is None:
             task = asyncio.create_task(
                 self._storage_watchdog_loop(),
                 name="synai-broker-storage-watchdog",
@@ -257,11 +267,7 @@ class BrokerService:
             await asyncio.sleep(interval)
             async with self._storage_assurance_lock:
                 try:
-                    if self.registry.failure_code is None:
-                        await asyncio.to_thread(self.registry.verify_ownership)
-                    storage_ready, reasons = await asyncio.to_thread(
-                        self.quota_manager.verify_startup,
-                    )
+                    storage_ready, reasons = await self._watchdog_storage_check()
                 except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                     self._invalidate_storage_readiness("storage_watchdog_failed")
                     logger.error(
@@ -282,6 +288,25 @@ class BrokerService:
                         "Broker storage assurance loss handling failed: %s",
                         type(exc).__name__,
                     )
+
+    async def _watchdog_storage_check(self) -> tuple[bool, tuple[str, ...]]:
+        def verify() -> tuple[bool, tuple[str, ...]]:
+            if self.registry.failure_code is None:
+                self.registry.verify_ownership()
+            return self.quota_manager.verify_startup()
+
+        verification = asyncio.create_task(asyncio.to_thread(verify))
+        try:
+            return await asyncio.shield(verification)
+        except asyncio.CancelledError:
+            # Cancelling the asyncio waiter cannot stop its filesystem/inspector thread.
+            # Join the in-flight check before closing registry descriptors.
+            try:
+                await verification
+            except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                self._invalidate_storage_readiness("storage_watchdog_failed")
+                logger.error("Broker storage verification failed during shutdown: %s", type(exc).__name__)
+            raise
 
     def _storage_watchdog_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -403,6 +428,8 @@ class BrokerService:
                 )
 
     async def dispatch(self, payload: OperationRequest) -> dict[str, Any]:
+        if self._closed:
+            raise BrokerError("broker_not_ready", "Broker service has stopped.", 503)
         if not self._started:
             raise BrokerError(
                 "broker_not_ready",
@@ -1081,13 +1108,22 @@ class BrokerService:
         raise BrokerError("tool_not_allowed", "Operation kind is not supported.", 403)
 
 
-def create_app(service: BrokerService) -> FastAPI:
+def create_app(service: BrokerService, *, startup_callback: Callable[[], None] | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        if service._lifespan_active:
+            raise BrokerError("service_lifecycle_invalid", "Broker service already has an active ASGI lifecycle.", 503)
+        service._lifespan_active = True
         try:
+            await service.start()
+            if startup_callback is not None:
+                startup_callback()
             yield
         finally:
-            await service.close()
+            try:
+                await service.close()
+            finally:
+                service._lifespan_active = False
 
     app = FastAPI(title="SynAI Sandbox Broker", version="1", lifespan=lifespan)
     app.state.broker = service
