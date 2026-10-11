@@ -31,6 +31,7 @@ classifiers = [
 synai = "synai.cli:main"
 synai-web = "synai.web.cli:main"
 synai-client = "synai.client.cli:main"
+synai-broker = "synai.broker.cli:main"
 
 [build-system]
 requires = ["setuptools>=77"]

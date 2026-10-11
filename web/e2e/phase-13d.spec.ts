@@ -136,7 +136,7 @@ test("browser command center, chat, project status, and protected navigation", a
   await page.getByRole("link", { name: "Devices", exact: true }).click();
   await expect(page.getByText("No registered devices")).toBeVisible();
   await page.getByRole("link", { name: "Sandboxes", exact: true }).click();
-  await expect(page.getByText("Sandbox Broker not installed")).toBeVisible();
+  await expect(page.getByText("Sandbox Broker execution unavailable")).toBeVisible();
 
   await page.getByRole("button", { name: "Sign out" }).click();
   await page.goto("/devices");

@@ -1207,11 +1207,11 @@ function ProjectBindingAlias({ project, deviceId }: { project: LogicalProjectRes
 
 export function SandboxesPage() {
   const broker = useResource<ExecutionTargetStatusResponse>("/api/v1/execution-targets");
-  return <section className="page-stack"><PageHeading eyebrow="Execution boundary" title="Sandboxes">The Broker and runtime administration are intentionally not part of Phase 13D.</PageHeading>
+  return <section className="page-stack"><PageHeading eyebrow="Execution boundary" title="Sandboxes">Sandbox execution remains unavailable until the isolated Broker passes security acceptance.</PageHeading>
     <ResourceMessage loading={broker.loading} error={broker.error} />
     {broker.data && <Card className="sandbox-status-card">
-      <div className="service-summary"><span className={`status-dot ${broker.data.broker_available ? "status-dot-warn" : ""}`} /><div><strong>{broker.data.broker_available ? "Broker metadata reports available" : "Sandbox Broker not installed"}</strong><span>{broker.data.targets.length} execution target records · no execution enabled</span></div></div>
-      <StatusMessage tone="neutral" title="Execution disabled">Chat has no terminal or host tool dispatcher. Agent Task execution, container control, and Docker/Podman administration are unavailable.</StatusMessage>
+      <div className="service-summary"><span className={`status-dot ${broker.data.broker_available ? "status-dot-warn" : ""}`} /><div><strong>Sandbox Broker execution unavailable</strong><span>{broker.data.targets.length} execution target records · runtime acceptance is incomplete</span></div></div>
+      <StatusMessage tone="neutral" title="Execution unavailable">Browser Chat has no tool dispatcher. Task execution remains disabled until the separate Broker passes isolation and security acceptance; Core has no container-runtime administration interface.</StatusMessage>
       <div className="future-panels">
         <InfoCard title="Resource status" value="Unavailable" detail="No Broker resource telemetry is configured." />
         <InfoCard title="Task runtime" value="Unavailable" detail="No task is executing in this phase." />

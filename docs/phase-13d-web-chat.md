@@ -70,6 +70,11 @@ the Client Agent transport and consented source snapshots; task execution,
 Broker execution, verification, and patch application remain disabled. A
 project reference in chat is metadata only and provides no source-file access.
 
+Phase 13F-A adds a separately launchable, fail-closed Broker package and
+typed protocol, documented in [Phase 13F-A](phase-13f-a-sandbox-broker.md).
+Its runtime is not accepted or connected to Core; browser Chat and Agent
+Tasks remain tool-disabled and execution remains unavailable.
+
 ## Development and browser acceptance checks
 
 Install locked frontend dependencies with `cd web && npm ci`. The UI-only
