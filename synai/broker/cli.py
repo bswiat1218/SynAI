@@ -19,7 +19,7 @@ def main() -> None:
     try:
         config = BrokerConfig.from_env()
         service = BrokerService(config)
-        def configure_logging() -> None:
+        def configure_logging() -> Callable[[], None]:
             log_role = next(
                 (role for role in config.storage_roles if role.kind == "broker_logs"),
                 None,
@@ -27,10 +27,11 @@ def main() -> None:
             if log_role is None or not service.quota_manager.verify_storage_role(log_role.role_id):
                 raise RuntimeError("Bounded Broker log storage could not be verified")
             authority = service.quota_manager.open_storage_role(log_role.role_id)
-            _configure_bounded_logging(
+            handler = _configure_bounded_logging(
                 config, authority=authority,
                 on_failure=lambda: service._invalidate_storage_readiness("logging_authority_lost"),
             )
+            return handler.close
 
         uvicorn.run(
             create_app(service, startup_callback=configure_logging),
@@ -50,16 +51,32 @@ def main() -> None:
 
 
 def _configure_bounded_logging(config: BrokerConfig, *, authority: Directory | None = None,
-                               on_failure: Callable[[], None] | None = None) -> None:
+                               on_failure: Callable[[], None] | None = None) -> _PinnedLogHandler:
     role = next(
         (item for item in config.storage_roles if item.kind == "broker_logs"),
         None,
     )
     if role is None:
         raise RuntimeError("Broker log storage role is not configured")
-    authority = authority or Directory(role.path, owner_uid=config.service_uid,
-                                      owner_gid=config.service_gid, private=True)
+    if (
+        authority is None or authority.file_verifier is None
+        or authority.path != role.path or authority.owner_uid != config.service_uid
+        or authority.owner_gid != config.service_gid
+    ):
+        if authority is not None:
+            authority.close()
+        raise RuntimeError("Broker persistent logging requires verified file-quota authority")
     try:
+        names = os.listdir(authority.fd)
+        if len(names) > role.inode_limit:
+            raise RuntimeError("Broker log inventory exceeds its inode bound")
+        for name in names:
+            descriptor = authority.open(name, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise RuntimeError("Broker log inventory contains an unsupported entry")
+            finally:
+                os.close(descriptor)
         descriptor = authority.open(
             "broker.log",
             os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -91,6 +108,7 @@ def _configure_bounded_logging(config: BrokerConfig, *, authority: Directory | N
     access = logging.getLogger("uvicorn.access")
     access.handlers.clear()
     access.disabled = True
+    return handler
 
 
 class _PinnedLogHandler(logging.StreamHandler):
@@ -100,16 +118,20 @@ class _PinnedLogHandler(logging.StreamHandler):
         self.authority = authority
         self.identity = identity
         self.on_failure = on_failure
+        self.failed = False
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             self._emit_verified(record)
         except (BrokerError, OSError, RuntimeError):
+            self.failed = True
             if self.on_failure is not None:
                 self.on_failure()
             raise
 
     def _emit_verified(self, record: logging.LogRecord) -> None:
+        if self.failed:
+            raise RuntimeError("Broker persistent logging authority remains revoked")
         self.authority.revalidate()
         descriptor = self.authority.open("broker.log", os.O_PATH)
         try:
@@ -119,15 +141,36 @@ class _PinnedLogHandler(logging.StreamHandler):
             os.close(descriptor)
         if self.stream is None:
             raise RuntimeError("Broker log stream is unavailable")
-        self.stream.write(self.format(record) + self.terminator)
-        self.flush()
+        self.authority.verify_file("broker.log", self.stream.fileno())
+        data = memoryview((self.format(record) + self.terminator).encode("utf-8"))
+        while data:
+            self.authority.verify_file("broker.log", self.stream.fileno())
+            written = os.write(self.stream.fileno(), data)
+            if written <= 0:
+                raise OSError("Broker log write made no progress")
+            data = data[written:]
+        self.authority.verify_file("broker.log", self.stream.fileno())
         self.authority.revalidate()
 
     def close(self) -> None:
-        if self.stream is not None:
-            self.stream.close()
-        self.authority.close()
-        super().close()
+        try:
+            if self.stream is not None and not self.stream.closed:
+                if self.authority.file_verifier is not None:
+                    self.authority.file_verifier(self.stream.fileno())
+                self.stream.close()
+        except (BrokerError, OSError, RuntimeError):
+            self.failed = True
+            if self.on_failure is not None:
+                self.on_failure()
+            raise
+        finally:
+            if self.stream is not None and not self.stream.closed:
+                self.stream.close()
+            self.authority.close()
+            root = logging.getLogger()
+            if self in root.handlers:
+                root.removeHandler(self)
+            super().close()
 
 
 if __name__ == "__main__":

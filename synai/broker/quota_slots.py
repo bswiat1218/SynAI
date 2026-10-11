@@ -9,6 +9,7 @@ import struct
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from synai.broker.filesystem import Directory, mount_identity, open_beneath, remove_tree
 from typing import Protocol
 
@@ -98,6 +99,9 @@ class QuotaSlotManager:
         self._task_identities: dict[tuple[str, str], tuple[int, int, int]] = {}
         self._runtime_path_identities: dict[tuple[str, Path], tuple[int, int, int]] = {}
         self._role_identity_lock = threading.Lock()
+        self.persistent_file_failure_callback: Callable[[str], None] | None = None
+        self.persistent_file_failure_code: str | None = None
+        self._failed_file_roles: set[str] = set()
 
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         with self._verification_lock:
@@ -105,6 +109,8 @@ class QuotaSlotManager:
 
     def _verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         reasons: list[str] = []
+        if self.persistent_file_failure_code is not None:
+            reasons.append(self.persistent_file_failure_code)
         if not self.config.quota_slots:
             reasons.append("quota_slot_inventory_missing")
         if not self.config.storage_roles:
@@ -145,6 +151,7 @@ class QuotaSlotManager:
                 observation = self.inspector.inspect(role.role_id)
                 self._verify_observation(role, observation)
                 self._verify_local_role_path(role, observation)
+                self.verify_existing_files(role.role_id)
                 observations[role.role_id] = observation
                 if role.kind == "task_slot":
                     slot_id = role.role_id.removeprefix("task-")
@@ -171,6 +178,7 @@ class QuotaSlotManager:
         self.runtime_containment_available = (
             self._production_inspector
             and containment_roles <= self.verified_role_ids
+            and not containment_roles & self._failed_file_roles
             and not any(reason in containment_blockers for reason in reasons)
             and _process_identity_is_restricted(
                 self.config.service_uid, self.config.service_gid,
@@ -277,6 +285,7 @@ class QuotaSlotManager:
             observation = self.inspector.inspect(role_id)
             self._verify_observation(role, observation)
             self._verify_local_role_path(role, observation)
+            self.verify_existing_files(role_id)
             return True
         except (
             InspectorFailure, BrokerError, OSError, ValueError,
@@ -555,10 +564,73 @@ class QuotaSlotManager:
                 if previous != identity:
                     raise BrokerError("filesystem_identity_changed", "Storage role was substituted.", 409)
             authority.revalidate()
+            authority.file_verifier = lambda descriptor: self.verify_persistent_file(role_id, descriptor)
+            authority.file_failure_callback = lambda code: self._persistent_file_failed(role_id, code)
             return authority
         except BaseException:
             authority.close()
             raise
+
+    def verify_persistent_file(self, role_id: str, descriptor: int) -> None:
+        role = next(item for item in self.config.storage_roles if item.role_id == role_id)
+        try:
+            live = self.inspector.inspect(role_id)
+            self._verify_observation(role, live)
+            info = os.fstat(descriptor)
+            actual = _mount_for_fd(descriptor)
+            project_id, _ = _project_attributes(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != role.owner_uid or info.st_gid != role.owner_gid
+                or info.st_mode & 0o022
+                or info.st_mode & 0o7000
+                or role.kind != "task_slot" and info.st_mode & 0o077
+                or actual.mount_id != live.mount_id
+                or actual.target != str(role.mount_path) or actual.filesystem != live.filesystem_type
+                or project_id != role.project_id
+            ):
+                raise BrokerError("filesystem_file_quota_mismatch", "Persistent file does not belong to its verified quota domain.", 503)
+            _verify_filesystem_device(role.filesystem_uuid, actual.device)
+        except (BrokerError, InspectorFailure, OSError, ValueError) as exc:
+            code = exc.code if isinstance(exc, BrokerError) else "filesystem_file_quota_unverified"
+            self._persistent_file_failed(role_id, code)
+            if isinstance(exc, BrokerError):
+                raise
+            raise BrokerError(code, "Persistent file quota identity cannot be verified.", 503) from exc
+
+    def _persistent_file_failed(self, role_id: str, code: str) -> None:
+        first_failure = self.persistent_file_failure_code is None
+        if first_failure:
+            self.persistent_file_failure_code = code
+        self._failed_file_roles.add(role_id)
+        self.verified = False
+        self.verified_slot_ids = frozenset()
+        if first_failure and self.persistent_file_failure_callback is not None:
+            self.persistent_file_failure_callback(code)
+
+    def verify_existing_files(self, role_id: str) -> None:
+        role = next(item for item in self.config.storage_roles if item.role_id == role_id)
+        remaining = role.inode_limit
+
+        def inspect(directory: Directory, depth: int) -> None:
+            nonlocal remaining
+            if depth > 32:
+                raise BrokerError("filesystem_inventory_limit", "Persistent file inventory exceeds its depth bound.", 503)
+            for name in os.listdir(directory.fd):
+                remaining -= 1
+                if remaining < 0:
+                    raise BrokerError("filesystem_inventory_limit", "Persistent file inventory exceeds its inode bound.", 503)
+                info = os.stat(name, dir_fd=directory.fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    with directory.child_directory(name) as child:
+                        inspect(child, depth + 1)
+                else:
+                    descriptor = directory.open(name, os.O_RDONLY | os.O_NONBLOCK)
+                    os.close(descriptor)
+            directory.revalidate()
+
+        with self.open_storage_role(role_id) as root:
+            inspect(root, 0)
 
     def open_task_root(self, task_id: str, *, allow_quarantined: bool = False,
                        create: bool = False) -> Directory:

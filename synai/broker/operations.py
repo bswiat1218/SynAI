@@ -103,7 +103,13 @@ def _execute_file_operation(workspace: Directory, kind: str, arguments: dict[str
     """Perform bounded workspace-only file operations using no-follow dirfds."""
     arguments = validate_operation(kind, arguments)
     root_fd = os.dup(workspace.fd)
+    parent_authority = workspace
+    authorities: list[Directory] = []
     try:
+        if arguments.get("path") != ".":
+            for part in PurePosixPath(arguments["path"]).parts[:-1]:
+                parent_authority = parent_authority.child_directory(part)
+                authorities.append(parent_authority)
         parent_fd, name = _parent_fd(root_fd, arguments["path"]) if arguments.get("path") != "." else (os.dup(root_fd), ".")
         try:
             identity = mount_identity(parent_fd)
@@ -130,33 +136,34 @@ def _execute_file_operation(workspace: Directory, kind: str, arguments: dict[str
                 finally:
                     os.close(target_fd)
             if kind == "read_file":
-                data = _read_at(parent_fd, name)
+                data = _read_at(parent_fd, name, parent_authority)
                 if len(data) > output_limit:
                     raise BrokerError("operation_output_limit", "File content exceeds its output limit.", 413)
                 return {"content": data.decode("utf-8", errors="strict"), "sha256": hashlib.sha256(data).hexdigest()}
             if kind == "delete_file":
-                data = _read_at(parent_fd, name)
+                data = _read_at(parent_fd, name, parent_authority)
                 _check_preimage(data, arguments["expected_sha256"])
                 verify_parent()
                 os.unlink(name, dir_fd=parent_fd)
+                parent_authority.forget_file(name)
                 os.fsync(parent_fd)
                 return {"deleted": True, "preimage_sha256": hashlib.sha256(data).hexdigest()}
             if kind == "write_file":
                 data = arguments["content"].encode("utf-8")
                 expected = arguments["expected_sha256"]
-                existing = _read_optional_at(parent_fd, name)
+                existing = _read_optional_at(parent_fd, name, parent_authority)
                 if (existing is None) != (expected is None):
                     raise BrokerError("preimage_conflict", "Workspace file existence changed before write.", 409)
                 if existing is not None:
                     _check_preimage(existing, expected)
-                _atomic_write(parent_fd, name, data, verify_parent)
+                _atomic_write(parent_fd, name, data, verify_parent, parent_authority)
                 return {
                     "written": True,
                     "preimage_sha256": None if existing is None else hashlib.sha256(existing).hexdigest(),
                     "postimage_sha256": hashlib.sha256(data).hexdigest(),
                 }
             if kind == "patch_file":
-                existing = _read_at(parent_fd, name)
+                existing = _read_at(parent_fd, name, parent_authority)
                 _check_preimage(existing, arguments["expected_sha256"])
                 text = existing.decode("utf-8", errors="strict")
                 if text.count(arguments["old"]) != 1:
@@ -164,7 +171,7 @@ def _execute_file_operation(workspace: Directory, kind: str, arguments: dict[str
                 updated = text.replace(arguments["old"], arguments["new"], 1).encode("utf-8")
                 if len(updated) > MAX_FILE_BYTES:
                     raise BrokerError("operation_too_large", "Patched file exceeds its size limit.", 413)
-                _atomic_write(parent_fd, name, updated, verify_parent)
+                _atomic_write(parent_fd, name, updated, verify_parent, parent_authority)
                 return {
                     "written": True,
                     "preimage_sha256": hashlib.sha256(existing).hexdigest(),
@@ -182,6 +189,8 @@ def _execute_file_operation(workspace: Directory, kind: str, arguments: dict[str
             raise BrokerError("unsafe_workspace_path", "Workspace path contains a symlink or wrong file type.", 422) from exc
         raise
     finally:
+        for authority in reversed(authorities):
+            authority.close()
         os.close(root_fd)
 
 
@@ -204,12 +213,14 @@ def _parent_fd(root_fd: int, path: str) -> tuple[int, str]:
         raise
 
 
-def _read_optional_at(parent_fd: int, name: str) -> bytes | None:
+def _read_optional_at(parent_fd: int, name: str, authority: Directory | None = None) -> bytes | None:
     try:
         descriptor = open_beneath(parent_fd, name, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     try:
+        if authority is not None:
+            authority.verify_file(name, descriptor)
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE_BYTES or info.st_uid != os.geteuid():
             raise BrokerError("file_type_unsupported", "Only bounded regular workspace files are supported.", 422)
@@ -226,8 +237,8 @@ def _read_optional_at(parent_fd: int, name: str) -> bytes | None:
         os.close(descriptor)
 
 
-def _read_at(parent_fd: int, name: str) -> bytes:
-    data = _read_optional_at(parent_fd, name)
+def _read_at(parent_fd: int, name: str, authority: Directory | None = None) -> bytes:
+    data = _read_optional_at(parent_fd, name, authority)
     if data is None:
         raise FileNotFoundError(name)
     return data
@@ -238,22 +249,30 @@ def _check_preimage(data: bytes, expected: str) -> None:
         raise BrokerError("preimage_conflict", "Workspace file changed since its approved preimage.", 409)
 
 
-def _atomic_write(parent_fd: int, name: str, data: bytes, verify_parent: Callable[[], None]) -> None:
+def _atomic_write(parent_fd: int, name: str, data: bytes, verify_parent: Callable[[], None],
+                  authority: Directory | None = None) -> None:
     verify_parent()
     temporary = f".synai-{secrets.token_hex(16)}.tmp"
     descriptor = open_beneath(
         parent_fd, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
     )
     try:
+        if authority is not None:
+            authority.verify_file(temporary, descriptor)
         view = memoryview(data)
         while view:
+            if authority is not None:
+                authority.verify_file(temporary, descriptor)
             count = os.write(descriptor, view)
             if count <= 0:
                 raise OSError("Workspace write made no progress")
             view = view[count:]
         os.fsync(descriptor)
+        if authority is not None:
+            authority.verify_file(temporary, descriptor)
     except BaseException:
-        os.unlink(temporary, dir_fd=parent_fd)
+        if authority is None or authority.file_verifier is None:
+            os.unlink(temporary, dir_fd=parent_fd)
         raise
     finally:
         os.close(descriptor)
@@ -265,7 +284,10 @@ def _atomic_write(parent_fd: int, name: str, data: bytes, verify_parent: Callabl
             raise BrokerError("file_type_unsupported", "Only regular files may be replaced.", 422)
     except FileNotFoundError:
         pass
-    os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    if authority is not None:
+        authority.replace_file(temporary, name)
+    else:
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
     os.fsync(parent_fd)
 
 

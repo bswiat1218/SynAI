@@ -93,6 +93,7 @@ class BrokerService:
         self.runtime = RootlessPodmanRuntime(config, self.registry)
         from synai.broker.quota_slots import QuotaSlotManager
         self.quota_manager = QuotaSlotManager(config, self.registry)
+        self.quota_manager.persistent_file_failure_callback = self._invalidate_storage_readiness
         self.runtime.storage_containment_check = (
             lambda: self.quota_manager.runtime_containment_available
         )
@@ -196,6 +197,7 @@ class BrokerService:
             if self.registry.failure_code is None:
                 self.registry._access_failed(exc)
         finally:
+            self._invalidate_storage_readiness("sqlite_file_quota_vfs_unaccepted")
             self._started = True
             self._start_storage_watchdog()
 
@@ -1123,22 +1125,27 @@ class BrokerService:
         raise BrokerError("tool_not_allowed", "Operation kind is not supported.", 403)
 
 
-def create_app(service: BrokerService, *, startup_callback: Callable[[], None] | None = None) -> FastAPI:
+def create_app(service: BrokerService, *, startup_callback: Callable[[], Callable[[], None] | None] | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if service._lifespan_active:
             raise BrokerError("service_lifecycle_invalid", "Broker service already has an active ASGI lifecycle.", 503)
         service._lifespan_active = True
+        close_logging = None
         try:
-            await service.start()
             if startup_callback is not None:
-                startup_callback()
+                close_logging = startup_callback()
+            await service.start()
             yield
         finally:
             try:
                 await service.close()
             finally:
-                service._lifespan_active = False
+                try:
+                    if close_logging is not None:
+                        close_logging()
+                finally:
+                    service._lifespan_active = False
 
     app = FastAPI(title="SynAI Sandbox Broker", version="1", lifespan=lifespan)
     app.state.broker = service

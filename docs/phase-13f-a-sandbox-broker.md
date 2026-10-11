@@ -330,8 +330,7 @@ SQLite databases, injected I/O/transaction failures, and fake runtimes.
 Production recovery/provisioning approval tooling, authentic historical
 baseline evidence, actual crash/power-loss durability, quota exhaustion under
 the kernel, and real-container reconciliation remain acceptance blockers.
-HIGH-4 and HIGH-5 follow-up controls are described below. Preexisting task-file
-project-ID checks (MEDIUM-1) remain deliberately unimplemented.
+HIGH-4, HIGH-5, and existing-file project-ID follow-up controls are described below.
 The seal is Broker-owned corruption/replacement detection, not protection
 against a compromised Broker identity rewriting both database and seal.
 
@@ -411,17 +410,18 @@ mocked quota/runtime evidence, and local Unix sockets. Only `openat2`, no-follow
 resolution, descriptor identity, and local socket behavior are exercised against
 the current kernel. No project quota, remount, privileged inspector, live Podman
 mount, or power-loss acceptance is claimed. HIGH-4 remains **partially resolved**
-pending the SQLite/runtime boundary and dedicated-host acceptance. MEDIUM-1
-remains out of scope; HIGH-5 is addressed separately below.
+pending the SQLite/runtime boundary and dedicated-host acceptance. HIGH-5 and
+MEDIUM-1 are addressed separately below.
 
 ### CLI/watchdog lifecycle correction (A.5.1a.4.1)
 
 The prior CLI called `asyncio.run(service.start())` before Uvicorn, placing the
 watchdog on a temporary loop that closed before HTTP serving. This was a real
 lifecycle defect. The CLI now only constructs the service and app and invokes
-Uvicorn with lifespan explicitly enabled. FastAPI lifespan awaits service startup
-and normal registry reconciliation on Uvicorn's serving loop, then configures
-verified bounded logging before admitting HTTP requests. Its `finally` closes the
+Uvicorn with lifespan explicitly enabled. FastAPI lifespan now configures verified
+bounded logging before service startup diagnostics, then awaits startup and normal
+registry reconciliation on Uvicorn's serving loop before admitting HTTP requests.
+Its `finally` closes the
 service, cancels/joins the watchdog, and waits for independent containment under
 the existing bounded shutdown policy. Startup exceptions also run that cleanup;
 failed storage/registry checks retain fail-closed diagnostics and never authorize
@@ -545,13 +545,136 @@ quota observations and fake runtime callbacks. They do not prove project quota
 enforcement, overlay accounting, engine tmpfs lifecycle, real Podman log/storage
 semantics, external configuration TOCTOU resistance, or kernel crash durability.
 No host Podman command, container/image operation, inspector implementation,
-storage provisioning, or MEDIUM-1 remediation was performed.
+storage provisioning, or MEDIUM-1 remediation was performed by the HIGH-5 change.
 
 Reference semantics: [Podman global options/environment](https://docs.podman.io/en/latest/markdown/podman.1.html),
 [storage.conf](https://github.com/containers/storage/blob/main/docs/containers-storage.conf.5.md),
 and [containers.conf](https://github.com/containers/common/blob/main/docs/containers.conf.5.md).
 Live acceptance must pin and verify the deployed versions rather than infer
 their behavior from these current upstream documents.
+
+### Existing-file quota verification (A.5.1a.6 / MEDIUM-1)
+
+MEDIUM-1 is **partially resolved**: descriptor-controlled file operations now
+verify actual per-file quota assignment, including preexisting files, but the
+SQLite VFS boundary and real kernel quota enforcement remain unaccepted.
+Startup adds `sqlite_file_quota_vfs_unaccepted` and never enables execution.
+HIGH-4 and HIGH-5 refusal gates remain independent and unchanged.
+
+The existing `Directory` authority carries a role-bound file verifier into its
+child authorities. Production role openers install that verifier; a plain
+directory descriptor, directory inheritance, or test fixture is not production
+quota evidence. Before returning an existing or newly created file descriptor,
+it validates:
+
+- Regular-file type, dedicated UID/GID, one hard link, and safe permissions.
+  State/config/log files are private; task-file read permissions remain compatible
+  with immutable snapshots. Group/other write and special permission bits fail.
+- Fresh independently inspected role UUID, mount, quota mode, exact byte/inode
+  limits, and owner identity; local filesystem device/UUID and mount identity.
+- `FS_IOC_FSGETXATTR` on the **file descriptor itself** supplies the project ID.
+  Regular files do not require directory-only `PROJINHERIT` flags.
+- No-follow, beneath/no-cross-mount resolution, pinned device/inode/mount identity,
+  and matching current directory-relative pathname. `O_PATH` inspection uses a
+  separately opened readable descriptor with matching identity for the ioctl.
+
+`O_TRUNC` is refused before open on a quota-bound authority. Newly created files
+are checked before writing any payload, and descriptor-backed writes are checked
+again around continued use. Failure leaves uncertain new files/evidence intact;
+there is no relabel, relocation, truncation, or repair procedure.
+File-verification failures immediately revoke execution/slot authority and latch
+the storage manager unavailable; later successful observations cannot clear it.
+Narrowly reverified reads may still inspect evidence without restoring authority.
+Startup and
+periodic role verification perform a bounded recursive metadata inventory of
+existing files, including audit/configuration files, manifests, artifacts,
+recovery evidence, and logs. File inventory is bounded by the role inode ceiling
+and a depth limit; physical filesystem/inspector latency still requires deployment
+qualification. No new privileged inspector protocol or server was introduced.
+
+SQLite database, WAL/SHM/journal files, identity seal, interruption marker, and
+pending seal use the same authority. Existing-only database startup, historical
+seal fingerprint, integrity/reference checks, full synchronous mode, checkpoint
+checking, and directory fsync remain intact. Sidecars are verified before/after
+SQLite open, before yielding the connection, and around checkpoint/close.
+A sidecar never observed in the active lifecycle may legitimately be absent;
+an observed active sidecar disappearing before checkpoint is unresolved. Closed
+sealed boundaries still require sidecars to be absent. Confirmed absence retires
+only the in-memory pathname pin, not historical SQLite ownership.
+
+The pending seal and marker are verified after creation and before persistent
+use. Atomic seal/workspace replacement verifies both source and any existing
+target, performs descriptor-relative replacement, updates only that expected
+in-memory pathname pin, then verifies the resulting file and fsyncs the directory.
+Failure after replacement remains unresolved and preserves interruption evidence;
+it does not reseal or discard history. Recovery/reconciliation and persistent audit
+rows remain in the same checked SQLite database, not a new authoritative ledger.
+
+SQLite's VFS can open/create/write a database or sidecar by pathname internally
+before a Python post-check. These checks do **not** establish atomic file identity
+or quota verification across every VFS syscall. A transient VFS-created file may
+not be observable after close. The original HIGH-4 SQLite path race therefore
+remains, with an explicit readiness blocker; there is no generic pathname fallback
+and no claim of complete VFS protection. Descriptor-relative replacement also has
+an external pathname-mutation interval; post-checks refuse uncertain identities
+rather than proving an atomic identity-preserving rename under hostile mutation.
+
+The CLI configures quota-verified persistent logging first within the ASGI lifespan,
+before service startup can emit persistent diagnostics. Unsafe logging initialization
+aborts the lifespan. The configured role/path/owner and all existing flat log entries
+are checked before opening `broker.log`; bare path authority is rejected. Every
+emission verifies the held file and current pathname, uses checked unbuffered
+descriptor writes, and propagates quota/I/O failure after revoking authority.
+Failures latch logging unavailable and cannot be cleared by later mocked success.
+The lifespan closes the owned handler after watchdog/containment/service shutdown.
+Bootstrap/service-manager stderr policy remains a separate deployment acceptance
+boundary; no persistent fallback file or directory is opened.
+
+Automatic log rotation is **not supported**. External renaming/replacement is
+refused; existing rotated or temporary log files must pass the same project/type/
+owner/link checks at startup and periodic inventory. Interrupted rotation never
+causes automatic deletion, truncation, or adoption of uncertain files. Operator
+recovery must preserve and inspect the state and log evidence before separate
+authorization. Log quota exhaustion is not success and does not authorize a
+fallback sink.
+
+#### HIGH-5 capacity reconciliation (no cap changes)
+
+The prior 15.75 GiB free-capacity entitlement calculation is arithmetically correct
+at four maximum slots and the maximum existing role quotas:
+
+| Quota domain | MiB hard limit | Inode hard limit |
+|---|---:|---:|
+| Four task slots (256 MiB / 4,096 each) | 1,024 | 16,384 |
+| Podman graph, including images/layers/metadata | 4,096 | 131,072 |
+| Podman runtime | 512 | 16,384 |
+| Image scratch | 512 | 16,384 |
+| Broker state | 512 | 16,384 |
+| Broker logs | 512 | 8,192 |
+| Temporary data | 512 | 16,384 |
+| **Hard-quota entitlements** | **7,680** | **221,184** |
+| Minimum reserve | 8,192 | 16,384 |
+| Operational allowance | 256 | 4,096 |
+| **Initial free-capacity requirement** | **16,128** | **241,664** |
+
+16,128 MiB = 15.75 GiB = **16,911,433,728 bytes**. Aliased purposes within
+graph/runtime/state roles are counted once, not as extra hard quotas. Host
+temporary and image scratch are separate domains. Container `/tmp` is ephemeral
+memory/tmpfs, not another persistent filesystem entitlement; live memory/tmpfs
+accounting is still blocked. For used domains, the required free capacity uses
+remaining hard entitlement (`limit - usage`), never adds caps to free capacity.
+
+This is not approval of a nominal 16 GiB volume: independently observed filesystem
+total bytes/inodes must also meet the configured aggregate total floor (default
+16 GiB / 262,144 inodes), and the available-capacity check must pass after real
+formatting, metadata, and usage. The overhead allowance is a policy floor, not
+measured production sufficiency. Native runtime paths, per-boot/tmpfs behavior,
+overlay charging, file quota enforcement, inspector freshness, and SQLite crash/
+power-loss behavior remain acceptance blockers, not a HIGH-5 redesign here.
+
+Deterministic tests use disposable SQLite/filesystem fixtures, synthetic project
+IDs and mount observations, controlled replacement, and injected quota failures.
+They do not modify quota assignments or prove live kernel quota charging.
 
 These controls are unit-tested with fake runtime and registry adapters only.
 They do not establish real Podman stop/kill behavior, privileged-inspector

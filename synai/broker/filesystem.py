@@ -8,7 +8,7 @@ import stat
 import weakref
 from contextlib import contextmanager
 from pathlib import Path
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from synai.broker.protocol import BrokerError
 
@@ -59,13 +59,18 @@ class Directory:
     """Owned dirfd with pinned ancestry; path is diagnostic, never child authority."""
 
     def __init__(self, path: Path, *, owner_uid: int | None = None,
-                 owner_gid: int | None = None, private: bool = False) -> None:
+                 owner_gid: int | None = None, private: bool = False,
+                 file_verifier: Callable[[int], None] | None = None,
+                 file_failure_callback: Callable[[str], None] | None = None) -> None:
         if not path.is_absolute() or path != Path(os.path.normpath(path)):
             raise BrokerError("filesystem_path_invalid", "Authority path must be canonical and absolute.", 409)
         self.path = path
         self.owner_uid = os.geteuid() if owner_uid is None else owner_uid
         self.owner_gid = owner_gid
         self.private = private
+        self.file_verifier = file_verifier
+        self.file_failure_callback = file_failure_callback
+        self._file_identities: dict[Path, tuple[int, int, int]] = {}
         self._chain: list[int] = []
         self._identities: list[tuple[int, int, int]] = []
         try:
@@ -90,6 +95,9 @@ class Directory:
         instance.owner_uid = parent.owner_uid
         instance.owner_gid = parent.owner_gid
         instance.private = False
+        instance.file_verifier = parent.file_verifier
+        instance.file_failure_callback = parent.file_failure_callback
+        instance._file_identities = parent._file_identities
         instance._chain = [os.dup(fd) for fd in parent._chain]
         instance._chain.append(descriptor)
         instance._identities = [mount_identity(fd) for fd in instance._chain]
@@ -141,8 +149,90 @@ class Directory:
             os.close(current)
 
     def open(self, name: str, flags: int, mode: int = 0) -> int:
+        try:
+            return self._open_verified(name, flags, mode)
+        except (BrokerError, OSError) as exc:
+            if not isinstance(exc, FileNotFoundError) and self.file_failure_callback is not None:
+                self.file_failure_callback(exc.code if isinstance(exc, BrokerError) else "filesystem_file_unavailable")
+            raise
+
+    def _open_verified(self, name: str, flags: int, mode: int) -> int:
         self.revalidate()
-        return open_beneath(self.fd, name, flags, mode)
+        # O_TRUNC changes data during open, before the file's quota can be checked.
+        if self.file_verifier is not None and flags & os.O_TRUNC:
+            raise BrokerError("filesystem_unsafe_open", "Pre-verification truncation is forbidden.", 503)
+        descriptor = open_beneath(self.fd, name, flags, mode)
+        try:
+            if self.file_verifier is not None and not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                if flags & os.O_PATH:
+                    readable = open_beneath(self.fd, name, os.O_RDONLY | os.O_NONBLOCK)
+                    try:
+                        if mount_identity(readable) != mount_identity(descriptor):
+                            raise BrokerError("filesystem_identity_changed", "File changed before quota verification.", 503)
+                        self.verify_file(name, readable)
+                    finally:
+                        os.close(readable)
+                else:
+                    self.verify_file(name, descriptor)
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def verify_file(self, name: str, descriptor: int) -> None:
+        try:
+            self._verify_file(name, descriptor)
+        except (BrokerError, OSError) as exc:
+            if self.file_failure_callback is not None:
+                self.file_failure_callback(exc.code if isinstance(exc, BrokerError) else "filesystem_file_unavailable")
+            raise
+
+    def _verify_file(self, name: str, descriptor: int) -> None:
+        self.revalidate()
+        if self.file_verifier is not None:
+            self.file_verifier(descriptor)
+        identity = mount_identity(descriptor)
+        if self.file_verifier is not None:
+            if self._file_identities.setdefault(self.path / name, identity) != identity:
+                raise BrokerError("filesystem_identity_changed", "Persistent file inode was replaced.", 503)
+        current = open_beneath(self.fd, name, os.O_PATH)
+        try:
+            if mount_identity(current) != identity:
+                raise BrokerError("filesystem_identity_changed", "Persistent file pathname was replaced.", 503)
+        finally:
+            os.close(current)
+
+    def replace_file(self, temporary: str, name: str) -> None:
+        self.revalidate()
+        source = self.open(temporary, os.O_RDONLY | os.O_NONBLOCK)
+        target = None
+        try:
+            try:
+                target = self.open(name, os.O_RDONLY | os.O_NONBLOCK)
+            except FileNotFoundError:
+                pass
+            self.verify_file(temporary, source)
+            if target is not None:
+                self.verify_file(name, target)
+            os.replace(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            self._file_identities.pop(self.path / temporary, None)
+            self._file_identities[self.path / name] = mount_identity(source)
+            self.verify_file(name, source)
+            os.fsync(self.fd)
+        finally:
+            os.close(source)
+            if target is not None:
+                os.close(target)
+
+    def forget_file(self, name: str) -> None:
+        """Forget only an independently confirmed absent lifecycle entry."""
+        try:
+            descriptor = open_beneath(self.fd, name, os.O_PATH)
+        except FileNotFoundError:
+            self._file_identities.pop(self.path / name, None)
+        else:
+            os.close(descriptor)
+            raise BrokerError("filesystem_identity_changed", "File remains present at an absent boundary.", 503)
 
     def child_directory(self, name: str) -> Directory:
         return Directory.child(self, name)
@@ -202,11 +292,15 @@ def write_new(directory: Directory, name: str, data: bytes, mode: int = 0o600) -
     try:
         view = memoryview(data)
         while view:
+            if directory.file_verifier is not None:
+                directory.verify_file(name, descriptor)
             written = os.write(descriptor, view)
             if written <= 0:
                 raise OSError("Filesystem write made no progress")
             view = view[written:]
         os.fsync(descriptor)
+        if directory.file_verifier is not None:
+            directory.verify_file(name, descriptor)
     finally:
         os.close(descriptor)
     directory.revalidate()
@@ -250,6 +344,7 @@ def remove_tree(directory: Directory) -> None:
                 if mount_identity(descriptor)[:2] != (info.st_dev, info.st_ino):
                     raise BrokerError("filesystem_identity_changed", "Cleanup entry was substituted.", 409)
                 os.unlink(name, dir_fd=directory.fd)
+                directory.forget_file(name)
             finally:
                 os.close(descriptor)
         else:

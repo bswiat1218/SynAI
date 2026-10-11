@@ -179,11 +179,14 @@ class BrokerRegistry:
         directory = self._state_directory()
         descriptor = directory.open(temporary.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as target:
+            directory.verify_file(temporary.name, target.fileno())
             json.dump(self._identity(), target, sort_keys=True)
+            directory.verify_file(temporary.name, target.fileno())
             target.flush()
             os.fsync(target.fileno())
+            directory.verify_file(temporary.name, target.fileno())
         directory.revalidate()
-        os.replace(temporary.name, self.seal_path.name, src_dir_fd=directory.fd, dst_dir_fd=directory.fd)
+        directory.replace_file(temporary.name, self.seal_path.name)
         self._sync_directory()
 
     def _verify_seal(self) -> None:
@@ -213,6 +216,7 @@ class BrokerRegistry:
         try:
             descriptor = directory.open(path.name, os.O_PATH)
         except FileNotFoundError:
+            directory.forget_file(path.name)
             return False
         else:
             os.close(descriptor)
@@ -223,6 +227,7 @@ class BrokerRegistry:
         try:
             descriptor = directory.open(self.path.name + suffix, os.O_RDONLY | os.O_NONBLOCK)
         except FileNotFoundError:
+            directory.forget_file(self.path.name + suffix)
             return False
         try:
             info = os.fstat(descriptor)
@@ -513,6 +518,8 @@ class BrokerRegistry:
                 if not self._initializing:
                     self._verify_seal()
                 directory = self._state_directory()
+                for suffix in ("-wal", "-shm", "-journal"):
+                    self._verify_sidecar(suffix)
                 descriptor = directory.open(self.path.name, os.O_RDWR)
                 try:
                     info = os.fstat(descriptor)
@@ -529,6 +536,7 @@ class BrokerRegistry:
                     os.close(descriptor)
                 marker = directory.open(self.dirty_path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 try:
+                    directory.verify_file(self.dirty_path.name, marker)
                     os.fsync(marker)
                 finally:
                     os.close(marker)
@@ -545,6 +553,8 @@ class BrokerRegistry:
                 finally:
                     os.close(descriptor)
                 connection.row_factory = sqlite3.Row
+                for suffix in ("-wal", "-shm", "-journal"):
+                    self._verify_sidecar(suffix)
                 connection.execute("PRAGMA foreign_keys=ON")
                 connection.execute("PRAGMA busy_timeout=2000")
                 connection.execute("PRAGMA synchronous=FULL")
@@ -552,6 +562,10 @@ class BrokerRegistry:
                     raise BrokerError("registry_corrupt", "Registry integrity is inconclusive.", 503)
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise BrokerError("registry_corrupt", "Registry references are inconsistent.", 503)
+                active_sidecars = {
+                    suffix for suffix in ("-wal", "-shm", "-journal")
+                    if self._verify_sidecar(suffix)
+                }
                 rejection = None
                 try:
                     with connection:
@@ -567,18 +581,26 @@ class BrokerRegistry:
                         connection.rollback()
                 if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise BrokerError("registry_corrupt", "Registry references are inconsistent.", 503)
-                if connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
-                    if any(not self._verify_sidecar(suffix)
-                           for suffix in ("-wal", "-shm")):
-                        raise BrokerError("registry_journal_unexpected", "Active registry journal evidence is missing.", 503)
+                self._identity()
+                for suffix in ("-wal", "-shm", "-journal"):
+                    if not self._verify_sidecar(suffix) and suffix in active_sidecars:
+                        raise BrokerError("registry_journal_unexpected", "Observed active sidecar disappeared before checkpoint.", 503)
                 checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
                 if checkpoint is not None and checkpoint[0] != 0:
                     raise BrokerError("registry_checkpoint_failed", "Registry checkpoint did not complete.", 503)
+                for suffix in ("-wal", "-shm", "-journal"):
+                    self._verify_sidecar(suffix)
                 connection.close()
                 connection = None
                 directory.revalidate()
+                for suffix in ("-wal", "-shm", "-journal"):
+                    if self._verify_sidecar(suffix):
+                        raise BrokerError("registry_journal_unexpected", "Journal remains at a closed persistence boundary.", 503)
                 self._seal()
+                marker = directory.open(self.dirty_path.name, os.O_RDONLY | os.O_NONBLOCK)
+                os.close(marker)
                 os.unlink(self.dirty_path.name, dir_fd=directory.fd)
+                directory.forget_file(self.dirty_path.name)
                 self._sync_directory()
                 if rejection is not None:
                     raise rejection
@@ -618,6 +640,7 @@ class BrokerRegistry:
             "registry_journal_unexpected": RegistryTrust.RECOVERY_INCOMPLETE,
             "filesystem_identity_changed": RegistryTrust.MISMATCH,
             "filesystem_ownership_invalid": RegistryTrust.MISMATCH,
+            "filesystem_file_quota_mismatch": RegistryTrust.MISMATCH,
         }.get(code, RegistryTrust.UNAVAILABLE)
         self.fail(state, code)
 

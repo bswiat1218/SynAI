@@ -131,7 +131,7 @@ class BrokerCliLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(watchdog.done())
         self.assertIsNone(self.service._storage_watchdog_task)
 
-    async def test_startup_barrier_prevents_dispatch_and_logging_until_checks_finish(self) -> None:
+    async def test_startup_barrier_prevents_dispatch_after_verified_logging_until_checks_finish(self) -> None:
         app = self.cli_app()
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -146,7 +146,7 @@ class BrokerCliLifecycleTests(unittest.IsolatedAsyncioTestCase):
         lifespan = app.router.lifespan_context(app)
         startup = asyncio.create_task(lifespan.__aenter__())
         await entered.wait()
-        self.logging.assert_not_called()
+        self.logging.assert_called_once()
         with self.assertRaises(BrokerError) as denied:
             await self.service.dispatch(None)
         self.assertEqual(denied.exception.code, "broker_not_ready")
