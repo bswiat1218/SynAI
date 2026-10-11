@@ -48,7 +48,6 @@ class BrokerRegistry:
         self.path = config.state_dir / "broker.sqlite3"
 
     def initialize(self) -> None:
-        self.config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = self.config.state_dir.lstat()
         if (
             not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
@@ -125,6 +124,20 @@ class BrokerRegistry:
                     release_evidence TEXT,
                     updated_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS broker_storage_roles (
+                    role_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    mount_path TEXT NOT NULL,
+                    filesystem_uuid TEXT NOT NULL,
+                    project_id INTEGER NOT NULL,
+                    byte_limit INTEGER NOT NULL,
+                    inode_limit INTEGER NOT NULL,
+                    owner_uid INTEGER NOT NULL,
+                    owner_gid INTEGER NOT NULL,
+                    policy_generation TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
             """)
             columns = {
                 row["name"]
@@ -158,6 +171,21 @@ class BrokerRegistry:
                     (
                         slot.slot_id, str(slot.path), slot.filesystem_uuid, slot.project_id,
                         slot.byte_limit, slot.inode_limit, int(time.time()),
+                    ),
+                )
+            from synai.broker.storage_inspector import inventory_generation
+            generation = inventory_generation(self.config.storage_roles)
+            for role in self.config.storage_roles:
+                connection.execute(
+                    "INSERT OR IGNORE INTO broker_storage_roles "
+                    "(role_id, kind, path, mount_path, filesystem_uuid, project_id, "
+                    "byte_limit, inode_limit, owner_uid, owner_gid, policy_generation, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        role.role_id, role.kind, str(role.path), str(role.mount_path),
+                        role.filesystem_uuid, role.project_id, role.byte_limit,
+                        role.inode_limit, role.owner_uid, role.owner_gid,
+                        generation, int(time.time()),
                     ),
                 )
             connection.executescript("""
@@ -575,6 +603,30 @@ class BrokerRegistry:
             ("inode_limit", slot.inode_limit),
         ))
 
+    def storage_role_inventory_matches(self, role: object, generation: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM broker_storage_roles WHERE role_id = ?", (role.role_id,),
+            ).fetchone()
+        return row is not None and all(row[name] == value for name, value in (
+            ("kind", role.kind),
+            ("path", str(role.path)),
+            ("mount_path", str(role.mount_path)),
+            ("filesystem_uuid", role.filesystem_uuid),
+            ("project_id", role.project_id),
+            ("byte_limit", role.byte_limit),
+            ("inode_limit", role.inode_limit),
+            ("owner_uid", role.owner_uid),
+            ("owner_gid", role.owner_gid),
+            ("policy_generation", generation),
+        ))
+
+    def storage_role_configurations(self) -> tuple[sqlite3.Row, ...]:
+        with self.connect() as connection:
+            return tuple(connection.execute(
+                "SELECT * FROM broker_storage_roles ORDER BY role_id",
+            ).fetchall())
+
     def unassigned_legacy_tasks(self) -> tuple[str, ...]:
         with self.connect() as connection:
             rows = connection.execute(
@@ -617,6 +669,46 @@ class BrokerRegistry:
                 "WHERE task_id = ? AND state != 'free'",
                 (int(time.time()), task_id),
             )
+
+    def quarantine_all_for_storage_loss(self, reason: str) -> tuple[str, ...]:
+        if not reason or len(reason) > 128:
+            raise BrokerError("storage_failure_invalid", "Storage failure reason is invalid.", 500)
+        now = int(time.time())
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                tasks = tuple(row["task_id"] for row in connection.execute(
+                    "SELECT task_id FROM broker_slots WHERE task_id IS NOT NULL "
+                    "AND state != 'free' ORDER BY task_id",
+                ).fetchall())
+                connection.execute(
+                    "UPDATE broker_operations SET state = 'uncertain', updated_at = ? "
+                    "WHERE state IN ('claimed', 'running') AND task_id IN "
+                    "(SELECT task_id FROM broker_slots WHERE task_id IS NOT NULL AND state != 'free')",
+                    (now,),
+                )
+                connection.execute(
+                    "UPDATE broker_tasks SET state = 'uncertain', updated_at = ? "
+                    "WHERE task_id IN (SELECT task_id FROM broker_slots "
+                    "WHERE task_id IS NOT NULL AND state != 'free') AND state != 'removed'",
+                    (now,),
+                )
+                connection.execute(
+                    "UPDATE broker_slots SET state = 'quarantined', updated_at = ? "
+                    "WHERE task_id IS NOT NULL AND state != 'free'",
+                    (now,),
+                )
+                for task_id in tasks:
+                    connection.execute(
+                        "UPDATE broker_containers SET reconciliation_evidence = ? "
+                        "WHERE task_id = ? AND lifecycle_state != 'removed'",
+                        (f"storage_assurance_lost:{reason}:{now}", task_id),
+                    )
+                connection.commit()
+                return tasks
+            except BaseException:
+                connection.rollback()
+                raise
 
     def has_quarantined_slots(self) -> bool:
         with self.connect() as connection:

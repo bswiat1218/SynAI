@@ -4,13 +4,13 @@ import hashlib
 import json
 import os
 import sqlite3
+import socket
 import tempfile
 import time
 import unittest
 import asyncio
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, patch
 
@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from synai.broker.app import BrokerService, OperationRequest, create_app
-from synai.broker.config import BrokerConfig, BrokerReadiness, QuotaSlot
+from synai.broker.config import BrokerConfig, BrokerReadiness, QuotaSlot, StorageRole
 from synai.broker.operations import execute_file_operation, validate_operation
 from synai.broker.protocol import (
     BrokerError,
@@ -31,9 +31,18 @@ from synai.broker.protocol import (
 from synai.broker.registry import BrokerRegistry
 from synai.broker import runtime as runtime_module
 from synai.broker.runtime import RootlessPodmanRuntime
-from synai.broker.quota_slots import QuotaUsage
+from synai.broker.quota_slots import QuotaUsage, aggregate_storage_reasons
 from synai.broker import quota_slots as quota_slots_module
-from synai.broker.quota_slots import LinuxQuotaInspector, QuotaSlotManager
+from synai.broker.quota_slots import QuotaSlotManager
+from synai.broker.storage_inspector import (
+    InspectorInvalid,
+    InspectorStale,
+    InspectorUnavailable,
+    StorageInspectionRequest,
+    StorageObservation,
+    UnixStorageInspectorClient,
+    inventory_generation,
+)
 from synai.broker.snapshots import (
     changed_files,
     load_staged_manifest,
@@ -69,8 +78,33 @@ def config(root: Path, *, podman: str = "podman", slot_count: int = 1) -> Broker
     )
     for slot in slots:
         slot.path.mkdir(mode=0o700, exist_ok=True)
+    role_data = (
+        ("podman_graph", "podman-graph", mount_path / "podman" / "graph", 4 * 1024**3, 131_072),
+        ("podman_runtime", "podman-runtime", mount_path / "podman" / "run", 512 * 1024**2, 16_384),
+        ("image_scratch", "image-scratch", mount_path / "podman" / "scratch", 512 * 1024**2, 16_384),
+        ("broker_state", "broker-state", mount_path / "broker-state", 512 * 1024**2, 16_384),
+        ("broker_logs", "broker-logs", mount_path / "broker-logs", 512 * 1024**2, 8192),
+        ("temporary", "broker-temp", mount_path / "temporary", 512 * 1024**2, 16_384),
+    )
+    storage_roles: list[StorageRole] = []
+    for slot in slots:
+        storage_roles.append(StorageRole(
+            role_id=f"task-{slot.slot_id}", kind="task_slot", path=slot.path,
+            mount_path=mount_path, filesystem_uuid=slot.filesystem_uuid,
+            project_id=slot.project_id, byte_limit=slot.byte_limit,
+            inode_limit=slot.inode_limit, owner_uid=os.geteuid(), owner_gid=os.getegid(),
+        ))
+    for index, (kind, role_id, path, byte_limit, inode_limit) in enumerate(role_data):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        storage_roles.append(StorageRole(
+            role_id=role_id, kind=kind, path=path, mount_path=mount_path,
+            filesystem_uuid="11111111-1111-4111-8111-111111111111",
+            project_id=29100 + index, byte_limit=byte_limit,
+            inode_limit=inode_limit, owner_uid=os.geteuid(), owner_gid=os.getegid(),
+        ))
+    broker_state = next(role.path for role in storage_roles if role.kind == "broker_state")
     return BrokerConfig(
-        state_dir=root,
+        state_dir=broker_state,
         podman=podman,
         image=f"registry.invalid/synai-test@{IMAGE_DIGEST}",
         image_digest=IMAGE_DIGEST,
@@ -81,13 +115,14 @@ def config(root: Path, *, podman: str = "podman", slot_count: int = 1) -> Broker
         broker_cert_file=root / "broker.pem",
         broker_key_file=root / "broker.key",
         quota_slots=slots,
+        storage_roles=tuple(storage_roles),
     )
 
 
 class FakeQuotaInspector:
-    def inspect(self, slot: QuotaSlot, *, uid: int, gid: int) -> QuotaUsage:
-        del uid, gid
-        return QuotaUsage(slot.byte_limit, slot.inode_limit, 0, 0)
+    def inspect(self, role_id: str) -> QuotaUsage:
+        del role_id
+        return QuotaUsage(1, 1, 0, 0)
 
 
 class FakeQuotaManager:
@@ -97,6 +132,7 @@ class FakeQuotaManager:
         self.inspector = FakeQuotaInspector()
         self.verified = True
         self.verified_slot_ids = frozenset(slot.slot_id for slot in selected.quota_slots)
+        self.runtime_containment_available = True
 
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         return True, ()
@@ -165,6 +201,122 @@ def claim(
         replay_nonce=replay_nonce,
         request_id=request_id,
     )
+
+
+def _observation_wire(
+    request: dict[str, object],
+    role: StorageRole,
+    changes: dict[str, object] | None = None,
+) -> dict[str, object]:
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "message_type": "storage_inspection_result",
+        "role_id": role.role_id,
+        "challenge": request["challenge"],
+        "status": "ok",
+        "helper_boot_epoch": "a" * 32,
+        "inventory_generation": request["inventory_generation"],
+        "observed_at": int(time.time()),
+        "filesystem_uuid": role.filesystem_uuid,
+        "mount_target": str(role.mount_path),
+        "mount_id": 10,
+        "filesystem_type": "ext4",
+        "quota_mode": "project",
+        "quota_configuration_enabled": True,
+        "project_id": role.project_id,
+        "inheritance_enabled": True,
+        "byte_limit": role.byte_limit,
+        "inode_limit": role.inode_limit,
+        "bytes_used": 0,
+        "inodes_used": 0,
+        "filesystem_bytes": 16 * 1024**3,
+        "filesystem_bytes_available": 16 * 1024**3,
+        "filesystem_inodes": 262_144,
+        "filesystem_inodes_available": 262_144,
+        "owner_uid": role.owner_uid,
+        "owner_gid": role.owner_gid,
+    }
+    value.update(changes or {})
+    return value
+
+
+class _InspectorTestServer:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        uid: int,
+        gid: int,
+        role: StorageRole,
+        generation: str,
+        response_factory: object,
+    ) -> None:
+        import threading
+
+        self.path = path
+        self.uid = uid
+        self.gid = gid
+        self.role = role
+        self.generation = generation
+        self.response_factory = response_factory
+        self.listener: socket.socket | None = None
+        self.thread: threading.Thread | None = None
+        self.stopping = threading.Event()
+
+    def start(self) -> None:
+        import threading
+
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        self.listener.listen(4)
+        self.listener.settimeout(0.05)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stopping.set()
+        if self.listener is not None:
+            self.listener.close()
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+        self.path.unlink(missing_ok=True)
+
+    def _serve(self) -> None:
+        assert self.listener is not None
+        while not self.stopping.is_set():
+            try:
+                connection, _ = self.listener.accept()
+            except (TimeoutError, OSError):
+                continue
+            with connection:
+                try:
+                    header = _recv_exact(connection, 4)
+                    size = int.from_bytes(header, "big")
+                    request = json.loads(_recv_exact(connection, size))
+                    if (
+                        request.get("role_id") != self.role.role_id
+                        or request.get("inventory_generation") != self.generation
+                    ):
+                        continue
+                    result = self.response_factory(request, self.role)
+                    if not isinstance(result, dict):
+                        continue
+                    encoded = json.dumps(result, separators=(",", ":")).encode()
+                    connection.sendall(len(encoded).to_bytes(4, "big") + encoded)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+
+
+def _recv_exact(connection: socket.socket, size: int) -> bytes:
+    result = bytearray()
+    while len(result) < size:
+        chunk = connection.recv(size - len(result))
+        if not chunk:
+            raise OSError("socket closed")
+        result.extend(chunk)
+    return bytes(result)
 
 
 class FakeSnapshotRetriever:
@@ -257,65 +409,272 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         self.registry = BrokerRegistry(self.selected)
         self.registry.initialize()
         self.slot = self.selected.quota_slots[0]
+        self._production_test_inspector = None
 
     def tearDown(self) -> None:
+        if self._production_test_inspector is not None:
+            self._production_test_inspector.stop()
         self.temporary.cleanup()
 
-    def manager(self, usage: QuotaUsage | None = None) -> QuotaSlotManager:
+    def production_client(self, response_factory: object) -> UnixStorageInspectorClient:
+        if self._production_test_inspector is not None:
+            self._production_test_inspector.stop()
+        role = self.selected.storage_roles[0]
+        generation = inventory_generation(self.selected.storage_roles)
+        self._production_test_inspector = _InspectorTestServer(
+            self.root / "inspector.sock",
+            uid=self.selected.inspector_uid,
+            gid=self.selected.inspector_gid,
+            role=role,
+            generation=generation,
+            response_factory=response_factory,
+        )
+        self._production_test_inspector.start()
+        client = UnixStorageInspectorClient(
+            self._production_test_inspector.path,
+            self.selected.storage_roles,
+            inspector_uid=os.geteuid(),
+            inspector_gid=os.getegid(),
+            timeout_seconds=0.25,
+            max_age_seconds=5,
+            inventory_generation=generation,
+        )
+        return client
+
+    def test_typed_inspector_accepts_bound_fresh_response(self) -> None:
+        client = self.production_client(lambda request, role: _observation_wire(request, role))
+        value = client.inspect(self.selected.storage_roles[0].role_id)
+        self.assertEqual(value.role_id, self.selected.storage_roles[0].role_id)
+
+    def test_typed_inspector_rejects_challenge_generation_and_stale_response(self) -> None:
+        for mutation, error in (
+            ({"challenge": "0" * 64}, InspectorInvalid),
+            ({"inventory_generation": "0" * 64}, InspectorInvalid),
+            ({"observed_at": int(time.time()) - 60}, InspectorStale),
+        ):
+            with self.subTest(mutation=mutation):
+                client = self.production_client(
+                    lambda request, role, mutation=mutation: _observation_wire(
+                        request, role, mutation,
+                    ),
+                )
+                with self.assertRaises(error):
+                    client.inspect(self.selected.storage_roles[0].role_id)
+
+    def test_typed_inspector_rejects_wrong_peer_and_unconfigured_role(self) -> None:
+        client = self.production_client(lambda request, role: _observation_wire(request, role))
+        with patch.object(
+            client, "_verify_peer",
+            side_effect=InspectorInvalid("simulated unauthorized peer"),
+        ), self.assertRaises(InspectorInvalid):
+            client.inspect(self.selected.storage_roles[0].role_id)
+        with self.assertRaises(InspectorInvalid):
+            client.inspect("../etc")
+
+    def test_typed_request_parser_rejects_unapproved_role_and_extra_path_fields(self) -> None:
+        role_id = self.selected.storage_roles[0].role_id
+        generation = inventory_generation(self.selected.storage_roles)
+        request = StorageInspectionRequest.issue(role_id, generation)
+        parsed = StorageInspectionRequest.parse(
+            request.to_wire(),
+            approved_roles=frozenset({role_id}),
+            expected_generation=generation,
+        )
+        self.assertEqual(parsed.role_id, role_id)
+        with self.assertRaises(InspectorInvalid):
+            StorageInspectionRequest.parse(
+                {**request.to_wire(), "path": "/etc"},
+                approved_roles=frozenset({role_id}),
+                expected_generation=generation,
+            )
+        with self.assertRaises(InspectorInvalid):
+            StorageInspectionRequest.parse(
+                {**request.to_wire(), "role_id": "unapproved"},
+                approved_roles=frozenset({role_id}),
+                expected_generation=generation,
+            )
+
+    def test_typed_inspector_reports_timeout_and_replay(self) -> None:
+        server = _InspectorTestServer(
+            self.root / "slow.sock",
+            uid=os.geteuid(), gid=os.getegid(),
+            role=self.selected.storage_roles[0],
+            generation=inventory_generation(self.selected.storage_roles),
+            response_factory=lambda request, role: time.sleep(0.5),
+        )
+        self._production_test_inspector = server
+        server.start()
+        client = UnixStorageInspectorClient(
+            server.path, self.selected.storage_roles,
+            inspector_uid=os.geteuid(), inspector_gid=os.getegid(),
+            timeout_seconds=0.05, max_age_seconds=5,
+            inventory_generation=inventory_generation(self.selected.storage_roles),
+        )
+        with self.assertRaises(InspectorUnavailable):
+            client.inspect(self.selected.storage_roles[0].role_id)
+
+    def test_typed_inspector_rejects_replayed_response_and_boot_epoch_change(self) -> None:
+        role = self.selected.storage_roles[0]
+        replayed: dict[str, object] = {}
+
+        def replay_response(request: dict[str, object], selected_role: StorageRole) -> dict[str, object]:
+            if not replayed:
+                replayed.update(_observation_wire(request, selected_role))
+            return dict(replayed)
+
+        client = self.production_client(replay_response)
+        client.inspect(role.role_id)
+        with self.assertRaises(InspectorInvalid):
+            client.inspect(role.role_id)
+
+        def epoch_response(request: dict[str, object], selected_role: StorageRole) -> dict[str, object]:
+            epoch = "a" * 32 if not replayed.get("second_epoch") else "b" * 32
+            value = _observation_wire(request, selected_role, {"helper_boot_epoch": epoch})
+            replayed["second_epoch"] = True
+            return value
+
+        replayed.clear()
+        client = self.production_client(epoch_response)
+        client.inspect(role.role_id)
+        with self.assertRaises(InspectorStale):
+            client.inspect(role.role_id)
+
+    def manager(self, changed_role: str | None = None, change: dict[str, object] | None = None) -> QuotaSlotManager:
         class Inspector:
-            def inspect(inner_self, slot: QuotaSlot, *, uid: int, gid: int) -> QuotaUsage:
-                del uid, gid
-                return usage or QuotaUsage(slot.byte_limit, slot.inode_limit, 0, 0)
+            def inspect(inner_self, role_id: str) -> StorageObservation:
+                role = next(item for item in self.selected.storage_roles if item.role_id == role_id)
+                values: dict[str, object] = {
+                    "role_id": role.role_id,
+                    "helper_boot_epoch": "a" * 32,
+                    "inventory_generation": inventory_generation(self.selected.storage_roles),
+                    "observed_at": int(time.time()),
+                    "filesystem_uuid": role.filesystem_uuid,
+                    "mount_target": str(role.mount_path),
+                    "mount_id": 10,
+                    "filesystem_type": "ext4",
+                    "quota_mode": "project",
+                    "quota_configuration_enabled": True,
+                    "project_id": role.project_id,
+                    "inheritance_enabled": True,
+                    "byte_limit": role.byte_limit,
+                    "inode_limit": role.inode_limit,
+                    "bytes_used": 0,
+                    "inodes_used": 0,
+                    "filesystem_bytes": self.selected.quota_volume_bytes,
+                    "filesystem_bytes_available": self.selected.quota_volume_bytes,
+                    "filesystem_inodes": self.selected.quota_volume_inodes,
+                    "filesystem_inodes_available": self.selected.quota_volume_inodes,
+                    "owner_uid": role.owner_uid,
+                    "owner_gid": role.owner_gid,
+                }
+                if role_id == changed_role and change:
+                    values.update(change)
+                return StorageObservation(**values)  # type: ignore[arg-type]
 
         return QuotaSlotManager(self.selected, self.registry, Inspector())
 
     def verify_manager(self, manager: QuotaSlotManager) -> tuple[bool, tuple[str, ...]]:
-        with (
-            patch.object(quota_slots_module, "_process_identity_is_restricted", return_value=True),
-            patch.object(
-                quota_slots_module.os, "stat",
-                side_effect=lambda path: SimpleNamespace(
-                    st_dev=1 if Path(path) == self.selected.state_dir else 2,
-                ),
-            ),
-            patch.object(
-                quota_slots_module.os, "statvfs",
-                return_value=SimpleNamespace(
-                    f_bavail=10_000_000, f_frsize=4096,
-                    f_favail=10_000_000, f_blocks=10_000_000,
-                ),
-            ),
-        ):
+        with patch.object(quota_slots_module, "_process_identity_is_restricted", return_value=True):
             return manager.verify_startup()
 
-    def test_startup_accepts_exact_live_limits_and_inventory(self) -> None:
+    def test_mock_observations_never_enable_production_readiness(self) -> None:
         manager = self.manager()
         verified, reasons = self.verify_manager(manager)
-        self.assertTrue(verified, reasons)
-        self.assertEqual(manager.verified_slot_ids, frozenset({"slot-00"}))
+        self.assertFalse(verified, reasons)
+        self.assertIn("storage_inspector_untrusted", reasons)
+        self.assertFalse(manager.verified_slot_ids)
 
     def test_startup_rejects_incorrect_byte_and_inode_limits(self) -> None:
-        for live in (
-            QuotaUsage(self.slot.byte_limit - 1024, self.slot.inode_limit, 0, 0),
-            QuotaUsage(self.slot.byte_limit, self.slot.inode_limit - 1, 0, 0),
+        for change in (
+            {"byte_limit": self.slot.byte_limit - 1024},
+            {"inode_limit": self.slot.inode_limit - 1},
+            {"project_id": self.slot.project_id + 1},
+            {"inheritance_enabled": False},
+            {"quota_configuration_enabled": False},
         ):
-            with self.subTest(live=live):
-                manager = self.manager(live)
+            with self.subTest(change=change):
+                manager = self.manager("task-slot-00", change)
                 verified, reasons = self.verify_manager(manager)
                 self.assertFalse(verified)
-                self.assertIn("quota_slot_unverified:slot-00", reasons)
+                self.assertIn("storage_role_inconsistent:task-slot-00", reasons)
                 self.assertFalse(manager.verified_slot_ids)
 
     def test_startup_fails_closed_when_inspection_is_inconclusive(self) -> None:
         class UnavailableInspector:
-            def inspect(inner_self, slot: QuotaSlot, *, uid: int, gid: int) -> QuotaUsage:
-                del slot, uid, gid
+            def inspect(inner_self, role_id: str) -> StorageObservation:
+                del role_id
                 raise BrokerError("workspace_quota_unreadable", "quota query unavailable", 503)
 
         manager = QuotaSlotManager(self.selected, self.registry, UnavailableInspector())
         verified, reasons = self.verify_manager(manager)
         self.assertFalse(verified)
-        self.assertIn("quota_slot_unverified:slot-00", reasons)
+        self.assertIn("storage_role_inconsistent:task-slot-00", reasons)
+
+    def test_shared_filesystem_with_separate_project_domains_is_valid(self) -> None:
+        self.selected.validate()
+        manager = self.manager()
+        observations = {
+            role.role_id: manager.inspector.inspect(role.role_id)
+            for role in self.selected.storage_roles
+        }
+        self.assertEqual(aggregate_storage_reasons(self.selected, observations), ())
+
+    def test_aggregate_headroom_accounts_for_every_remaining_role_entitlement(self) -> None:
+        manager = self.manager()
+        baseline = {
+            role.role_id: manager.inspector.inspect(role.role_id)
+            for role in self.selected.storage_roles
+        }
+        role = self.selected.storage_roles[0]
+        for field in ("filesystem_bytes_available", "filesystem_inodes_available"):
+            with self.subTest(field=field):
+                observations = dict(baseline)
+                observations[role.role_id] = StorageObservation(
+                    **{**baseline[role.role_id].__dict__, field: 1},
+                )
+                self.assertEqual(
+                    aggregate_storage_reasons(self.selected, observations),
+                    ("storage_aggregate_headroom",),
+                )
+
+    def test_root_backed_storage_role_is_rejected(self) -> None:
+        role = next(item for item in self.selected.storage_roles if item.kind == "broker_logs")
+        bad = replace(role, mount_path=Path("/"))
+        with self.assertRaises(ValueError):
+            bad.validate()
+
+    def test_storage_role_config_requires_complete_roles_and_safe_bounds(self) -> None:
+        incomplete = replace(self.selected, storage_roles=self.selected.storage_roles[:-1])
+        with self.assertRaises(ValueError):
+            incomplete.validate()
+        root_role = replace(
+            self.selected.storage_roles[1],
+            path=Path("/tmp/broker-store"), mount_path=Path("/"),
+        )
+        with self.assertRaises(ValueError):
+            root_role.validate()
+
+    def test_inspector_failure_states_have_distinct_readiness_reasons(self) -> None:
+        from synai.broker.storage_inspector import InspectorStale
+
+        class StaleInspector:
+            def inspect(inner_self, role_id: str) -> StorageObservation:
+                raise InspectorStale(f"stale {role_id}")
+
+        manager = QuotaSlotManager(self.selected, self.registry, StaleInspector())
+        verified, reasons = self.verify_manager(manager)
+        self.assertFalse(verified)
+        self.assertTrue(any(reason.startswith("storage_role_stale:") for reason in reasons))
+
+    def test_quota_drift_invalidates_after_a_previous_good_inspection(self) -> None:
+        manager = self.manager()
+        first, _ = self.verify_manager(manager)
+        self.assertFalse(first)
+        self.assertFalse(manager.verified_slot_ids)
+        drifted = self.manager("task-slot-00", {"byte_limit": self.slot.byte_limit - 4096})
+        verified, reasons = self.verify_manager(drifted)
+        self.assertFalse(verified)
+        self.assertIn("storage_role_inconsistent:task-slot-00", reasons)
 
     def test_task_root_is_created_before_staging_and_project_inheritance_is_checked(self) -> None:
         request = claim("prepare", {})
@@ -326,7 +685,7 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         with patch.object(
             quota_slots_module, "_project_attributes",
             return_value=(self.slot.project_id, quota_slots_module._FS_XFLAG_PROJINHERIT),
-        ):
+        ), patch.object(manager, "_verify_local_role_path"):
             task_root = manager.create_task_root(request.task_id)
         self.assertTrue(task_root.is_dir())
         self.assertEqual(task_root.stat().st_uid, self.selected.service_uid)
@@ -341,8 +700,9 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         external = Path(self.temporary.name) / "outside"
         external.mkdir()
         task_root.symlink_to(external, target_is_directory=True)
-        with self.assertRaises(BrokerError):
-            manager.resolve_task_root(request.task_id)
+        with patch.object(manager, "_verify_local_role_path"):
+            with self.assertRaises(BrokerError):
+                manager.resolve_task_root(request.task_id)
         self.assertEqual(
             self.registry.task_slot(request.task_id, allow_quarantined=True)["state"],
             "quarantined",
@@ -351,96 +711,27 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         another = claim(
             "prepare", {}, task_id="2" * 32, project_id="3" * 32, snapshot_id="4" * 32,
         )
-        other_config = config(Path(self.temporary.name) / "other-broker")
+        other_config = config(Path(self.temporary.name) / "other" / "broker")
         other_registry = BrokerRegistry(other_config)
         other_registry.initialize()
         other_registry.authorize(another, sign_claim(another, CLAIM_PRIVATE))
         other_manager = self.manager()
+        other_manager.config = other_config
         other_manager.registry = other_registry
         other_manager.verified = True
         other_manager.verified_slot_ids = frozenset({"slot-00"})
         with patch.object(
             quota_slots_module, "_project_attributes", return_value=(42, 0),
+        ), patch.object(
+            other_manager, "_verify_observation",
+        ), patch.object(
+            other_manager, "_verify_local_role_path",
         ), self.assertRaises(BrokerError):
             other_manager.create_task_root(another.task_id)
         self.assertEqual(
             other_registry.task_slot(another.task_id, allow_quarantined=True)["state"],
             "quarantined",
         )
-
-    def test_linux_inspector_rejects_mount_and_project_identity_failures(self) -> None:
-        valid_mount = quota_slots_module._Mount(
-            mount_id=1, device="8:1", root="/", target=str(self.slot.mount_path),
-            mount_options=frozenset({"rw", "prjquota"}), filesystem="ext4",
-            super_options=frozenset({"rw"}),
-        )
-        good_usage = QuotaUsage(self.slot.byte_limit, self.slot.inode_limit, 0, 0)
-        good_flags = quota_slots_module._FS_XFLAG_PROJINHERIT
-
-        def inspect_with(*, mounts: tuple[object, ...] | None = None,
-                         project_id: int | None = None, flags: int | None = None,
-                         device_check: bool = True, quota_readable: bool = True) -> None:
-            mount_pair = mounts or (valid_mount, valid_mount, valid_mount)
-            with (
-                patch.object(
-                    quota_slots_module, "_open_directory_chain",
-                    side_effect=((10, [10, 11]), (20, [20, 21, 22])),
-                ),
-                patch.object(quota_slots_module, "_mount_for_fd", side_effect=mount_pair),
-                patch.object(
-                    quota_slots_module, "_verify_filesystem_device",
-                    return_value=None,
-                    side_effect=ValueError("UUID mismatch") if not device_check else None,
-                ),
-                patch.object(quota_slots_module, "_verify_directory_ownership"),
-                patch.object(
-                    quota_slots_module, "_project_attributes",
-                    return_value=(
-                        self.slot.project_id if project_id is None else project_id,
-                        good_flags if flags is None else flags,
-                    ),
-                ),
-                patch.object(
-                    quota_slots_module, "_read_project_quota",
-                    return_value=good_usage,
-                    side_effect=BrokerError(
-                        "workspace_quota_unreadable", "quota disabled", 503,
-                    ) if not quota_readable else None,
-                ),
-                patch.object(quota_slots_module.os, "close"),
-            ):
-                LinuxQuotaInspector().inspect(
-                    self.slot, uid=self.selected.service_uid, gid=self.selected.service_gid,
-                )
-
-        inspect_with()
-        bad_mounts = (
-            (valid_mount, SimpleNamespace(**{**valid_mount.__dict__, "mount_id": 2}), valid_mount),
-            (
-                SimpleNamespace(**{**valid_mount.__dict__, "filesystem": "xfs"}),
-                SimpleNamespace(**{**valid_mount.__dict__, "filesystem": "xfs"}),
-                SimpleNamespace(**{**valid_mount.__dict__, "filesystem": "xfs"}),
-            ),
-            (SimpleNamespace(**{
-                **valid_mount.__dict__, "mount_options": frozenset({"rw"}),
-            }), SimpleNamespace(**{
-                **valid_mount.__dict__, "mount_options": frozenset({"rw"}),
-            }), SimpleNamespace(**{
-                **valid_mount.__dict__, "mount_options": frozenset({"rw"}),
-            })),
-        )
-        for mounts in bad_mounts:
-            with self.subTest(mounts=mounts), self.assertRaises(BrokerError):
-                inspect_with(mounts=mounts)
-        with self.assertRaises(BrokerError):
-            inspect_with(project_id=self.slot.project_id + 1)
-        with self.assertRaises(BrokerError):
-            inspect_with(flags=0)
-        with self.assertRaises(BrokerError):
-            inspect_with(device_check=False)
-        with self.assertRaises(BrokerError):
-            inspect_with(quota_readable=False)
-
 
 class DurableQuotaSlotRegistryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -614,7 +905,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
 
     def test_legacy_registry_schema_migrates_without_reassigning_old_tasks(self) -> None:
         legacy = self.prepare_claim()
-        legacy_config = config(Path(self.temporary.name) / "legacy-broker")
+        legacy_config = config(Path(self.temporary.name) / "legacy" / "broker")
         legacy_registry = BrokerRegistry(legacy_config)
         legacy_config.state_dir.mkdir(mode=0o700, exist_ok=True)
         with sqlite3.connect(legacy_registry.path) as connection:
@@ -876,11 +1167,111 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         ).workspace
         self.service.registry.initialize()
         self.service.readiness = BrokerReadiness(
-            False, False, {"workspace_quota": True}, (),
+            True, True, {"workspace_quota": True}, (),
         )
+        self.service._started = True
 
     async def asyncTearDown(self) -> None:
         self.temporary.cleanup()
+
+    async def test_dispatch_is_blocked_when_execution_readiness_is_false(self) -> None:
+        self.service.readiness = BrokerReadiness(
+            False, False, {"workspace_quota": False}, ("storage_inspector",),
+        )
+        request = claim("prepare", {})
+        with self.assertRaises(BrokerError) as unavailable:
+            await self.service.dispatch(OperationRequest(
+                schema_version=1, claim=request.to_dict(),
+                claim_signature=sign_claim(request, CLAIM_PRIVATE),
+                kind="prepare", arguments={},
+            ))
+        self.assertEqual(unavailable.exception.code, "execution_unavailable")
+
+    async def test_startup_does_not_initialize_sqlite_before_state_role_verification(self) -> None:
+        service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
+        with (
+            patch.object(service.quota_manager, "verify_storage_role", return_value=False),
+            patch.object(service.registry, "initialize") as initialize,
+        ):
+            await service.start()
+        initialize.assert_not_called()
+        self.assertFalse(service.readiness.execution_available)
+        self.assertTrue(service._started)
+
+    async def test_startup_does_not_probe_podman_when_storage_roles_are_unverified(self) -> None:
+        service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
+        with (
+            patch.object(service.quota_manager, "verify_storage_role", return_value=True),
+            patch.object(
+                service.quota_manager, "verify_startup",
+                return_value=(False, ("storage_role_unavailable",)),
+            ),
+            patch.object(service.runtime, "verify_startup", new_callable=AsyncMock) as verify_runtime,
+        ):
+            await service.start()
+        verify_runtime.assert_not_awaited()
+        self.assertFalse(service.readiness.execution_available)
+
+    async def test_storage_assurance_loss_quarantines_and_verifies_exact_container(self) -> None:
+        request = claim("prepare", {})
+        self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
+        self.service.registry.transition(request.task_id, "ready")
+        self.service.registry.reserve_container(request.task_id, request.allocation_id)
+        self.service.registry.bind_container(request.task_id, request.allocation_id, "c" * 64)
+        self.service.runtime.terminate_recorded = AsyncMock(return_value="stopped")
+        self.service.runtime.inspect_recorded = AsyncMock(
+            return_value={"State": {"Running": False}},
+        )
+
+        await self.service._handle_storage_assurance_loss(("storage_role_unavailable",))
+
+        self.service.runtime.terminate_recorded.assert_awaited_once_with(request.task_id)
+        self.service.runtime.inspect_recorded.assert_awaited_once_with(request.task_id)
+        container = self.service.registry.container_record(request.task_id)
+        self.assertEqual(container["lifecycle_state"], "terminated")
+        self.assertEqual(
+            self.service.registry.task_slot(request.task_id, allow_quarantined=True)["state"],
+            "quarantined",
+        )
+        self.assertFalse(self.service.readiness.execution_available)
+
+    async def test_storage_loss_with_unconfirmed_termination_stays_quarantined(self) -> None:
+        request = claim("prepare", {})
+        self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
+        self.service.registry.transition(request.task_id, "ready")
+        self.service.registry.reserve_container(request.task_id, request.allocation_id)
+        self.service.registry.bind_container(request.task_id, request.allocation_id, "d" * 64)
+        self.service.runtime.terminate_recorded = AsyncMock(
+            side_effect=BrokerError("termination_unconfirmed", "not stopped", 409),
+        )
+
+        await self.service._handle_storage_assurance_loss(("storage_role_stale",))
+
+        container = self.service.registry.container_record(request.task_id)
+        self.assertEqual(container["lifecycle_state"], "quarantined")
+        self.assertIn("storage_containment_unconfirmed", self.service.readiness.reasons)
+        self.assertFalse(self.service.readiness.execution_available)
+
+    async def test_storage_loss_skips_podman_when_runtime_storage_is_unverified(self) -> None:
+        request = claim("prepare", {})
+        self.service.registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
+        self.service.registry.transition(request.task_id, "ready")
+        self.service.registry.reserve_container(request.task_id, request.allocation_id)
+        self.service.registry.bind_container(request.task_id, request.allocation_id, "e" * 64)
+        self.service.quota_manager.runtime_containment_available = False
+
+        with patch.object(self.service.runtime, "_run", new_callable=AsyncMock) as run:
+            await self.service._handle_storage_assurance_loss(("storage_role_unavailable",))
+
+            with self.assertRaises(BrokerError) as blocked:
+                await self.service.runtime.terminate_recorded(request.task_id)
+            self.assertEqual(blocked.exception.code, "runtime_storage_unverified")
+            run.assert_not_awaited()
+        self.assertEqual(
+            self.service.registry.container_record(request.task_id)["lifecycle_state"],
+            "quarantined",
+        )
+        self.assertIn("storage_containment_unconfirmed", self.service.readiness.reasons)
 
     async def test_container_tmpfs_has_both_byte_and_inode_limits(self) -> None:
         runtime = RootlessPodmanRuntime(self.selected, self.service.registry)
@@ -909,7 +1300,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             "linux_security_module": False,
             "user_namespace": False,
             "approved_image_present": False,
-            "podman_storage_separate": False,
+            "storage_layout": False,
             "workspace_quota": True,
         }
         base = BrokerReadiness(
@@ -925,7 +1316,20 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
                 "apparmorEnabled": True,
                 "selinuxEnabled": False,
             },
-            "store": {"graphRoot": str(self.root / "podman-storage")},
+            "store": {
+                "graphRoot": str(next(
+                    role.path for role in self.selected.storage_roles
+                    if role.kind == "podman_graph"
+                )),
+                "runRoot": str(next(
+                    role.path for role in self.selected.storage_roles
+                    if role.kind == "podman_runtime"
+                )),
+                "imageCopyTmpDir": str(next(
+                    role.path for role in self.selected.storage_roles
+                    if role.kind == "image_scratch"
+                )),
+            },
         })
 
         async def run(*args: str, **_: object) -> str:
@@ -939,16 +1343,10 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(runtime, "_run", side_effect=run),
             patch.object(runtime_module.Path, "is_file", return_value=True),
             patch.object(runtime_module.Path, "exists", return_value=True),
-            patch.object(
-                runtime_module.os, "stat",
-                side_effect=lambda path: SimpleNamespace(
-                    st_dev=1 if Path(path) == self.selected.quota_slots[0].mount_path else 2,
-                ),
-            ),
         ):
             readiness = await runtime.verify_startup(base)
         self.assertTrue(readiness.execution_available, (readiness.reasons, readiness.checks))
-        self.assertTrue(readiness.checks["podman_storage_separate"])
+        self.assertTrue(readiness.checks["storage_layout"])
 
     async def test_prepare_and_scoped_read_uses_exact_immutable_snapshot(self) -> None:
         initial = claim("prepare", {})
@@ -1071,7 +1469,8 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             task_id, allow_quarantined=True,
         ).workspace
         service.registry.initialize()
-        service.readiness = BrokerReadiness(False, False, {"workspace_quota": True}, ())
+        service.readiness = BrokerReadiness(True, True, {"workspace_quota": True}, ())
+        service._started = True
         request = claim("prepare", {})
         payload = OperationRequest(
             schema_version=1, claim=request.to_dict(),
@@ -1125,6 +1524,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_live_lease_authority_fails_closed(self) -> None:
         service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
         service.registry.initialize()
+        service._started = True
         request = claim("prepare", {})
         payload = OperationRequest(
             schema_version=1, claim=request.to_dict(),

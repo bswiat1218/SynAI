@@ -128,26 +128,43 @@ project ID, and fixed byte/inode hard limits (at most 256 MiB and 4,096
 inodes). The initial active-container limit remains one. Claims and operation
 arguments cannot select paths, project IDs, or quota settings.
 
-The operator inventory is supplied only through
-`SYNAI_BROKER_QUOTA_SLOTS` (JSON entries with `slot_id`, `path`,
-`mount_path`, `filesystem_uuid`, `project_id`, `byte_limit`, and
-`inode_limit`). `SYNAI_BROKER_SERVICE_GID` binds the expected primary group.
-The aggregate capacity/reserve and active-task ceilings are
-`SYNAI_BROKER_QUOTA_VOLUME_BYTES`, `SYNAI_BROKER_QUOTA_RESERVE_BYTES`,
-`SYNAI_BROKER_QUOTA_RESERVE_INODES`, and
-`SYNAI_BROKER_MAX_ACTIVE_TASKS`. These are operator configuration only and
-are checked against live filesystem state.
+The operator inventories are supplied through `SYNAI_BROKER_QUOTA_SLOTS` and
+`SYNAI_BROKER_STORAGE_ROLES`. Storage roles cover each task slot, Podman graph
+and runtime storage, image scratch, Broker state, Broker logs, and temporary
+storage. They require unique project-quota domains on one approved bounded
+filesystem; separate physical filesystems are not required. The initial
+policy caps are four 256 MiB / 4,096-inode task slots, 4 GiB / 131,072 inodes
+for Podman graph storage, 512 MiB / 16,384 inodes for Podman runtime, image
+scratch, Broker state, and temporary storage, and 512 MiB / 8,192 inodes for
+Broker logs. At least 8 GiB and 16,384 inodes remain reserved. These values
+are operator policy ceilings, not measurements of the current host. Aggregate
+role entitlements plus reserves must fit both the configured filesystem size
+and live available block/inode capacity.
 
-Before readiness, the Broker checks the live ext4 mount identity and
-`prjquota`/`pquota` mount state, the UUID-to-device mapping, slot and parent
-ownership, project ID/inheritance attributes, live project hard quotas and
-usage through read-only `quotactl(Q_GETQUOTA)`, aggregate capacity/reserve,
-directory inventory, private registry identity, and absence of effective
-Linux capabilities or extra service groups. Checks use no-follow directory
-opens and kernel mount IDs. If an unprivileged Broker cannot read any required
-state, the slot is unavailable and readiness remains false. New task
-directories are created under a verified slot and their inherited project
-ID is confirmed before snapshot bytes are staged.
+Quota observation now uses protocol v1 over a local Unix-domain socket to a
+future separately confined host inspector. The Broker sends only a configured
+role ID, a random challenge, and the deterministic inventory generation.
+The A.5.1b server contract must authenticate the connecting Broker UID/GID via
+Unix peer credentials before parsing the request, and independently reject
+any role outside its fixed operator inventory; no public or client-facing
+socket is part of this interface.
+Responses bind the role, challenge, protocol version, helper boot epoch,
+inventory generation, observation time, filesystem/mount identity, quota
+configuration, project ID, ownership, hard limits, usage, and filesystem
+capacity. The client verifies the socket path and peer UID/GID, rejects
+replay, stale epochs, stale responses, schema deviations, and oversized
+frames, and uses bounded retries/timeouts. The response's quota-configuration
+field is not evidence that the kernel rejected an over-limit write.
+
+The Broker independently opens each configured path without following
+symlinks and cross-checks the mount ID, ext4 UUID/device mapping, project ID
+and inheritance attributes, `prjquota`/`pquota` mount state, directory
+ownership/permissions, and local `statvfs` capacity against the inspector
+response. It requires zero effective capabilities and no extra service
+groups. Direct `quotactl(Q_GETQUOTA)` calls have been removed from the
+unprivileged Broker. The privileged inspector is not implemented in this
+stage; until it is installed and independently reviewed, all storage
+inspection is unavailable and Broker readiness remains false.
 
 The SQLite registry transactionally binds each task and allocation to one
 fixed slot using a collision-resistant private ownership token. Slot states
@@ -160,17 +177,34 @@ confirmation that its owned container is absent. Ambiguity quarantines the
 slot. Historical tasks without assignments are preserved and block new
 workspace readiness rather than being silently relocated.
 
-For the 16 GiB candidate volume, four 256 MiB hard-limited task slots cap
-task allocation at 1 GiB total and 16,384 inodes; one active task remains the
-initial runtime acceptance limit. Each task's immutable snapshot, writable
-copy, and collected artifacts consume the same per-slot quota. The verifier
-requires at least 8 GiB of free-byte reserve and 16,384 free inodes. Up to
-7 GiB is left for ext4 metadata and additional operational headroom after
-the slot ceilings and free reserve; it is not a larger task quota. Rootless
-Podman image storage must use a different filesystem with a separately
-operator-managed capacity limit. The Broker registry and logs remain in
-private state/system logging outside the task quota filesystem and require
-their own operator-managed capacity controls.
+All persistent task files, snapshots, writable workspaces, manifests, and
+collected evidence are resolved through the durable task-to-slot assignment.
+Podman graph storage (including image layers and container writable layers),
+Podman runtime storage, image scratch, Broker SQLite/WAL state, logs, and
+temporary paths each have separate project-quota domains on the same bounded
+filesystem. Podman `HOME`, `TMPDIR`, and `XDG_RUNTIME_DIR` point into the
+inventoried bounded roles. Container `/tmp` is a private tmpfs capped by both
+bytes and inodes. Uvicorn service logs go to the private `broker.log` within
+the inventoried log project quota, and HTTP access logging is disabled. A
+different `st_dev` value is not treated as proof of a
+hard bound; a root-backed or otherwise unbounded role fails inventory checks.
+External service-manager logging policy and helper confinement still require
+deployment acceptance.
+
+For a 16 GiB candidate volume, total role entitlements and the 8 GiB /
+16,384-inode reserves must fit the observed capacity; live free capacity is
+rechecked at startup and before operations. Each task's snapshot, writable
+copy, manifests, and artifacts consume the same per-slot project quota. The
+initial one-active-container limit remains in force.
+
+When storage inspection is lost or inconsistent during active work, the
+registry durably marks operations uncertain and quarantines assigned slots.
+The Broker tries to stop only each exact recorded Broker-owned container,
+only while the independently verified Broker-state, Podman graph/runtime,
+and temporary-storage roles remain usable, then independently inspects it.
+If those roles cannot be verified, Podman containment is blocked and operator
+intervention is required. Unconfirmed termination is escalated in readiness
+and never permits slot reuse. No runtime-wide cleanup is issued.
 
 Collected change manifests (including bounded artifact payloads) are fsynced
 under the assigned task root before Core result recording. The Broker's
@@ -227,12 +261,13 @@ image, policy, and service-unit changes before applying them:
    (at least 65,536 IDs) in `/etc/subuid` and `/etc/subgid`; verify rootless
    `podman info` under that identity.
 2. Enable and verify the host's enforcing AppArmor or SELinux policy, seccomp
-   profile, user namespaces, cgroup v2 CPU/memory/PID controllers, and an
-   actual per-task plus aggregate byte/inode quota on the dedicated filesystem
-   used by `SYNAI_BROKER_QUOTA_SLOTS`. Keep `SYNAI_BROKER_STATE_DIR` and
-   rootless Podman image storage on different filesystems. Do not start the
-   service unless write-time quota behavior (including sparse files and
-   concurrent writes) is demonstrated.
+   profile, user namespaces, cgroup v2 CPU/memory/PID controllers, and actual
+   per-task plus aggregate byte/inode quotas for every configured storage role
+   on a dedicated bounded filesystem. Roles may use distinct project IDs on
+   that filesystem; physical filesystem separation is not required. Keep all
+   roles off an unbounded host-root path. Do not start the service unless
+   write-time quota behavior (including sparse files and concurrent writes)
+   is demonstrated and the A.5.1b inspector has passed independent review.
 3. Create a Broker-only state directory and rootless Podman storage/run
    directories with restrictive ownership and modes. Do not share Podman
    sockets, storage, or credentials with Core. Place Core and Broker
@@ -286,11 +321,13 @@ That package is not an independent security review or runtime acceptance.
 | Durable operation provenance and Core result validation | Core metadata tables and bounded artifact recomputation | authority tests | PASS (unit) |
 | Uncertain side effects are not replayed | Broker operation registry and startup state transition | `test_restart_reports_durable_uncertainty_without_replaying_operation` | PASS (unit) |
 | Owned-container restart reconciliation | Registry-scoped inspect and verified-stop path | Real Podman restart/tamper/loss tests not run | BLOCKED |
-| Aggregate writable byte/inode quota | Fixed project-quota slots, durable allocation, live fail-closed verifier | Broker quota-slot unit tests; no dedicated production filesystem or Broker identity | IMPLEMENTED (unit only); BLOCKED (runtime) |
+| Aggregate writable byte/inode quota | Fixed project-quota slots, bounded role inventory, typed inspector client, durable allocation | Broker quota-slot/protocol tests; no privileged inspector or production filesystem/identity | INTERFACES IMPLEMENTED; BLOCKED (kernel integration) |
 | Rootless isolation, LSM, network/resource limits | Fixed Podman options plus startup probes | No approved local image, separate UID, or enforcing LSM | BLOCKED |
-| No host fallback or browser execution | No Core runtime socket/API; no task route wiring | Static architecture and existing regressions | PASS (code path; regressions pending) |
+| No host fallback or browser execution | No Core runtime socket/API; no task route wiring | Static architecture, Python suite, frontend regressions | PASS (code path and regressions) |
 
 No skipped or mocked runtime test is counted as a security pass. Until every
 mandatory implementation and runtime rows pass and an independent security
-review accepts the boundary, execution remains unavailable. Current
-classification: **NOT READY — SECURITY IMPLEMENTATION GAPS**.
+review accepts the boundary, execution remains unavailable. The A.5.1a
+protocol and storage-role policy are code-only interfaces; the privileged
+inspector and real rootless-container acceptance are still absent. Current
+classification: **NOT READY — INSPECTOR AND PRODUCTION ACCEPTANCE BLOCKED**.

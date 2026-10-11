@@ -18,7 +18,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from synai.broker.config import BrokerConfig
+from synai.broker.config import BrokerConfig, BrokerReadiness
 from synai.broker.operations import execute_file_operation, validate_claim_operation
 from synai.broker.protocol import (
     MAX_REQUEST_BYTES,
@@ -80,14 +80,16 @@ class BrokerService:
         operation_starter: OperationStarter | None = None,
         result_recorder: ResultRecorder | None = None,
         operation_outcome_recorder: OperationOutcomeRecorder | None = None,
-        quota_manager: Any | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.registry = BrokerRegistry(config)
         self.runtime = RootlessPodmanRuntime(config, self.registry)
         from synai.broker.quota_slots import QuotaSlotManager
-        self.quota_manager = quota_manager or QuotaSlotManager(config, self.registry)
+        self.quota_manager = QuotaSlotManager(config, self.registry)
+        self.runtime.storage_containment_check = (
+            lambda: self.quota_manager.runtime_containment_available
+        )
         self.runtime.workspace_resolver = lambda task_id: self.task_paths(
             task_id, allow_quarantined=True,
         ).workspace
@@ -109,19 +111,41 @@ class BrokerService:
             None if self.core_client is None else self.core_client.record_operation_state
         )
         self.readiness = None
+        self._started = False
         self._task_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
+        state_role = next(
+            (role for role in self.config.storage_roles if role.kind == "broker_state"),
+            None,
+        )
+        if (
+            state_role is None
+            or not await asyncio.to_thread(
+                self.quota_manager.verify_storage_role, state_role.role_id,
+            )
+        ):
+            self.readiness = _readiness_with_storage(self.config, False)
+            self._started = True
+            return
         self.registry.initialize()
         quota_ready, _ = self.quota_manager.verify_startup()
-        base = self.config.readiness(workspace_quota_verified=quota_ready)
-        self.readiness = await self.runtime.verify_startup(base)
+        base = _readiness_with_storage(self.config, quota_ready)
+        if quota_ready:
+            self.readiness = await self.runtime.verify_startup(base)
+        else:
+            self.readiness = base
         await self.recover()
-        self.quota_manager.recover_pending_releases()
-        quota_ready, _ = self.quota_manager.verify_startup()
-        self.readiness = await self.runtime.verify_startup(
-            self.config.readiness(workspace_quota_verified=quota_ready),
-        )
+        if quota_ready:
+            self.quota_manager.recover_pending_releases()
+            quota_ready, _ = self.quota_manager.verify_startup()
+            if quota_ready:
+                self.readiness = await self.runtime.verify_startup(
+                    _readiness_with_storage(self.config, quota_ready),
+                )
+            else:
+                self.readiness = _readiness_with_storage(self.config, False)
+        self._started = True
 
     def task_paths(self, task_id: str, *, allow_quarantined: bool = False) -> TaskWorkspacePaths:
         root = self.quota_manager.resolve_task_root(
@@ -154,9 +178,7 @@ class BrokerService:
             slot for slot in self.config.quota_slots
             if slot.slot_id == assignment["slot_id"]
         )
-        self.quota_manager.inspector.inspect(
-            selected, uid=self.config.service_uid, gid=self.config.service_gid,
-        )
+        self.quota_manager.inspector.inspect(f"task-{selected.slot_id}")
         self.registry.release_slot(task_id, evidence)
 
     async def close(self) -> None:
@@ -227,6 +249,12 @@ class BrokerService:
                 )
 
     async def dispatch(self, payload: OperationRequest) -> dict[str, Any]:
+        if not self._started:
+            raise BrokerError(
+                "broker_not_ready",
+                "Broker startup verification has not completed.",
+                503,
+            )
         try:
             claim = TaskClaim.from_dict(payload.claim)
             verify_claim(claim, payload.claim_signature, self.config.claim_key)
@@ -255,6 +283,22 @@ class BrokerService:
             raise BrokerError("lease_authority_unavailable", "Current task lease authority is unavailable.", 503) from exc
         if current_lease is not True:
             raise BrokerError("stale_fence", "Task lease is stale or no longer authorized.", 409)
+        if self.readiness is None or not self.readiness.execution_available:
+            raise BrokerError(
+                "execution_unavailable",
+                "Broker execution security readiness is not satisfied.",
+                503,
+            )
+        storage_ready, storage_reasons = await asyncio.to_thread(
+            self.quota_manager.verify_startup,
+        )
+        if not storage_ready:
+            await self._handle_storage_assurance_loss(storage_reasons)
+            raise BrokerError(
+                "storage_inspection_unavailable",
+                "Fresh bounded-storage inspection is unavailable or inconsistent.",
+                503,
+            )
         if claim.tool_kind == "prepare" and (
             self.readiness is None
             or self.readiness.checks.get("workspace_quota") is not True
@@ -358,6 +402,7 @@ class BrokerService:
                 "schema_version": 1, "operation_id": claim.operation_id,
                 "task_id": claim.task_id, "status": "completed", "result": result,
             }
+
         except BrokerError:
             if operation_completed:
                 raise
@@ -406,6 +451,56 @@ class BrokerService:
                 )
             raise
 
+    async def _handle_storage_assurance_loss(self, reasons: tuple[str, ...]) -> None:
+        reason = ",".join(reasons)[:128] or "inspection_unavailable"
+        checks = dict(self.readiness.checks) if self.readiness is not None else {}
+        checks["workspace_quota"] = False
+        checks["storage_inspector"] = False
+        checks["storage_inventory"] = False
+        self.readiness = BrokerReadiness(
+            False, False, checks,
+            tuple(dict.fromkeys((*reasons, "storage_containment_pending"))),
+        )
+        task_ids = self.registry.quarantine_all_for_storage_loss(reason)
+        unresolved: list[str] = []
+        for task_id in task_ids:
+            container = self.registry.container_record(task_id)
+            if container is None or container["lifecycle_state"] == "removed":
+                continue
+            if not self.quota_manager.runtime_containment_available:
+                unresolved.append(task_id)
+                self.registry.record_reconciliation(
+                    task_id, "quarantined",
+                    f"storage_loss_runtime_path_unverified:{int(time.time())}",
+                )
+                continue
+            if not container["container_id"]:
+                unresolved.append(task_id)
+                self.registry.record_reconciliation(
+                    task_id, "quarantined", f"storage_loss_no_container_id:{int(time.time())}",
+                )
+                continue
+            try:
+                evidence = await self.runtime.terminate_recorded(task_id)
+                await self.runtime.inspect_recorded(task_id)
+                self.registry.record_reconciliation(
+                    task_id, "terminated", f"storage_loss_verified_stop:{evidence}",
+                )
+            except (BrokerError, OSError, TimeoutError) as exc:
+                unresolved.append(task_id)
+                code = exc.code if isinstance(exc, BrokerError) else "runtime_unavailable"
+                self.registry.record_reconciliation(
+                    task_id, "quarantined",
+                    f"storage_loss_containment_unconfirmed:{code}:{int(time.time())}",
+                )
+        if unresolved:
+            checks = dict(self.readiness.checks)
+            checks["storage_containment_confirmed"] = False
+            self.readiness = BrokerReadiness(
+                False, False, checks,
+                tuple(dict.fromkeys((*self.readiness.reasons, "storage_containment_unconfirmed"))),
+            )
+
     async def _execute_with_lease_monitor(
         self,
         claim: TaskClaim,
@@ -423,6 +518,30 @@ class BrokerService:
                 done, _ = await asyncio.wait({operation}, timeout=2)
                 if done:
                     return operation.result()
+                try:
+                    storage_ready, storage_reasons = await asyncio.to_thread(
+                        self.quota_manager.verify_startup,
+                    )
+                except (BrokerError, OSError, ValueError, sqlite3.Error):
+                    self.quota_manager.runtime_containment_available = False
+                    storage_ready = False
+                    storage_reasons = ("storage_verification_failed",)
+                if not storage_ready:
+                    try:
+                        await self._handle_storage_assurance_loss(storage_reasons)
+                    finally:
+                        operation.cancel()
+                        try:
+                            await operation
+                        except (
+                            asyncio.CancelledError, BrokerError, OSError, TimeoutError,
+                        ):
+                            pass
+                    raise BrokerError(
+                        "storage_inspection_unavailable",
+                        "Storage assurance was lost during task execution.",
+                        503,
+                    )
                 try:
                     valid = await asyncio.wait_for(
                         self.lease_validator(claim, signature),
@@ -778,7 +897,18 @@ def _remove_task_tree(task_root: Path) -> None:
             if stat.S_ISLNK(item.st_mode) or item.st_uid != os.geteuid():
                 raise BrokerError("workspace_cleanup_refused", "Task workspace contains an untrusted filesystem entry.", 409)
     import shutil
+    import sqlite3
     shutil.rmtree(task_root)
+
+
+def _readiness_with_storage(config: BrokerConfig, storage_ready: bool) -> BrokerReadiness:
+    base = config.readiness()
+    checks = dict(base.checks)
+    checks["workspace_quota"] = storage_ready
+    checks["storage_inventory"] = bool(config.storage_roles) and storage_ready
+    checks["storage_inspector"] = config.inspector_socket is not None and storage_ready
+    reasons = tuple(name for name, passed in checks.items() if not passed)
+    return BrokerReadiness(not reasons, not reasons, checks, reasons)
 
 
 def _persist_artifact_evidence(task_root: Path, operation_id: str, content: bytes) -> None:

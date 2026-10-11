@@ -13,6 +13,20 @@ from pathlib import Path
 _DIGEST = re.compile(r"sha256:[a-f0-9]{64}\Z")
 _PROFILE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 _UUID = re.compile(r"[a-fA-F0-9-]{36}\Z")
+_STORAGE_ROLE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
+_STORAGE_KINDS = frozenset({
+    "task_slot", "podman_graph", "podman_runtime", "image_scratch",
+    "broker_state", "broker_logs", "temporary",
+})
+_STORAGE_CAPS = {
+    "task_slot": (256 * 1024 * 1024, 4096),
+    "podman_graph": (4 * 1024 * 1024 * 1024, 131_072),
+    "podman_runtime": (512 * 1024 * 1024, 16_384),
+    "image_scratch": (512 * 1024 * 1024, 16_384),
+    "broker_state": (512 * 1024 * 1024, 16_384),
+    "broker_logs": (512 * 1024 * 1024, 8192),
+    "temporary": (512 * 1024 * 1024, 16_384),
+}
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,7 @@ class QuotaSlot:
             or self.mount_path != Path(os.path.normpath(self.mount_path))
             or not self.path.is_relative_to(self.mount_path)
             or self.path == self.mount_path
+            or self.mount_path == Path("/")
             or self.path.name != self.slot_id
             or self.path.parent != self.mount_path / "tasks"
             or not isinstance(self.filesystem_uuid, str)
@@ -68,6 +83,70 @@ class QuotaSlot:
             or not 128 <= self.inode_limit <= 4096
         ):
             raise ValueError("Quota slot configuration exceeds the fixed safety policy")
+
+
+@dataclass(frozen=True)
+class StorageRole:
+    role_id: str
+    kind: str
+    path: Path
+    mount_path: Path
+    filesystem_uuid: str
+    project_id: int
+    byte_limit: int
+    inode_limit: int
+    owner_uid: int
+    owner_gid: int
+
+    @classmethod
+    def from_dict(cls, value: object) -> StorageRole:
+        if not isinstance(value, dict) or set(value) != {
+            "role_id", "kind", "path", "mount_path", "filesystem_uuid",
+            "project_id", "byte_limit", "inode_limit", "owner_uid", "owner_gid",
+        }:
+            raise ValueError("Storage role configuration has an invalid shape")
+        try:
+            return cls(
+                role_id=value["role_id"],
+                kind=value["kind"],
+                path=Path(value["path"]),
+                mount_path=Path(value["mount_path"]),
+                filesystem_uuid=value["filesystem_uuid"],
+                project_id=value["project_id"],
+                byte_limit=value["byte_limit"],
+                inode_limit=value["inode_limit"],
+                owner_uid=value["owner_uid"],
+                owner_gid=value["owner_gid"],
+            )
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Storage role configuration is incomplete") from exc
+
+    def validate(self) -> None:
+        maximum_bytes, maximum_inodes = _STORAGE_CAPS.get(self.kind, (0, 0))
+        if (
+            not isinstance(self.role_id, str)
+            or not _STORAGE_ROLE_ID.fullmatch(self.role_id)
+            or self.kind not in _STORAGE_KINDS
+            or not self.path.is_absolute()
+            or self.path != Path(os.path.normpath(self.path))
+            or not self.mount_path.is_absolute()
+            or self.mount_path != Path(os.path.normpath(self.mount_path))
+            or not self.path.is_relative_to(self.mount_path)
+            or self.path == self.mount_path
+            or self.mount_path == Path("/")
+            or not isinstance(self.filesystem_uuid, str)
+            or not _UUID.fullmatch(self.filesystem_uuid)
+            or str(uuid.UUID(self.filesystem_uuid)) != self.filesystem_uuid.lower()
+            or type(self.project_id) is not int
+            or not 1 <= self.project_id <= 0xFFFFFFFF
+            or type(self.byte_limit) is not int
+            or not 1024 <= self.byte_limit <= maximum_bytes
+            or type(self.inode_limit) is not int
+            or not 16 <= self.inode_limit <= maximum_inodes
+            or type(self.owner_uid) is not int or self.owner_uid < 0
+            or type(self.owner_gid) is not int or self.owner_gid < 0
+        ):
+            raise ValueError("Storage role exceeds its fixed safety policy")
 
 
 @dataclass(frozen=True)
@@ -117,7 +196,14 @@ class BrokerConfig:
     core_port: int = 8767
     profile: ResourceProfile = DEFAULT_PROFILE
     quota_slots: tuple[QuotaSlot, ...] = ()
+    storage_roles: tuple[StorageRole, ...] = ()
+    inspector_socket: Path | None = None
+    inspector_uid: int = 0
+    inspector_gid: int = 0
+    inspector_timeout_seconds: float = 0.5
+    inspector_max_age_seconds: int = 5
     quota_volume_bytes: int = 16 * 1024 * 1024 * 1024
+    quota_volume_inodes: int = 262_144
     quota_reserve_bytes: int = 8 * 1024 * 1024 * 1024
     quota_reserve_inodes: int = 16_384
     max_active_tasks: int = 1
@@ -157,10 +243,78 @@ class BrokerConfig:
             raise ValueError("Quota slot paths must be unique")
         if len({slot.project_id for slot in self.quota_slots}) != len(self.quota_slots):
             raise ValueError("Quota project identifiers must be unique")
-        if any(slot.mount_path != self.quota_slots[0].mount_path for slot in self.quota_slots):
-            raise ValueError("All Broker quota slots must use one dedicated filesystem")
         for slot in self.quota_slots:
             slot.validate()
+        if len({role.role_id for role in self.storage_roles}) != len(self.storage_roles):
+            raise ValueError("Storage role identifiers must be unique")
+        if len({role.path for role in self.storage_roles}) != len(self.storage_roles):
+            raise ValueError("Storage role paths must be unique")
+        if len({
+            (role.filesystem_uuid, role.project_id) for role in self.storage_roles
+        }) != len(self.storage_roles):
+            raise ValueError("Storage roles must use distinct project-quota domains")
+        for role in self.storage_roles:
+            role.validate()
+        if self.storage_roles:
+            kinds = {role.kind for role in self.storage_roles}
+            if kinds != _STORAGE_KINDS:
+                raise ValueError("The storage inventory must cover every required Broker storage role")
+            if any(
+                sum(role.kind == kind for role in self.storage_roles) != 1
+                for kind in _STORAGE_KINDS - {"task_slot"}
+            ):
+                raise ValueError("Each non-task storage role must have exactly one configured identity")
+            if any(
+                role.filesystem_uuid != self.storage_roles[0].filesystem_uuid
+                or role.mount_path != self.storage_roles[0].mount_path
+                for role in self.storage_roles
+            ):
+                raise ValueError("Storage roles must share the configured bounded filesystem")
+            state_roles = [role for role in self.storage_roles if role.kind == "broker_state"]
+            if state_roles[0].path != self.state_dir:
+                raise ValueError("Broker state path must use its inventoried bounded storage role")
+            if any(
+                role.owner_uid != self.service_uid or role.owner_gid != self.service_gid
+                for role in self.storage_roles
+            ):
+                raise ValueError("Broker storage roles must be owned by the dedicated service identity")
+            slot_roles = {
+                role.role_id: role for role in self.storage_roles if role.kind == "task_slot"
+            }
+            if len(slot_roles) != len(self.quota_slots):
+                raise ValueError("Every quota slot must have exactly one storage role")
+            for slot in self.quota_slots:
+                role = slot_roles.get(f"task-{slot.slot_id}")
+                if role is None or (
+                    role.path != slot.path
+                    or role.mount_path != slot.mount_path
+                    or role.filesystem_uuid != slot.filesystem_uuid
+                    or role.project_id != slot.project_id
+                    or role.byte_limit != slot.byte_limit
+                    or role.inode_limit != slot.inode_limit
+                ):
+                    raise ValueError("Task storage role differs from its fixed quota-slot inventory")
+        if self.inspector_socket is not None and (
+            not self.inspector_socket.is_absolute()
+            or self.inspector_socket != Path(os.path.normpath(self.inspector_socket))
+        ):
+            raise ValueError("Inspector socket path must be absolute and canonical")
+        if (
+            type(self.inspector_uid) is not int or self.inspector_uid < 0
+            or type(self.inspector_gid) is not int or self.inspector_gid < 0
+            or type(self.inspector_timeout_seconds) not in {int, float}
+            or not 0.05 <= self.inspector_timeout_seconds <= 2
+            or type(self.inspector_max_age_seconds) is not int
+            or not 1 <= self.inspector_max_age_seconds <= 30
+        ):
+            raise ValueError("Inspector identity or timeout policy is invalid")
+        role_bytes = sum(role.byte_limit for role in self.storage_roles)
+        role_inodes = sum(role.inode_limit for role in self.storage_roles)
+        if self.storage_roles and (
+            role_bytes + self.quota_reserve_bytes > self.quota_volume_bytes
+            or role_inodes + self.quota_reserve_inodes > self.quota_volume_inodes
+        ):
+            raise ValueError("Storage-role entitlements exceed the configured aggregate policy")
         if self.quota_slots and any(
             self.profile.workspace_bytes > slot.byte_limit
             for slot in self.quota_slots
@@ -169,6 +323,8 @@ class BrokerConfig:
         if (
             type(self.quota_volume_bytes) is not int
             or not 16 * 1024 * 1024 * 1024 <= self.quota_volume_bytes <= 1024 * 1024 * 1024 * 1024
+            or type(self.quota_volume_inodes) is not int
+            or not 204_800 <= self.quota_volume_inodes <= 4_194_304
             or type(self.quota_reserve_bytes) is not int
             or self.quota_reserve_bytes < 0
             or type(self.quota_reserve_inodes) is not int
@@ -228,8 +384,18 @@ class BrokerConfig:
             listen_port=int(os.environ.get("SYNAI_BROKER_PORT", "8766")),
             core_port=int(os.environ.get("SYNAI_CORE_BROKER_PORT", "8767")),
             quota_slots=_quota_slots_from_env(),
+            storage_roles=_storage_roles_from_env(),
+            inspector_socket=(
+                Path(os.environ["SYNAI_BROKER_INSPECTOR_SOCKET"])
+                if os.environ.get("SYNAI_BROKER_INSPECTOR_SOCKET") else None
+            ),
+            inspector_uid=int(os.environ.get("SYNAI_BROKER_INSPECTOR_UID", "0")),
+            inspector_gid=int(os.environ.get("SYNAI_BROKER_INSPECTOR_GID", "0")),
             quota_volume_bytes=int(os.environ.get(
                 "SYNAI_BROKER_QUOTA_VOLUME_BYTES", str(16 * 1024 * 1024 * 1024),
+            )),
+            quota_volume_inodes=int(os.environ.get(
+                "SYNAI_BROKER_QUOTA_VOLUME_INODES", "262144",
             )),
             quota_reserve_bytes=int(os.environ.get(
                 "SYNAI_BROKER_QUOTA_RESERVE_BYTES", str(8 * 1024 * 1024 * 1024),
@@ -242,7 +408,7 @@ class BrokerConfig:
         config.validate()
         return config
 
-    def readiness(self, *, workspace_quota_verified: bool = False) -> BrokerReadiness:
+    def readiness(self) -> BrokerReadiness:
         checks: dict[str, bool] = {
             "distinct_unprivileged_identity": self.service_uid != 0 and self.service_uid != self.core_uid,
             "pinned_image_reference": bool(_DIGEST.fullmatch(self.image_digest))
@@ -262,8 +428,9 @@ class BrokerConfig:
             "seccomp_profile": Path("/usr/share/containers/seccomp.json").is_file(),
             "linux_security_module": Path("/sys/kernel/security/lsm").exists()
             and _active_lsm(),
-            "workspace_quota": workspace_quota_verified,
-            "podman_storage_separate": False,
+            "workspace_quota": False,
+            "storage_inventory": bool(self.storage_roles),
+            "storage_inspector": self.inspector_socket is not None,
             "approved_image_present": False,
         }
         reasons = tuple(name for name, passed in checks.items() if not passed)
@@ -283,6 +450,19 @@ def _quota_slots_from_env() -> tuple[QuotaSlot, ...]:
         return tuple(QuotaSlot.from_dict(entry) for entry in value)
     except (json.JSONDecodeError, ValueError) as exc:
         raise ValueError("SYNAI_BROKER_QUOTA_SLOTS must be a valid JSON array") from exc
+
+
+def _storage_roles_from_env() -> tuple[StorageRole, ...]:
+    encoded = os.environ.get("SYNAI_BROKER_STORAGE_ROLES")
+    if not encoded:
+        return ()
+    try:
+        value = json.loads(encoded)
+        if not isinstance(value, list):
+            raise ValueError
+        return tuple(StorageRole.from_dict(entry) for entry in value)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("SYNAI_BROKER_STORAGE_ROLES must be a valid JSON array") from exc
 
 
 def _decode_key(value: str) -> bytes:

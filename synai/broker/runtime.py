@@ -25,6 +25,7 @@ class RootlessPodmanRuntime:
         self.image_id: str | None = None
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
         self.workspace_resolver: Callable[[str], Path] | None = None
+        self.storage_containment_check: Callable[[], bool] | None = None
 
     async def verify_startup(self, base_readiness: BrokerReadiness | None = None) -> BrokerReadiness:
         base = base_readiness or self.config.readiness()
@@ -32,7 +33,7 @@ class RootlessPodmanRuntime:
         runtime_checks = {
             "rootless_podman", "cgroup_v2", "seccomp_profile",
             "linux_security_module", "user_namespace",
-            "approved_image_present", "podman_storage_separate",
+            "approved_image_present", "storage_layout",
         }
         reasons = [reason for reason in base.reasons if reason not in runtime_checks]
         if checks["podman_available"]:
@@ -69,13 +70,7 @@ class RootlessPodmanRuntime:
                 store = runtime.get("store", runtime.get("Store", {}))
                 if not isinstance(store, dict):
                     raise ValueError("Podman storage information is invalid")
-                graph_root = store.get("graphRoot", store.get("GraphRoot"))
-                checks["podman_storage_separate"] = (
-                    isinstance(graph_root, str)
-                    and bool(self.config.quota_slots)
-                    and os.stat(graph_root).st_dev
-                    != os.stat(self.config.quota_slots[0].mount_path).st_dev
-                )
+                checks["storage_layout"] = self._verify_reported_storage_layout(store)
                 uid_map = await self._run(
                     "unshare", "cat", "/proc/self/uid_map", timeout=10, maximum=4096,
                 )
@@ -94,12 +89,12 @@ class RootlessPodmanRuntime:
                 checks["seccomp_profile"] = False
                 checks["user_namespace"] = False
                 checks["linux_security_module"] = False
-                checks["podman_storage_separate"] = False
+                checks["storage_layout"] = False
             if not checks["rootless_podman"] and "rootless_podman" not in reasons:
                 reasons.append("rootless_podman")
             for name in (
                 "cgroup_v2", "seccomp_profile", "user_namespace",
-                "linux_security_module", "podman_storage_separate",
+                "linux_security_module", "storage_layout",
             ):
                 if not checks[name] and name not in reasons:
                     reasons.append(name)
@@ -125,6 +120,38 @@ class RootlessPodmanRuntime:
             not reasons, not reasons, checks, tuple(reasons),
         )
         return self.readiness
+
+    def _verify_reported_storage_layout(self, store: dict[str, Any]) -> bool:
+        roles = {role.kind: role for role in self.config.storage_roles}
+        expected_fields = {
+            "podman_graph": ("graphRoot", "GraphRoot"),
+            "podman_runtime": ("runRoot", "RunRoot"),
+            "image_scratch": ("imageCopyTmpDir", "ImageCopyTmpDir"),
+        }
+        for kind, names in expected_fields.items():
+            role = roles.get(kind)
+            actual = next((store.get(name) for name in names if name in store), None)
+            if role is None or not isinstance(actual, str):
+                return False
+            if Path(actual) != role.path:
+                return False
+        state = roles.get("broker_state")
+        if state is None or state.path != self.config.state_dir:
+            return False
+        temporary = roles.get("temporary")
+        if not roles.get("broker_logs") or temporary is None:
+            return False
+        try:
+            for kind in (
+                "podman_graph", "podman_runtime", "image_scratch",
+                "broker_logs", "temporary", "broker_state",
+            ):
+                role = roles[kind]
+                if not role.path.is_dir() or role.path.is_symlink():
+                    return False
+        except OSError:
+            return False
+        return True
 
     async def create_task(self, task_id: str, allocation_id: str, workspace: Path) -> str:
         if self.readiness is None:
@@ -175,9 +202,17 @@ class RootlessPodmanRuntime:
         owned = self.registry.container_record(task_id)
         if owned is None or not owned["container_id"]:
             raise BrokerError("container_not_owned", "No recorded container identity is available.", 404)
-        return await self._inspect_record(task_id, owned)
+        return await self._inspect_record(
+            task_id, owned, allow_unverified_workspace=True,
+        )
 
-    async def _inspect_record(self, task_id: str, owned: Any) -> dict[str, Any]:
+    async def _inspect_record(
+        self,
+        task_id: str,
+        owned: Any,
+        *,
+        allow_unverified_workspace: bool = False,
+    ) -> dict[str, Any]:
         raw = await self._run("inspect", owned["container_id"], timeout=10, maximum=64 * 1024)
         try:
             details = json.loads(raw)
@@ -196,8 +231,15 @@ class RootlessPodmanRuntime:
                 if item.get("Type") == "tmpfs" and item.get("Destination") == "/tmp"
             ]
             if self.workspace_resolver is None:
-                raise BrokerError("workspace_slot_missing", "Task workspace resolver is unavailable.", 503)
-            expected_workspace = str(self.workspace_resolver(task_id))
+                if not allow_unverified_workspace:
+                    raise BrokerError("workspace_slot_missing", "Task workspace resolver is unavailable.", 503)
+            expected_workspace: str | None = None
+            if self.workspace_resolver is not None:
+                try:
+                    expected_workspace = str(self.workspace_resolver(task_id))
+                except BrokerError:
+                    if not allow_unverified_workspace:
+                        raise
             expected_image_id = self.image_id
             security_options = host.get("SecurityOpt", [])
             if (
@@ -223,7 +265,10 @@ class RootlessPodmanRuntime:
                 or host.get("NanoCpus") != int(self.config.profile.cpus * 1_000_000_000)
                 or not isinstance(mounts, list) or len(mounts) != 2
                 or len(workspace_mounts) != 1
-                or workspace_mounts[0].get("Source") != expected_workspace
+                or (
+                    expected_workspace is not None
+                    and workspace_mounts[0].get("Source") != expected_workspace
+                )
                 or workspace_mounts[0].get("RW") is not True
                 or len(temp_mounts) != 1 or temp_mounts[0].get("RW") is not True
                 or info["Config"].get("User") != "65532:65532"
@@ -246,6 +291,15 @@ class RootlessPodmanRuntime:
         return await self._terminate_container(task_id, recovery=True)
 
     async def _terminate_container(self, task_id: str, *, recovery: bool) -> str:
+        if (
+            self.storage_containment_check is not None
+            and self.storage_containment_check() is not True
+        ):
+            raise BrokerError(
+                "runtime_storage_unverified",
+                "Podman containment storage roles are not currently verified.",
+                503,
+            )
         owned = (
             self.registry.container_record(task_id)
             if recovery else self.registry.owned_container(task_id)
@@ -333,8 +387,7 @@ class RootlessPodmanRuntime:
             executable, "container", "exists", container_id,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={
-                "PATH": "/usr/bin:/bin", "HOME": str(self.config.state_dir),
-                "XDG_RUNTIME_DIR": f"/run/user/{self.config.service_uid}",
+                **self._runtime_environment(),
             },
         )
         try:
@@ -375,8 +428,7 @@ class RootlessPodmanRuntime:
             owned["container_id"], *argv,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={
-                "PATH": "/usr/bin:/bin", "HOME": str(self.config.state_dir),
-                "XDG_RUNTIME_DIR": f"/run/user/{self.config.service_uid}",
+                **self._runtime_environment(),
             },
         )
         self._active_processes[task_id] = process
@@ -438,7 +490,7 @@ class RootlessPodmanRuntime:
             raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
         process = await asyncio.create_subprocess_exec(
             executable, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env={"PATH": "/usr/bin:/bin", "HOME": str(self.config.state_dir), "XDG_RUNTIME_DIR": f"/run/user/{self.config.service_uid}"},
+            env=self._runtime_environment(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -462,6 +514,18 @@ class RootlessPodmanRuntime:
         if process.returncode:
             raise BrokerError("runtime_operation_failed", "Rootless Podman task operation failed.", 502)
         return stdout.decode("utf-8", errors="strict")
+
+    def _runtime_environment(self) -> dict[str, str]:
+        temporary = next(
+            role for role in self.config.storage_roles
+            if role.kind == "temporary"
+        )
+        return {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(self.config.state_dir),
+            "TMPDIR": str(temporary.path),
+            "XDG_RUNTIME_DIR": str(temporary.path),
+        }
 
 
 async def _read_bounded(stream: asyncio.StreamReader, limit: int) -> bytes:

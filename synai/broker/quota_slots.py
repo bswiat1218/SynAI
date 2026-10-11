@@ -6,24 +6,24 @@ import os
 import re
 import stat
 import struct
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from synai.broker.config import BrokerConfig, QuotaSlot
+from synai.broker.config import BrokerConfig, QuotaSlot, StorageRole
 from synai.broker.protocol import BrokerError
+from synai.broker.storage_inspector import (
+    InspectorFailure,
+    StorageObservation,
+    UnixStorageInspectorClient,
+    inventory_generation,
+)
 
 
 _EXT4_SUPER_MAGIC = 0xEF53
 _FS_IOC_FSGETXATTR = 0x801C581F
 _FS_XFLAG_PROJINHERIT = 0x00000200
-_Q_GETQUOTA = 0x80000702
-_PRJQUOTA = 2
-_QIF_BLIMITS = 1 << 0
-_QIF_SPACE = 1 << 1
-_QIF_ILIMITS = 1 << 2
-_QIF_INODES = 1 << 3
-_QIF_REQUIRED = _QIF_BLIMITS | _QIF_SPACE | _QIF_ILIMITS | _QIF_INODES
 _MOUNT_ESCAPE = re.compile(r"\\([0-7]{3})")
 
 
@@ -36,51 +36,26 @@ class QuotaUsage:
 
 
 class QuotaInspector(Protocol):
-    def inspect(self, slot: QuotaSlot, *, uid: int, gid: int) -> QuotaUsage: ...
+    def inspect(self, role_id: str) -> StorageObservation: ...
 
 
 class LinuxQuotaInspector:
-    """Read-only inspection of the live mount, project ID and project quota."""
+    """Broker-side local socket client; never performs privileged quota syscalls."""
 
-    def inspect(self, slot: QuotaSlot, *, uid: int, gid: int) -> QuotaUsage:
-        descriptors: list[int] = []
-        try:
-            mount_fd, mount_chain = _open_directory_chain(slot.mount_path)
-            descriptors.extend(mount_chain)
-            slot_fd, slot_chain = _open_directory_chain(slot.path)
-            descriptors.extend(slot_chain)
-            mount = _mount_for_fd(mount_fd)
-            slot_mount = _mount_for_fd(slot_fd)
-            if (
-                mount.mount_id != slot_mount.mount_id
-                or mount.target != str(slot.mount_path)
-                or mount.root != "/"
-                or mount.filesystem != "ext4"
-                or not ({"prjquota", "pquota"} & (mount.mount_options | mount.super_options))
-            ):
-                raise ValueError("Quota slot is not on the expected dedicated ext4 project-quota mount")
-            _verify_filesystem_device(slot.filesystem_uuid, mount.device)
-            _verify_directory_ownership(mount_fd, expected_uid=0, expected_gid=None, writable=False)
-            parent_fd = slot_chain[-2]
-            _verify_directory_ownership(parent_fd, expected_uid=0, expected_gid=None, writable=False)
-            _verify_directory_ownership(slot_fd, expected_uid=uid, expected_gid=gid, writable=True)
-            if _mount_for_fd(parent_fd).mount_id != mount.mount_id:
-                raise ValueError("Quota slot parent crosses a mount boundary")
-            project_id, flags = _project_attributes(slot_fd)
-            if project_id != slot.project_id or not flags & _FS_XFLAG_PROJINHERIT:
-                raise ValueError("Quota slot project ID or inheritance flag differs from its inventory")
-            return _read_project_quota(slot.mount_path, slot.project_id)
-        except BrokerError:
-            raise
-        except (OSError, ValueError, IndexError, struct.error) as exc:
-            raise BrokerError(
-                "workspace_quota_unverified",
-                "Broker cannot independently verify the configured project quota slot.",
-                503,
-            ) from exc
-        finally:
-            for descriptor in reversed(descriptors):
-                os.close(descriptor)
+    def __init__(self, config: BrokerConfig) -> None:
+        self.config = config
+        self.client = UnixStorageInspectorClient(
+            config.inspector_socket,
+            config.storage_roles,
+            inspector_uid=config.inspector_uid,
+            inspector_gid=config.inspector_gid,
+            timeout_seconds=config.inspector_timeout_seconds,
+            max_age_seconds=config.inspector_max_age_seconds,
+            inventory_generation=inventory_generation(config.storage_roles),
+        )
+
+    def inspect(self, role_id: str) -> StorageObservation:
+        return self.client.inspect(role_id)
 
 
 @dataclass(frozen=True)
@@ -105,15 +80,32 @@ class QuotaSlotManager:
     ) -> None:
         self.config = config
         self.registry = registry
-        self.inspector = inspector or LinuxQuotaInspector()
+        self.inspector = inspector or LinuxQuotaInspector(config)
+        self._production_inspector = (
+            type(self.inspector) is LinuxQuotaInspector
+            and type(self.inspector.client) is UnixStorageInspectorClient
+        )
         self.verified = False
         self.verified_slot_ids: frozenset[str] = frozenset()
+        self.verified_role_ids: frozenset[str] = frozenset()
+        self.runtime_containment_available = False
         self.reasons: tuple[str, ...] = ("workspace_quota_unverified",)
+        self._mount_identity: tuple[str, str, int] | None = None
+        self._mount_identity_lock = threading.Lock()
+        self._verification_lock = threading.Lock()
 
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
+        with self._verification_lock:
+            return self._verify_startup()
+
+    def _verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         reasons: list[str] = []
         if not self.config.quota_slots:
             reasons.append("quota_slot_inventory_missing")
+        if not self.config.storage_roles:
+            reasons.append("storage_role_inventory_missing")
+        if not self._production_inspector:
+            reasons.append("storage_inspector_untrusted")
         if not _process_identity_is_restricted(
             self.config.service_uid, self.config.service_gid,
         ):
@@ -125,52 +117,71 @@ class QuotaSlotManager:
                     break
         else:
             reasons.append("quota_slot_registry_unavailable")
-        usage: list[tuple[QuotaSlot, QuotaUsage]] = []
-        physical_reasons: list[str] = []
+        generation = inventory_generation(self.config.storage_roles)
+        if hasattr(self.registry, "storage_role_inventory_matches"):
+            if any(
+                not self.registry.storage_role_inventory_matches(role, generation)
+                for role in self.config.storage_roles
+            ):
+                reasons.append("storage_role_inventory_conflict")
+            if {
+                row["role_id"] for row in self.registry.storage_role_configurations()
+            } != {role.role_id for role in self.config.storage_roles}:
+                reasons.append("storage_role_inventory_conflict")
+        else:
+            reasons.append("storage_role_registry_unavailable")
+        observations: dict[str, StorageObservation] = {}
         verified_ids: set[str] = set()
         slot_records = {
             row["slot_id"]: row for row in self.registry.slot_configurations()
         } if hasattr(self.registry, "slot_configurations") else {}
-        for slot in self.config.quota_slots:
+        for role in self.config.storage_roles:
             try:
-                current = self.inspector.inspect(
-                    slot, uid=self.config.service_uid, gid=self.config.service_gid,
-                )
-                self._verify_slot_contents(slot, slot_records.get(slot.slot_id))
-                if os.stat(self.config.state_dir).st_dev == os.stat(slot.path).st_dev:
-                    raise ValueError("Broker registry/state shares the task quota filesystem")
-                if (
-                    current.byte_limit != slot.byte_limit
-                    or current.inode_limit != slot.inode_limit
-                    or current.bytes_used > current.byte_limit
-                    or current.inodes_used > current.inode_limit
-                ):
-                    raise ValueError("Live project quota does not match its configured hard limits")
-                usage.append((slot, current))
-                verified_ids.add(slot.slot_id)
-            except (BrokerError, OSError, ValueError):
-                physical_reasons.append(f"quota_slot_unverified:{slot.slot_id}")
-        if physical_reasons:
-            reasons.extend(physical_reasons)
-        if len(usage) == len(self.config.quota_slots) and usage:
-            try:
-                values = os.statvfs(self.config.quota_slots[0].mount_path)
-                available_bytes = values.f_bavail * values.f_frsize
-                available_inodes = values.f_favail
-                missing_bytes = sum(
-                    slot.byte_limit - live.bytes_used for slot, live in usage
-                )
-                missing_inodes = sum(
-                    slot.inode_limit - live.inodes_used for slot, live in usage
-                )
-                if (
-                    values.f_blocks * values.f_frsize < self.config.quota_volume_bytes
-                    or available_bytes < missing_bytes + self.config.quota_reserve_bytes
-                    or available_inodes < missing_inodes + self.config.quota_reserve_inodes
-                ):
-                    reasons.append("quota_aggregate_headroom")
-            except OSError:
-                reasons.append("quota_aggregate_headroom_unverified")
+                observation = self.inspector.inspect(role.role_id)
+                self._verify_observation(role, observation)
+                self._verify_local_role_path(role, observation)
+                observations[role.role_id] = observation
+                if role.kind == "task_slot":
+                    slot_id = role.role_id.removeprefix("task-")
+                    slot = next(item for item in self.config.quota_slots if item.slot_id == slot_id)
+                    self._verify_slot_contents(slot, slot_records.get(slot_id))
+                    verified_ids.add(slot_id)
+            except (
+                InspectorFailure, BrokerError, OSError, ValueError, StopIteration,
+                AttributeError, TypeError,
+            ) as exc:
+                reason = getattr(exc, "state", "inconsistent")
+                reasons.append(f"storage_role_{reason}:{role.role_id}")
+        self.verified_role_ids = frozenset(observations)
+        containment_roles = {
+            role.role_id for role in self.config.storage_roles
+            if role.kind in {"broker_state", "podman_graph", "podman_runtime", "temporary"}
+        }
+        containment_blockers = {
+            "quota_bypass_privilege", "storage_inspector_untrusted",
+            "storage_role_inventory_conflict", "storage_role_registry_unavailable",
+            "quota_slot_inventory_mismatch", "quota_slot_registry_unavailable",
+            "legacy_task_slot_assignment_missing",
+        }
+        self.runtime_containment_available = (
+            self._production_inspector
+            and containment_roles <= self.verified_role_ids
+            and not any(reason in containment_blockers for reason in reasons)
+            and _process_identity_is_restricted(
+                self.config.service_uid, self.config.service_gid,
+            )
+        )
+        if len(observations) == len(self.config.storage_roles) and observations:
+            reasons.extend(aggregate_storage_reasons(self.config, observations))
+            first = observations[self.config.storage_roles[0].role_id]
+            mount_identity = (
+                first.filesystem_uuid, first.mount_target, first.mount_id,
+            )
+            with self._mount_identity_lock:
+                if self._mount_identity is None:
+                    self._mount_identity = mount_identity
+                elif self._mount_identity != mount_identity:
+                    reasons.append("storage_mount_identity_changed")
             try:
                 task_root = self.config.quota_slots[0].path.parent
                 task_fd, descriptors = _open_directory_chain(task_root)
@@ -197,15 +208,47 @@ class QuotaSlotManager:
             "quota_slot_inventory_mismatch", "quota_slot_registry_unavailable",
             "quota_slot_directory_inventory_mismatch",
             "quota_slot_directory_inventory_unverified",
-            "quota_aggregate_headroom", "quota_aggregate_headroom_unverified",
+            "storage_role_inventory_missing", "storage_inspector_untrusted",
+            "storage_role_inventory_conflict", "storage_role_registry_unavailable",
+            "storage_filesystem_identity_conflict", "storage_aggregate_headroom",
+            "storage_mount_identity_changed",
             "legacy_task_slot_assignment_missing",
         }
         self.verified = bool(verified_ids) and not any(
-            reason in blocked_inventory or reason.startswith("quota_slot_unverified:")
+            reason in blocked_inventory or reason.startswith("storage_role_")
             for reason in self.reasons
         )
         self.verified_slot_ids = frozenset(verified_ids if self.verified else ())
         return self.verified, self.reasons
+
+    def verify_storage_role(self, role_id: str) -> bool:
+        with self._verification_lock:
+            return self._verify_storage_role(role_id)
+
+    def _verify_storage_role(self, role_id: str) -> bool:
+        if (
+            not self._production_inspector
+            or not _process_identity_is_restricted(
+                self.config.service_uid, self.config.service_gid,
+            )
+        ):
+            return False
+        role = next(
+            (item for item in self.config.storage_roles if item.role_id == role_id),
+            None,
+        )
+        if role is None:
+            return False
+        try:
+            observation = self.inspector.inspect(role_id)
+            self._verify_observation(role, observation)
+            self._verify_local_role_path(role, observation)
+            return True
+        except (
+            InspectorFailure, BrokerError, OSError, ValueError,
+            AttributeError, TypeError,
+        ):
+            return False
 
     def _verify_slot_contents(self, slot: QuotaSlot, record: object | None) -> None:
         if record is None:
@@ -267,6 +310,83 @@ class QuotaSlotManager:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
+    @staticmethod
+    def _verify_observation(role: StorageRole, observation: StorageObservation) -> None:
+        if (
+            observation.role_id != role.role_id
+            or observation.filesystem_uuid != role.filesystem_uuid
+            or observation.mount_target != str(role.mount_path)
+            or observation.filesystem_type != "ext4"
+            or observation.quota_mode != "project"
+            or not observation.quota_configuration_enabled
+            or not observation.inheritance_enabled
+            or observation.project_id != role.project_id
+            or observation.byte_limit != role.byte_limit
+            or observation.inode_limit != role.inode_limit
+            or observation.bytes_used > role.byte_limit
+            or observation.inodes_used > role.inode_limit
+            or observation.owner_uid != role.owner_uid
+            or observation.owner_gid != role.owner_gid
+        ):
+            raise ValueError("Live storage observation differs from the operator inventory")
+
+    @staticmethod
+    def _verify_local_role_path(
+        role: StorageRole, observation: StorageObservation,
+    ) -> None:
+        mount_fd, mount_descriptors = _open_directory_chain(role.mount_path)
+        role_fd, role_descriptors = _open_directory_chain(role.path)
+        try:
+            mount = _mount_for_fd(mount_fd)
+            actual = _mount_for_fd(role_fd)
+            if (
+                mount.target != str(role.mount_path)
+                or actual.target != str(role.mount_path)
+                or mount.mount_id != observation.mount_id
+                or actual.mount_id != observation.mount_id
+                or actual.filesystem != observation.filesystem_type
+                or actual.device != mount.device
+                or not ({"prjquota", "pquota"} & (actual.mount_options | actual.super_options))
+            ):
+                raise ValueError("Local storage path mount identity differs from inspector evidence")
+            _verify_filesystem_device(role.filesystem_uuid, actual.device)
+            _verify_directory_ancestors(
+                role_descriptors, role.owner_uid,
+            )
+            _verify_directory_ownership(
+                role_fd, expected_uid=role.owner_uid,
+                expected_gid=role.owner_gid, writable=True,
+            )
+            project_id, flags = _project_attributes(role_fd)
+            if project_id != role.project_id or not flags & _FS_XFLAG_PROJINHERIT:
+                raise ValueError("Storage role project quota inheritance differs from the inventory")
+            filesystem = os.fstatvfs(role_fd)
+            local = (
+                filesystem.f_blocks * filesystem.f_frsize,
+                filesystem.f_bavail * filesystem.f_frsize,
+                filesystem.f_files,
+                filesystem.f_favail,
+            )
+            observed = (
+                observation.filesystem_bytes,
+                observation.filesystem_bytes_available,
+                observation.filesystem_inodes,
+                observation.filesystem_inodes_available,
+            )
+            if (
+                local[0] != observed[0]
+                or local[1] < observed[1]
+                or local[2] != observed[2]
+                or local[3] < observed[3]
+            ):
+                raise ValueError("Local filesystem capacity differs from live inspection evidence")
+        finally:
+            for descriptor in reversed(role_descriptors):
+                os.close(descriptor)
+            for descriptor in reversed(mount_descriptors):
+                os.close(descriptor)
+
+
     def resolve_task_root(self, task_id: str, *, allow_quarantined: bool = False) -> Path:
         if not re.fullmatch(r"[a-f0-9]{32}", task_id):
             raise BrokerError("task_identity_invalid", "Task identity is invalid.", 422)
@@ -288,15 +408,20 @@ class QuotaSlotManager:
                 409,
             )
         try:
-            live = self.inspector.inspect(
-                slot, uid=self.config.service_uid, gid=self.config.service_gid,
+            role = next(
+                item for item in self.config.storage_roles
+                if item.kind == "task_slot" and item.role_id == f"task-{slot.slot_id}"
             )
-        except BrokerError:
+            live = self.inspector.inspect(role.role_id)
+            self._verify_observation(role, live)
+            self._verify_local_role_path(role, live)
+        except (InspectorFailure, BrokerError, OSError, ValueError, StopIteration):
             self.registry.quarantine_slot(task_id)
-            raise
-        if live.byte_limit != slot.byte_limit or live.inode_limit != slot.inode_limit:
-            self.registry.quarantine_slot(task_id)
-            raise BrokerError("workspace_slot_mismatch", "Live task quota differs from its assigned slot.", 409)
+            raise BrokerError(
+                "workspace_slot_mismatch",
+                "Fresh quota inspection no longer matches the assigned task slot.",
+                409,
+            )
         try:
             slot_fd, descriptors = _open_directory_chain(slot.path)
         except OSError as exc:
@@ -458,6 +583,47 @@ class QuotaSlotManager:
         self.verify_startup()
 
 
+def aggregate_storage_reasons(
+    config: BrokerConfig,
+    observations: dict[str, StorageObservation],
+) -> tuple[str, ...]:
+    if not config.storage_roles or set(observations) != {
+        role.role_id for role in config.storage_roles
+    }:
+        return ("storage_observations_incomplete",)
+    first = observations[config.storage_roles[0].role_id]
+    identity = (
+        first.filesystem_uuid, first.mount_target, first.mount_id,
+        first.filesystem_bytes, first.filesystem_inodes,
+    )
+    if any(
+        (
+            item.filesystem_uuid, item.mount_target, item.mount_id,
+            item.filesystem_bytes, item.filesystem_inodes,
+        ) != identity
+        for item in observations.values()
+    ):
+        return ("storage_filesystem_identity_conflict",)
+    remaining_bytes = sum(
+        role.byte_limit - observations[role.role_id].bytes_used
+        for role in config.storage_roles
+    )
+    remaining_inodes = sum(
+        role.inode_limit - observations[role.role_id].inodes_used
+        for role in config.storage_roles
+    )
+    if (
+        first.filesystem_bytes < config.quota_volume_bytes
+        or first.filesystem_inodes < config.quota_volume_inodes
+        or min(item.filesystem_bytes_available for item in observations.values())
+        < remaining_bytes + config.quota_reserve_bytes
+        or min(item.filesystem_inodes_available for item in observations.values())
+        < remaining_inodes + config.quota_reserve_inodes
+    ):
+        return ("storage_aggregate_headroom",)
+    return ()
+
+
 def _process_identity_is_restricted(expected_uid: int, expected_gid: int) -> bool:
     if os.geteuid() != expected_uid or os.getegid() != expected_gid or expected_uid == 0:
         return False
@@ -534,6 +700,11 @@ def _verify_filesystem_device(filesystem_uuid: str, device: str) -> None:
     info = target.stat()
     if not stat.S_ISBLK(info.st_mode) or f"{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}" != device:
         raise ValueError("Expected filesystem UUID does not match the mounted block device")
+    root_device = os.stat("/").st_dev
+    if f"{os.major(root_device)}:{os.minor(root_device)}" == device:
+        raise ValueError("Broker storage must not use the host root filesystem")
+    if (Path("/sys/dev/block") / device / "loop" / "backing_file").exists():
+        raise ValueError("Loop-backed filesystems are development-only and cannot satisfy readiness")
 
 
 def _verify_directory_ownership(
@@ -551,42 +722,21 @@ def _verify_directory_ownership(
         raise ValueError("Quota mount parent can be modified by an untrusted identity")
 
 
+def _verify_directory_ancestors(
+    descriptors: list[int], expected_uid: int,
+) -> None:
+    for descriptor in descriptors[1:-1]:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in {0, expected_uid}
+            or info.st_mode & 0o022
+        ):
+            raise ValueError("Storage path ancestor is not protected from substitution")
+
+
 def _project_attributes(descriptor: int) -> tuple[int, int]:
     buffer = bytearray(28)
     fcntl.ioctl(descriptor, _FS_IOC_FSGETXATTR, buffer, True)
     flags, _, _, project_id, _, _ = struct.unpack("=IIIII8s", buffer)
     return project_id, flags
-
-
-def _read_project_quota(mount_path: Path, project_id: int) -> QuotaUsage:
-    class Dqblk(ctypes.Structure):
-        _fields_ = [
-            ("bhard", ctypes.c_uint64), ("bsoft", ctypes.c_uint64),
-            ("space", ctypes.c_uint64), ("ihard", ctypes.c_uint64),
-            ("isoft", ctypes.c_uint64), ("inodes", ctypes.c_uint64),
-            ("btime", ctypes.c_uint64), ("itime", ctypes.c_uint64),
-            ("valid", ctypes.c_uint32),
-        ]
-
-    quota = Dqblk()
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.quotactl.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
-    libc.quotactl.restype = ctypes.c_int
-    result = libc.quotactl(
-        _Q_GETQUOTA, os.fsencode(mount_path), project_id, ctypes.byref(quota),
-    )
-    if result != 0:
-        code = ctypes.get_errno()
-        raise BrokerError(
-            "workspace_quota_unreadable",
-            "Broker lacks an unprivileged read-only view of live project quota state.",
-            503,
-        ) from OSError(code, os.strerror(code))
-    if quota.valid & _QIF_REQUIRED != _QIF_REQUIRED:
-        raise ValueError("Kernel did not return all project quota limit and usage fields")
-    return QuotaUsage(
-        byte_limit=quota.bhard * 1024,
-        inode_limit=quota.ihard,
-        bytes_used=quota.space,
-        inodes_used=quota.inodes,
-    )
