@@ -7,9 +7,11 @@ import os
 import secrets
 import sqlite3
 import stat
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
 
 from synai.broker.config import BrokerConfig
@@ -40,14 +42,166 @@ _TRANSITIONS = {
 }
 
 
+class RegistryTrust(StrEnum):
+    STORAGE_UNVERIFIED = "state_storage_unverified"
+    NOT_OPENED = "storage_verified_registry_not_opened"
+    RECOVERABLE = "registry_verified_recoverable"
+    UNAVAILABLE = "registry_unavailable"
+    CORRUPT = "registry_corrupt"
+    MISMATCH = "registry_identity_mismatch"
+    RECOVERY_INCOMPLETE = "recovery_incomplete"
+    COMPLETE = "recovery_verified_complete"
+
+
 class BrokerRegistry:
     """Private durable task, operation, request-replay and ownership ledger."""
 
     def __init__(self, config: BrokerConfig) -> None:
         self.config = config
         self.path = config.state_dir / "broker.sqlite3"
+        self.seal_path = config.state_dir / "registry-identity.json"
+        self.dirty_path = config.state_dir / "registry-interrupted"
+        self.trust = RegistryTrust.STORAGE_UNVERIFIED
+        self.failure_code: str | None = None
+        self.failure_callback: Callable[[str], None] | None = None
+        self.storage_check: Callable[[], bool] | None = None
+        self._lock = threading.RLock()
+        self._initializing_thread: int | None = None
 
-    def initialize(self) -> None:
+    @property
+    def _initializing(self) -> bool:
+        return self._initializing_thread == threading.get_ident()
+
+    def fail(self, state: RegistryTrust, code: str) -> None:
+        self.trust = state
+        self.failure_code = code
+        if self.failure_callback is not None:
+            self.failure_callback(code)
+
+    def require_execution_authority(self) -> None:
+        if self.failure_code is not None or self.trust not in {
+            RegistryTrust.RECOVERABLE, RegistryTrust.COMPLETE,
+        }:
+            raise BrokerError("registry_unavailable", "Registry authority does not permit new work or slot reuse.", 503)
+
+    def status(self) -> dict[str, object]:
+        authority = self.failure_code in {None, "recovery_incomplete"} and self.trust in {
+            RegistryTrust.RECOVERABLE, RegistryTrust.RECOVERY_INCOMPLETE,
+            RegistryTrust.COMPLETE,
+        }
+        return {
+            "state": self.trust.value,
+            "error_code": self.failure_code,
+            "operator_intervention_required": self.failure_code is not None,
+            "ownership_authority_available": authority,
+            "container_identity_unavailable": not authority,
+            "containment_unresolved": self.failure_code is not None,
+        }
+
+    @contextmanager
+    def _serialized(self) -> Iterator[None]:
+        if not self._lock.acquire(timeout=2):
+            self.fail(RegistryTrust.UNAVAILABLE, "registry_busy")
+            raise BrokerError("registry_busy", "Registry access did not complete within its bound.", 503)
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def _policy_digest(self) -> str:
+        from synai.broker.storage_inspector import inventory_generation
+        policy = {
+            "inventory": inventory_generation(self.config.storage_roles),
+            "slots": [repr(slot) for slot in self.config.quota_slots],
+            "uid": self.config.service_uid, "gid": self.config.service_gid,
+            "claim_key": self.config.claim_key.hex(),
+            "image": self.config.image, "profile": repr(self.config.profile),
+        }
+        return hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).hexdigest()
+
+    def _identity(self) -> dict[str, object]:
+        info = self.path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077
+            or info.st_size > 512 * 1024 * 1024
+        ):
+            raise BrokerError("registry_identity_mismatch", "Registry identity is unsafe.", 503)
+        digest = hashlib.sha256()
+        with self.path.open("rb") as source:
+            for chunk in iter(lambda: source.read(65536), b""):
+                digest.update(chunk)
+        return {
+            "schema_version": 1, "device": info.st_dev, "inode": info.st_ino,
+            "sha256": digest.hexdigest(), "policy": self._policy_digest(),
+        }
+
+    def _sync_directory(self) -> None:
+        descriptor = os.open(self.config.state_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _seal(self) -> None:
+        temporary = self.seal_path.with_suffix(".pending")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, "w") as target:
+            json.dump(self._identity(), target, sort_keys=True)
+            target.flush()
+            os.fsync(target.fileno())
+        os.replace(temporary, self.seal_path)
+        self._sync_directory()
+
+    def _verify_seal(self) -> None:
+        if self.dirty_path.exists() or self.seal_path.with_suffix(".pending").exists():
+            raise BrokerError("registry_recovery_evidence_missing", "Registry access was interrupted; operator recovery is required.", 503)
+        for suffix in ("-wal", "-shm", "-journal"):
+            if self.path.with_name(self.path.name + suffix).exists():
+                raise BrokerError("registry_journal_unexpected", "Registry journal evidence requires operator recovery.", 503)
+        info = self.seal_path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size > 4096:
+            raise BrokerError("registry_identity_mismatch", "Registry seal is unsafe.", 503)
+        try:
+            seal = json.loads(self.seal_path.read_text())
+        except (ValueError, UnicodeError) as exc:
+            raise BrokerError("registry_identity_mismatch", "Registry seal is invalid.", 503) from exc
+        if seal != self._identity():
+            raise BrokerError("registry_identity_mismatch", "Registry or storage policy changed; operator recovery is required.", 503)
+
+    def initialize(self, *, storage_verified: bool = False, provision: bool = False,
+                   adopt_legacy: bool = False) -> None:
+        """Provisioning/adoption are explicit offline operator actions, never service startup."""
+        if not storage_verified:
+            self.fail(RegistryTrust.STORAGE_UNVERIFIED, "state_storage_unverified")
+            raise BrokerError("state_storage_unverified", "Bounded registry storage is not verified.", 503)
+        self.trust = RegistryTrust.NOT_OPENED
+        try:
+            with self._serialized():
+                if not self.path.exists():
+                    if not provision or self.seal_path.exists() or self.dirty_path.exists():
+                        raise BrokerError("registry_unavailable", "Historical registry is missing; no replacement will be created.", 503)
+                    descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    os.close(descriptor)
+                elif not self.seal_path.exists() and not adopt_legacy:
+                    raise BrokerError("registry_recovery_evidence_missing", "Registry identity evidence is missing; operator adoption is required.", 503)
+                if self.seal_path.exists():
+                    self._verify_seal()
+                elif self.dirty_path.exists():
+                    raise BrokerError("registry_recovery_evidence_missing", "Interrupted provisioning requires operator recovery.", 503)
+                self._initializing_thread = threading.get_ident()
+                try:
+                    self._initialize_schema()
+                    self.verify_ownership()
+                finally:
+                    self._initializing_thread = None
+                self.trust = RegistryTrust.RECOVERABLE
+                self.failure_code = None
+        except (BrokerError, OSError, sqlite3.Error) as exc:
+            self._access_failed(exc)
+            raise
+
+    def _initialize_schema(self) -> None:
         info = self.config.state_dir.lstat()
         if (
             not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
@@ -55,6 +209,17 @@ class BrokerRegistry:
         ):
             raise ValueError("Broker state directory must be private and owned by the Broker identity")
         with self.connect() as connection:
+            if self.seal_path.exists():
+                expected = {
+                    "broker_tasks", "broker_operations", "broker_containers",
+                    "broker_request_nonces", "broker_slots", "broker_storage_roles",
+                }
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'",
+                )}
+                if not expected.issubset(tables):
+                    raise BrokerError("registry_corrupt", "Historical registry schema is incomplete.", 503)
+                self._verify_ownership(connection)
             connection.executescript("""
                 PRAGMA journal_mode = WAL;
                 CREATE TABLE IF NOT EXISTS broker_tasks (
@@ -239,27 +404,131 @@ class BrokerRegistry:
                 raise
         os.chmod(self.path, 0o600)
 
+    def verify_ownership(self) -> None:
+        with self.connect() as connection:
+            self._verify_ownership(connection)
+
+    @staticmethod
+    def _verify_ownership(connection: sqlite3.Connection) -> None:
+        if connection.execute("""
+                SELECT 1 FROM broker_containers c
+                LEFT JOIN broker_tasks t ON t.task_id = c.task_id
+                WHERE t.task_id IS NULL OR c.allocation_id IS NOT t.allocation_id
+                   OR c.image_digest IS NOT t.image_digest
+                   OR c.snapshot_digest IS NOT t.snapshot_digest
+                   OR c.resource_profile IS NOT t.profile LIMIT 1
+            """).fetchone() is not None:
+            raise BrokerError("registry_identity_mismatch", "Container ownership history is inconsistent.", 503)
+        if connection.execute("""
+                SELECT 1 FROM broker_slots s LEFT JOIN broker_tasks t ON t.task_id = s.task_id
+                WHERE (s.state = 'free' AND (s.task_id IS NOT NULL OR s.allocation_id IS NOT NULL))
+                   OR (s.state != 'free' AND (
+                       t.task_id IS NULL OR t.slot_id IS NOT s.slot_id
+                       OR t.allocation_id IS NOT s.allocation_id
+                       OR t.slot_owner_token_hash IS NOT s.owner_token_hash)) LIMIT 1
+            """).fetchone() is not None:
+            raise BrokerError("registry_identity_mismatch", "Quota-slot ownership history is inconsistent.", 503)
+
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW
-        descriptor = os.open(self.path, flags, 0o600)
-        try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-                raise BrokerError("registry_unavailable", "Broker ownership registry is unsafe.", 503)
-            connection = sqlite3.connect(self.path, timeout=2, isolation_level=None)
-        except BaseException:
-            os.close(descriptor)
-            raise
-        os.close(descriptor)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=2000")
-        try:
-            with connection:
-                yield connection
-        finally:
-            connection.close()
+        if not self._initializing and self.storage_check is not None and not self.storage_check():
+            self.fail(RegistryTrust.STORAGE_UNVERIFIED, "state_storage_unverified")
+            raise BrokerError("state_storage_unverified", "Bounded registry storage is unavailable.", 503)
+        with self._serialized():
+            connection = None
+            try:
+                if self.failure_code not in {None, "recovery_incomplete"} and not self._initializing:
+                    raise BrokerError(self.failure_code, "Registry trust is revoked; restart and operator recovery are required.", 503)
+                if not self._initializing:
+                    self._verify_seal()
+                descriptor = os.open(self.path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+                try:
+                    info = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                        or info.st_mode & 0o077 or info.st_size > 512 * 1024 * 1024
+                    ):
+                        raise BrokerError("registry_identity_mismatch", "Registry ownership or type is unsafe.", 503)
+                finally:
+                    os.close(descriptor)
+                marker = os.open(self.dirty_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                try:
+                    os.fsync(marker)
+                finally:
+                    os.close(marker)
+                self._sync_directory()
+                connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, timeout=2, isolation_level=None)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA foreign_keys=ON")
+                connection.execute("PRAGMA busy_timeout=2000")
+                connection.execute("PRAGMA synchronous=FULL")
+                if [tuple(row) for row in connection.execute("PRAGMA integrity_check")] != [("ok",)]:
+                    raise BrokerError("registry_corrupt", "Registry integrity is inconclusive.", 503)
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise BrokerError("registry_corrupt", "Registry references are inconsistent.", 503)
+                rejection = None
+                try:
+                    with connection:
+                        yield connection
+                except BrokerError as exc:
+                    if exc.status_code == 503:
+                        raise
+                    if connection.in_transaction:
+                        connection.rollback()
+                    rejection = exc
+                finally:
+                    if connection.in_transaction:
+                        connection.rollback()
+                if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                    raise BrokerError("registry_corrupt", "Registry references are inconsistent.", 503)
+                if connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+                    if any(not self.path.with_name(self.path.name + suffix).is_file()
+                           for suffix in ("-wal", "-shm")):
+                        raise BrokerError("registry_journal_unexpected", "Active registry journal evidence is missing.", 503)
+                checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint is not None and checkpoint[0] != 0:
+                    raise BrokerError("registry_checkpoint_failed", "Registry checkpoint did not complete.", 503)
+                connection.close()
+                connection = None
+                self._seal()
+                self.dirty_path.unlink()
+                self._sync_directory()
+                if rejection is not None:
+                    raise rejection
+            except BrokerError as exc:
+                if exc.status_code == 503:
+                    self._access_failed(exc)
+                raise
+            except (OSError, sqlite3.Error) as exc:
+                self._access_failed(exc)
+                raise BrokerError(
+                    self.failure_code or "registry_unavailable",
+                    "Registry access or durability failed; operator recovery is required.",
+                    503,
+                ) from exc
+            except BaseException:
+                self.fail(RegistryTrust.RECOVERY_INCOMPLETE, "registry_access_interrupted")
+                raise
+            finally:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error as exc:
+                        self._access_failed(exc)
+                        raise
+
+    def _access_failed(self, exc: Exception) -> None:
+        code = exc.code if isinstance(exc, BrokerError) else "registry_unavailable"
+        if isinstance(exc, sqlite3.DatabaseError) and not isinstance(exc, sqlite3.OperationalError):
+            code = "registry_corrupt"
+        state = {
+            "state_storage_unverified": RegistryTrust.STORAGE_UNVERIFIED,
+            "registry_corrupt": RegistryTrust.CORRUPT,
+            "registry_identity_mismatch": RegistryTrust.MISMATCH,
+            "registry_recovery_evidence_missing": RegistryTrust.RECOVERY_INCOMPLETE,
+            "registry_journal_unexpected": RegistryTrust.RECOVERY_INCOMPLETE,
+        }.get(code, RegistryTrust.UNAVAILABLE)
+        self.fail(state, code)
 
     def consume_request_nonce(self, nonce: str, now: int) -> None:
         with self.connect() as connection:
@@ -286,6 +555,7 @@ class BrokerRegistry:
         *,
         eligible_slot_ids: frozenset[str] | None = None,
     ) -> str:
+        self.require_execution_authority()
         timestamp = int(time.time()) if now is None else now
         verify_claim(claim, signature, self.config.claim_key, timestamp)
         if (
@@ -405,6 +675,7 @@ class BrokerRegistry:
         return request_digest
 
     def begin_operation(self, operation_id: str) -> None:
+        self.require_execution_authority()
         with self.connect() as connection:
             cursor = connection.execute(
                 "UPDATE broker_operations SET state = 'running', updated_at = ? "
@@ -457,6 +728,7 @@ class BrokerRegistry:
                 raise
 
     def reserve_container(self, task_id: str, allocation_id: str, now: int | None = None) -> None:
+        self.require_execution_authority()
         timestamp = int(time.time()) if now is None else now
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -739,6 +1011,7 @@ class BrokerRegistry:
             ).fetchall())
 
     def mark_slot_release_pending(self, task_id: str, operation_id: str, evidence: str) -> None:
+        self.require_execution_authority()
         if not evidence or len(evidence) > 4096:
             raise BrokerError("slot_release_evidence_invalid", "Quota-slot release evidence is invalid.", 500)
         with self.connect() as connection:
@@ -782,6 +1055,7 @@ class BrokerRegistry:
                 raise
 
     def release_slot(self, task_id: str, evidence: str) -> None:
+        self.require_execution_authority()
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:

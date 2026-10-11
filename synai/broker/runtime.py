@@ -175,6 +175,7 @@ class RootlessPodmanRuntime:
         return True
 
     async def create_task(self, task_id: str, allocation_id: str, workspace: Path) -> str:
+        self.registry.require_execution_authority()
         if self.readiness is None:
             raise BrokerError("broker_not_ready", "Broker startup verification has not completed.", 503)
         if not self.readiness.execution_available:
@@ -210,6 +211,7 @@ class RootlessPodmanRuntime:
     async def start_owned(self, task_id: str) -> None:
         lock = self._containment_locks.setdefault(task_id, asyncio.Lock())
         async with lock:
+            self.registry.require_execution_authority()
             owned = self.registry.owned_container(task_id)
             await self.inspect_owned(task_id)
             await self._run("start", owned["container_id"], timeout=15, maximum=4096)
@@ -616,6 +618,7 @@ class RootlessPodmanRuntime:
     async def execute(
         self, task_id: str, argv: list[str], cwd: str, timeout: int, output_limit: int,
     ) -> dict[str, Any]:
+        self.registry.require_execution_authority()
         owned = self.registry.owned_container(task_id)
         await self.inspect_owned(task_id)
         workdir = "/workspace" if cwd == "." else f"/workspace/{cwd}"

@@ -30,7 +30,7 @@ from synai.broker.protocol import (
     canonical_json,
     verify_claim,
 )
-from synai.broker.registry import BrokerRegistry
+from synai.broker.registry import BrokerRegistry, RegistryTrust
 from synai.broker.runtime import ContainmentResult, RootlessPodmanRuntime
 from synai.broker.snapshots import (
     changed_files,
@@ -121,42 +121,60 @@ class BrokerService:
         self._storage_assurance_lock = asyncio.Lock()
         self._storage_watchdog_task: asyncio.Task[None] | None = None
         self._containment_tasks: dict[str, asyncio.Task[ContainmentResult]] = {}
+        self._startup_lock = asyncio.Lock()
+        self._recovery_lock = asyncio.Lock()
+        self.registry.failure_callback = self._registry_failure
+        self.registry.storage_check = self._registry_storage_verified
 
-    async def start(self) -> None:
-        if self._started:
-            return
-        state_role = next(
+    def _registry_storage_verified(self) -> bool:
+        role = next(
             (role for role in self.config.storage_roles if role.kind == "broker_state"),
             None,
         )
-        if (
-            state_role is None
-            or not await asyncio.to_thread(
-                self.quota_manager.verify_storage_role, state_role.role_id,
-            )
-        ):
-            self.readiness = _readiness_with_storage(self.config, False)
-            self._started = True
+        return role is not None and self.quota_manager.verify_storage_role(role.role_id)
+
+    def _registry_failure(self, code: str) -> None:
+        self._invalidate_storage_readiness(code)
+        self._invalidate_storage_readiness("operator_intervention_required")
+        self._invalidate_storage_readiness("storage_containment_unconfirmed")
+        logger.error("Broker registry authority revoked: %s; containment unresolved", code)
+
+    async def start(self) -> None:
+        async with self._startup_lock:
+            await self._start()
+
+    async def _start(self) -> None:
+        if self._started:
             return
-        self.registry.initialize()
-        quota_ready, _ = self.quota_manager.verify_startup()
-        base = _readiness_with_storage(self.config, quota_ready)
-        if quota_ready:
-            self.readiness = await self.runtime.verify_startup(base)
-        else:
-            self.readiness = base
-        await self.recover()
-        if quota_ready:
-            self.quota_manager.recover_pending_releases()
+        self.readiness = _readiness_with_storage(self.config, False)
+        try:
+            if not await asyncio.to_thread(self._registry_storage_verified):
+                self.registry.fail(RegistryTrust.STORAGE_UNVERIFIED, "state_storage_unverified")
+                return
+            self.registry.initialize(storage_verified=True)
+            self.registry.trust = RegistryTrust.RECOVERY_INCOMPLETE
             quota_ready, _ = self.quota_manager.verify_startup()
+            base = _readiness_with_storage(self.config, quota_ready)
             if quota_ready:
-                self.readiness = await self.runtime.verify_startup(
-                    _readiness_with_storage(self.config, quota_ready),
-                )
-            else:
-                self.readiness = _readiness_with_storage(self.config, False)
-        self._started = True
-        self._start_storage_watchdog()
+                self.readiness = await self.runtime.verify_startup(base)
+            await self.recover()
+            if quota_ready and self.registry.trust == RegistryTrust.COMPLETE:
+                self.quota_manager.recover_pending_releases()
+                quota_ready, _ = self.quota_manager.verify_startup()
+                if quota_ready:
+                    self.readiness = await self.runtime.verify_startup(
+                        _readiness_with_storage(self.config, quota_ready),
+                    )
+                else:
+                    self.readiness = _readiness_with_storage(self.config, False)
+            if self.registry.failure_code is not None or self.registry.trust != RegistryTrust.COMPLETE:
+                self._registry_failure(self.registry.failure_code or "recovery_incomplete")
+        except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
+            if self.registry.failure_code is None:
+                self.registry._access_failed(exc)
+        finally:
+            self._started = True
+            self._start_storage_watchdog()
 
     def task_paths(self, task_id: str, *, allow_quarantined: bool = False) -> TaskWorkspacePaths:
         root = self.quota_manager.resolve_task_root(
@@ -233,6 +251,8 @@ class BrokerService:
             await asyncio.sleep(interval)
             async with self._storage_assurance_lock:
                 try:
+                    if self.registry.failure_code is None:
+                        await asyncio.to_thread(self.registry.verify_ownership)
                     storage_ready, reasons = await asyncio.to_thread(
                         self.quota_manager.verify_startup,
                     )
@@ -290,6 +310,30 @@ class BrokerService:
         )
 
     async def recover(self) -> None:
+        async with self._recovery_lock:
+            self._invalidate_storage_readiness("recovery_incomplete")
+            if self.registry.failure_code is None:
+                self.registry.trust = RegistryTrust.RECOVERY_INCOMPLETE
+            try:
+                self.registry.verify_ownership()
+                await self._recover()
+                if (
+                    self.registry.has_quarantined_slots()
+                    or self.registry.unassigned_legacy_tasks()
+                    or any(row["lifecycle_state"] not in {"terminated", "removed"}
+                           for row in self.registry.container_records())
+                ):
+                    self.registry.fail(RegistryTrust.RECOVERY_INCOMPLETE, "recovery_incomplete")
+                elif self.registry.failure_code is None:
+                    self.registry.trust = RegistryTrust.COMPLETE
+            except asyncio.CancelledError:
+                self.registry.fail(RegistryTrust.RECOVERY_INCOMPLETE, "recovery_interrupted")
+                raise
+            except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
+                self.registry._access_failed(exc)
+                raise
+
+    async def _recover(self) -> None:
         if self.operation_outcome_recorder is not None:
             for operation in self.registry.uncertain_operations():
                 if not operation["claim_json"] or not operation["claim_signature"]:
@@ -359,6 +403,8 @@ class BrokerService:
                 "Broker startup verification has not completed.",
                 503,
             )
+        if self.registry.failure_code is not None:
+            raise BrokerError("registry_unavailable", "Registry authority is revoked; operator recovery is required.", 503)
         try:
             claim = TaskClaim.from_dict(payload.claim)
             verify_claim(claim, payload.claim_signature, self.config.claim_key)
@@ -418,6 +464,7 @@ class BrokerService:
                 if claim.tool_kind == "prepare"
                 else None
             )
+            self.registry.verify_ownership()
             self.registry.authorize(
                 claim, payload.claim_signature, eligible_slot_ids=eligible_slots,
             )
@@ -1058,11 +1105,16 @@ def create_app(service: BrokerService) -> FastAPI:
     async def readiness() -> dict[str, Any]:
         state = service.readiness
         if state is None:
-            return {"schema_version": 1, "ready": False, "execution_available": False, "reasons": ["startup_verification_incomplete"]}
+            return {
+                "schema_version": 1, "ready": False, "execution_available": False,
+                "reasons": ["startup_verification_incomplete"],
+                "registry": service.registry.status(),
+            }
         return {
             "schema_version": 1, "ready": state.ready,
             "execution_available": state.execution_available,
             "checks": state.checks, "reasons": list(state.reasons),
+            "registry": service.registry.status(),
         }
 
     @app.post("/v1/tasks/{task_id}/operations")

@@ -137,6 +137,9 @@ class FakeQuotaManager:
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         return True, ()
 
+    def verify_storage_role(self, role_id: str) -> bool:
+        return role_id in {role.role_id for role in self.config.storage_roles}
+
     def resolve_task_root(self, task_id: str, *, allow_quarantined: bool = False) -> Path:
         assignment = self.registry.task_slot(task_id, allow_quarantined=allow_quarantined)
         slot = next(slot for slot in self.config.quota_slots if slot.slot_id == assignment["slot_id"])
@@ -384,7 +387,7 @@ class BrokerProtocolTests(unittest.TestCase):
     def test_registry_rejects_operation_replay_and_stale_or_cross_project_claims(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             registry = BrokerRegistry(config(Path(directory) / "broker"))
-            registry.initialize()
+            registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             prepared = claim("prepare", {})
             signature = sign_claim(prepared, CLAIM_PRIVATE)
             registry.authorize(prepared, signature)
@@ -407,7 +410,7 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         self.root = Path(self.temporary.name) / "broker"
         self.selected = config(self.root)
         self.registry = BrokerRegistry(self.selected)
-        self.registry.initialize()
+        self.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         self.slot = self.selected.quota_slots[0]
         self._production_test_inspector = None
 
@@ -713,7 +716,7 @@ class QuotaSlotVerificationTests(unittest.TestCase):
         )
         other_config = config(Path(self.temporary.name) / "other" / "broker")
         other_registry = BrokerRegistry(other_config)
-        other_registry.initialize()
+        other_registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         other_registry.authorize(another, sign_claim(another, CLAIM_PRIVATE))
         other_manager = self.manager()
         other_manager.config = other_config
@@ -738,7 +741,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.selected = config(Path(self.temporary.name) / "broker")
         self.registry = BrokerRegistry(self.selected)
-        self.registry.initialize()
+        self.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -810,7 +813,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
         first = self.prepare_claim()
         self.registry.authorize(first, sign_claim(first, CLAIM_PRIVATE))
         restarted = BrokerRegistry(self.selected)
-        restarted.initialize()
+        restarted.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         self.assertEqual(restarted.task(first.task_id)["state"], "uncertain")
         self.assertEqual(
             restarted.task_slot(first.task_id, allow_quarantined=True)["state"],
@@ -842,7 +845,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
         self.registry.transition(first.task_id, "cancelling")
         self.registry.transition(first.task_id, "cleaning_up")
         restarted = BrokerRegistry(self.selected)
-        restarted.initialize()
+        restarted.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         self.assertEqual(restarted.task(first.task_id)["state"], "uncertain")
         self.assertEqual(
             restarted.task_slot(first.task_id, allow_quarantined=True)["state"],
@@ -942,7 +945,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
                 ),
             )
         os.chmod(legacy_registry.path, 0o600)
-        legacy_registry.initialize()
+        legacy_registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         row = legacy_registry.task(legacy.task_id)
         self.assertIsNone(row["slot_id"])
         self.assertEqual(legacy_registry.unassigned_legacy_tasks(), (legacy.task_id,))
@@ -950,7 +953,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
     def test_request_nonce_is_persistently_one_shot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             registry = BrokerRegistry(config(Path(directory) / "broker"))
-            registry.initialize()
+            registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             registry.consume_request_nonce("a" * 32, 100)
             with self.assertRaises(BrokerError) as replay:
                 registry.consume_request_nonce("a" * 32, 101)
@@ -959,7 +962,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
     def test_recovery_marks_running_work_uncertain_and_quarantines_container(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             registry = BrokerRegistry(config(Path(directory) / "broker"))
-            registry.initialize()
+            registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             prepared = claim("prepare", {})
             registry.authorize(prepared, sign_claim(prepared, CLAIM_PRIVATE))
             registry.transition(prepared.task_id, "ready")
@@ -967,7 +970,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
             registry.bind_container(prepared.task_id, prepared.allocation_id, "e" * 64)
             registry.transition(prepared.task_id, "running")
             restarted = BrokerRegistry(registry.config)
-            restarted.initialize()
+            restarted.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             self.assertEqual(restarted.task(prepared.task_id)["state"], "uncertain")
             with self.assertRaises(BrokerError) as quarantined:
                 restarted.owned_container(prepared.task_id)
@@ -977,11 +980,11 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             broker_config = config(Path(directory) / "broker")
             registry = BrokerRegistry(broker_config)
-            registry.initialize()
+            registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             request = claim("prepare", {})
             registry.authorize(request, sign_claim(request, CLAIM_PRIVATE))
             registry.begin_operation(request.operation_id)
-            registry.initialize()
+            registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             recorded: list[tuple[str, str]] = []
 
             async def record_outcome(task: TaskClaim, signature: str, state: str) -> None:
@@ -992,6 +995,7 @@ class DurableQuotaSlotRegistryTests(unittest.TestCase):
             service = BrokerService(
                 broker_config, operation_outcome_recorder=record_outcome,
             )
+            service.quota_manager = FakeQuotaManager(broker_config, service.registry)
             asyncio.run(service.recover())
             self.assertEqual(recorded, [(request.operation_id, "uncertain")])
             operation = registry.uncertain_operations()[0]
@@ -1165,13 +1169,14 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service.runtime.workspace_resolver = lambda task_id: self.service.task_paths(
             task_id, allow_quarantined=True,
         ).workspace
-        self.service.registry.initialize()
+        self.service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         self.service.readiness = BrokerReadiness(
             True, True, {"workspace_quota": True}, (),
         )
         self.service._started = True
 
     async def asyncTearDown(self) -> None:
+        await self.service.close()
         self.temporary.cleanup()
 
     async def test_dispatch_is_blocked_when_execution_readiness_is_false(self) -> None:
@@ -1197,6 +1202,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         initialize.assert_not_called()
         self.assertFalse(service.readiness.execution_available)
         self.assertTrue(service._started)
+        await service.close()
 
     async def test_startup_does_not_probe_podman_when_storage_roles_are_unverified(self) -> None:
         service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
@@ -1681,7 +1687,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service._handle_storage_assurance_loss(("inspector_unavailable",))
 
         restarted = BrokerRegistry(self.selected)
-        restarted.initialize()
+        restarted.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         persisted = restarted.container_record(record["task_id"])
         self.assertEqual(persisted["lifecycle_state"], "quarantined")
         self.assertIn("runtime_unavailable", persisted["reconciliation_evidence"])
@@ -1811,7 +1817,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
                 await self.service.dispatch(payload)
         self.assertEqual(self.service.registry.task(request.task_id)["state"], "uncertain")
         restarted = BrokerRegistry(self.selected)
-        restarted.initialize()
+        restarted.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         self.assertEqual(
             restarted.task_slot(request.task_id, allow_quarantined=True)["state"],
             "quarantined",
@@ -1885,7 +1891,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         service.runtime.workspace_resolver = lambda task_id: service.task_paths(
             task_id, allow_quarantined=True,
         ).workspace
-        service.registry.initialize()
+        service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         service.readiness = BrokerReadiness(True, True, {"workspace_quota": True}, ())
         service._started = True
         request = claim("prepare", {})
@@ -1940,7 +1946,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_live_lease_authority_fails_closed(self) -> None:
         service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
-        service.registry.initialize()
+        service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
         service._started = True
         request = claim("prepare", {})
         payload = OperationRequest(
@@ -1959,7 +1965,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             "path": "src/file.txt", "content": "new", "expected_sha256": None,
         })
         self.service.registry.authorize(operation, sign_claim(operation, CLAIM_PRIVATE))
-        BrokerRegistry(self.selected).initialize()
+        BrokerRegistry(self.selected).initialize(storage_verified=True, provision=True, adopt_legacy=True)
         with self.assertRaises(BrokerError) as quarantined:
             self.service.registry.authorize(operation, sign_claim(operation, CLAIM_PRIVATE))
         self.assertEqual(quarantined.exception.code, "operation_replayed")
@@ -1971,7 +1977,7 @@ class BrokerMtlsBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             selected = config(Path(directory) / "broker")
             service = BrokerService(selected)
-            service.registry.initialize()
+            service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             app = create_app(service)
             client = TestClient(app)
             response = client.get("/v1/ready")
@@ -1982,7 +1988,7 @@ class BrokerMtlsBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             selected = config(Path(directory) / "broker")
             service = BrokerService(selected)
-            service.registry.initialize()
+            service.registry.initialize(storage_verified=True, provision=True, adopt_legacy=True)
             client = TestClient(create_app(service), base_url="https://testserver")
             body = json.dumps({
                 "schema_version": 2, "claim": {}, "claim_signature": "0" * 128,

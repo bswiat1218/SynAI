@@ -249,6 +249,91 @@ quarantine or containment is claimed only when the registry write succeeds.
 This is the HIGH-3 registry-loss recovery boundary: no independent recovery
 journal or root-filesystem fallback is introduced here.
 
+### HIGH-3 registry trust and operator recovery
+
+Registry trust is reported separately by `/v1/ready`: state storage unverified;
+storage verified but registry not opened; registry verified/recoverable;
+registry unavailable; corrupt; identity/policy mismatch; recovery incomplete;
+and recovery verified/complete. Diagnostics report authority availability,
+unknown container identity, unresolved containment, and operator intervention
+without returning task contents or credentials. Unavailable historical state
+is an **unresolved host-containment concern**, not evidence that no containers
+exist. Quota inspection does not establish database integrity or ownership.
+
+Service startup never provisions or adopts a registry. It verifies the bounded
+state role first, opens only an existing database, verifies its identity seal,
+checks SQLite integrity/schema/references and task/container/slot bindings,
+preserves existing migrations and uncertain-operation recovery, and reconciles
+exact recorded containers. Readiness remains unavailable until reconciliation
+completes and all other isolation gates pass. Quarantined slots, legacy tasks
+without assignments, ambiguous allocations, or unverified containers keep
+recovery incomplete. A successful observation or repeat recovery call cannot
+clear a latched registry failure. Startup and reconciliation are single-flight.
+
+Two small files live only in the same approved bounded state role:
+`registry-identity.json` seals database device/inode, SHA-256 content, schema
+version, and the approved configuration fingerprint; `registry-interrupted`
+marks access that has not reached a verified persistence boundary. These are
+**not an emergency ownership ledger**: they contain no container IDs, approvals,
+or allocation history and cannot authorize recovery in place of SQLite.
+SQLite remains the sole ownership authority. Each serialized connection uses
+existing-only mode, full synchronous durability, integrity/reference checks,
+and a checked WAL checkpoint. After close, the seal is atomically replaced and
+fsynced; only then is the interruption marker removed and the directory fsynced.
+Unknown or missing active WAL/SHM, unexpected sidecars at a closed boundary,
+interruption markers, pending seals, replacement, or configuration changes
+require operator intervention. Connections are short-lived; normal close
+checkpoints and removes WAL/SHM, so their absence at a sealed closed boundary
+is expected, not interpreted as lost state. Checksums/integrity checks impose
+I/O cost; hashing is limited to the fixed 512 MiB state-file ceiling.
+
+Registry access rechecks the state-role assurance before persistent writes.
+SQLite, checkpoint, rollback, commit, filesystem, and seal failures revoke
+execution readiness, stop new allocation and slot reuse, and leave containment
+unresolved if its result cannot be persisted. Access and quota verification
+use consistent lock ordering and reentrant verification; SQLite/registry-lock
+waits are bounded to two seconds. The watchdog remains lifecycle-managed even
+when startup refuses state, but cannot restore readiness. Filesystem I/O itself
+can stall in the kernel; this code is not a proof of bounded physical I/O or
+power-loss durability. No unbounded fallback directory is used.
+
+**Operator-assisted procedure (requires separate approval; not automated):**
+
+1. Keep execution disabled. Preserve the database, WAL/SHM/journal, seal,
+   interruption marker, task roots, artifacts, and existing lab evidence;
+   do not delete sidecars or clear markers to make startup pass.
+2. Confirm dedicated service identity, real inspector freshness, bounded
+   state storage, filesystem identity, quota policy, capacity, and permissions.
+   Independently inspect database backups, integrity/schema, approved Core
+   claims, task/operation/approval history, exact container IDs and labels,
+   allocations, slot assignments, and reconciliation evidence.
+3. If ownership cannot be established, retain unresolved containment and
+   escalate to the operator. No prefix enumeration, broad cleanup, host process
+   killing, or speculative container termination is authorized.
+4. Obtain explicit approval for any restore, legacy adoption/migration, policy
+   change, or separately authorized exact-container recovery. Before first
+   provisioning, independently prove this is a new deployment, not lost history.
+   The offline library initialization API requires explicit `storage_verified`
+   and `provision`/`adopt_legacy` arguments; the service never passes provisioning
+   or adoption arguments. This is not a readiness bypass and no production
+   provisioning CLI, external authority/signing mechanism, or recovery tool is
+   installed by this phase. A seal alone is not an operator approval or proof
+   that historical state was complete.
+5. Restart only after an approved recovery establishes authoritative SQLite
+   history and coherent identity evidence. Require fresh storage verification
+   and exact reconciliation again; no uncertain operation is replayed and no
+   slot is automatically freed merely because a container stopped.
+
+HIGH-3's automatic refusal paths are implemented and tested with disposable
+SQLite databases, injected I/O/transaction failures, and fake runtimes.
+Production recovery/provisioning approval tooling, authentic historical
+baseline evidence, actual crash/power-loss durability, quota exhaustion under
+the kernel, and real-container reconciliation remain acceptance blockers.
+Path-use races (HIGH-4), complete runtime storage accounting (HIGH-5), and
+preexisting-file project-ID checks (MEDIUM-1) are deliberately not implemented.
+The seal is Broker-owned corruption/replacement detection, not protection
+against a compromised Broker identity rewriting both database and seal.
+
 These controls are unit-tested with fake runtime and registry adapters only.
 They do not establish real Podman stop/kill behavior, privileged-inspector
 availability, kernel quota enforcement, or production containment acceptance.

@@ -92,7 +92,7 @@ class QuotaSlotManager:
         self.reasons: tuple[str, ...] = ("workspace_quota_unverified",)
         self._mount_identity: tuple[str, str, int] | None = None
         self._mount_identity_lock = threading.Lock()
-        self._verification_lock = threading.Lock()
+        self._verification_lock = threading.RLock()
 
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         with self._verification_lock:
