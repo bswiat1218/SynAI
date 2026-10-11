@@ -1,4 +1,10 @@
-# SynAI architecture baseline
+# SynAI legacy agent architecture
+
+The authoritative SynAI 2.0 system baseline is
+[docs/architecture/synai-2.0.md](architecture/synai-2.0.md). This document
+retains the detailed legacy TUI and Phases 0–13E implementation history; it is
+not a replacement for the distributed trust boundaries, protocol contracts
+or Phase 13F-A prerequisites in the canonical baseline.
 
 This document records the current architecture before adding the opt-in
 coding-agent workflow. Existing components remain the authority for their

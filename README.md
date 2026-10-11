@@ -1,5 +1,12 @@
 # SynAI // terminal UI
 
+## Architecture documentation
+
+The authoritative SynAI 2.0 architecture baseline, trust boundaries,
+protocol contracts, ADRs and phase compatibility matrix are in
+[docs/architecture/synai-2.0.md](docs/architecture/synai-2.0.md). Distributed
+Agent Task execution and the Sandbox Broker are planned, not implemented.
+
 **SynAI** is a bold **'80s cyberpunk arcade Textual TUI** for coding with local or remote Ollama models: near-black violet panels, readable light text, cyan/hot-pink digital borders, and a retro masthead by default. Select a model, write a prompt, stream its answer, inspect provider-emitted reasoning, and reopen saved conversations. Native tools let eligible models read/edit a workspace, create files in any language, fetch HTTP resources, and run tests/builds/git inside a restricted non-root container or, with explicit consent, directly on the Linux host.
 
 This replaces the old benchmark CLI. `list-models`, `run`, and `run-all` are no longer commands. Existing `prompts/` and `results/` files are preserved, but are not automatically imported, run, or sent to the model.
