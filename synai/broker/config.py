@@ -202,6 +202,7 @@ class BrokerConfig:
     inspector_gid: int = 0
     inspector_timeout_seconds: float = 0.5
     inspector_max_age_seconds: int = 5
+    storage_watchdog_interval_seconds: float = 1.0
     quota_volume_bytes: int = 16 * 1024 * 1024 * 1024
     quota_volume_inodes: int = 262_144
     quota_reserve_bytes: int = 8 * 1024 * 1024 * 1024
@@ -306,8 +307,10 @@ class BrokerConfig:
             or not 0.05 <= self.inspector_timeout_seconds <= 2
             or type(self.inspector_max_age_seconds) is not int
             or not 1 <= self.inspector_max_age_seconds <= 30
+            or type(self.storage_watchdog_interval_seconds) not in {int, float}
+            or not 0.1 <= self.storage_watchdog_interval_seconds < self.inspector_max_age_seconds
         ):
-            raise ValueError("Inspector identity or timeout policy is invalid")
+            raise ValueError("Inspector or storage-watchdog timing policy is invalid")
         role_bytes = sum(role.byte_limit for role in self.storage_roles)
         role_inodes = sum(role.inode_limit for role in self.storage_roles)
         if self.storage_roles and (
@@ -391,6 +394,9 @@ class BrokerConfig:
             ),
             inspector_uid=int(os.environ.get("SYNAI_BROKER_INSPECTOR_UID", "0")),
             inspector_gid=int(os.environ.get("SYNAI_BROKER_INSPECTOR_GID", "0")),
+            storage_watchdog_interval_seconds=float(os.environ.get(
+                "SYNAI_BROKER_STORAGE_WATCHDOG_INTERVAL_SECONDS", "1.0",
+            )),
             quota_volume_bytes=int(os.environ.get(
                 "SYNAI_BROKER_QUOTA_VOLUME_BYTES", str(16 * 1024 * 1024 * 1024),
             )),

@@ -4,10 +4,13 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
+import sqlite3
 import stat
 import time
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +38,8 @@ from synai.broker.snapshots import (
     stage_snapshot,
     validate_snapshot,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SnapshotRetriever(Protocol):
@@ -113,8 +118,12 @@ class BrokerService:
         self.readiness = None
         self._started = False
         self._task_locks: dict[str, asyncio.Lock] = {}
+        self._storage_assurance_lock = asyncio.Lock()
+        self._storage_watchdog_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
+        if self._started:
+            return
         state_role = next(
             (role for role in self.config.storage_roles if role.kind == "broker_state"),
             None,
@@ -146,6 +155,7 @@ class BrokerService:
             else:
                 self.readiness = _readiness_with_storage(self.config, False)
         self._started = True
+        self._start_storage_watchdog()
 
     def task_paths(self, task_id: str, *, allow_quarantined: bool = False) -> TaskWorkspacePaths:
         root = self.quota_manager.resolve_task_root(
@@ -182,8 +192,85 @@ class BrokerService:
         self.registry.release_slot(task_id, evidence)
 
     async def close(self) -> None:
+        watchdog = self._storage_watchdog_task
+        self._storage_watchdog_task = None
+        if watchdog is not None:
+            watchdog.cancel()
+            try:
+                await watchdog
+            except asyncio.CancelledError:
+                pass
         if self.core_client is not None:
             await self.core_client.close()
+
+    def _start_storage_watchdog(self) -> None:
+        if self._storage_watchdog_task is None:
+            task = asyncio.create_task(
+                self._storage_watchdog_loop(),
+                name="synai-broker-storage-watchdog",
+            )
+            task.add_done_callback(self._storage_watchdog_finished)
+            self._storage_watchdog_task = task
+
+    async def _storage_watchdog_loop(self) -> None:
+        interval = self.config.storage_watchdog_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            async with self._storage_assurance_lock:
+                try:
+                    storage_ready, reasons = await asyncio.to_thread(
+                        self.quota_manager.verify_startup,
+                    )
+                except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                    self._invalidate_storage_readiness("storage_watchdog_failed")
+                    logger.error(
+                        "Broker storage watchdog could not verify assurance: %s",
+                        type(exc).__name__,
+                    )
+                    continue
+                if not storage_ready:
+                    try:
+                        await self._handle_storage_assurance_loss(reasons)
+                    except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                        self._invalidate_storage_readiness(
+                            "storage_loss_handling_failed",
+                        )
+                        logger.error(
+                            "Broker storage assurance loss handling failed: %s",
+                            type(exc).__name__,
+                        )
+
+    def _storage_watchdog_finished(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            if self._storage_watchdog_task is task:
+                self._invalidate_storage_readiness("storage_watchdog_stopped")
+                logger.error("Broker storage watchdog was cancelled unexpectedly")
+                self._storage_watchdog_task = None
+                self._start_storage_watchdog()
+            return
+        error = task.exception()
+        if error is not None:
+            self._invalidate_storage_readiness("storage_watchdog_stopped")
+            logger.error(
+                "Broker storage watchdog stopped unexpectedly: %s",
+                type(error).__name__,
+            )
+            if self._storage_watchdog_task is task:
+                self._storage_watchdog_task = None
+                self._start_storage_watchdog()
+
+    def _invalidate_storage_readiness(self, reason: str) -> None:
+        checks = dict(self.readiness.checks) if self.readiness is not None else {}
+        checks["workspace_quota"] = False
+        checks["storage_inventory"] = False
+        checks["storage_inspector"] = False
+        self.readiness = BrokerReadiness(
+            False, False, checks,
+            tuple(dict.fromkeys((
+                *(self.readiness.reasons if self.readiness is not None else ()),
+                reason,
+            ))),
+        )
 
     async def recover(self) -> None:
         if self.operation_outcome_recorder is not None:
@@ -283,39 +370,40 @@ class BrokerService:
             raise BrokerError("lease_authority_unavailable", "Current task lease authority is unavailable.", 503) from exc
         if current_lease is not True:
             raise BrokerError("stale_fence", "Task lease is stale or no longer authorized.", 409)
-        if self.readiness is None or not self.readiness.execution_available:
-            raise BrokerError(
-                "execution_unavailable",
-                "Broker execution security readiness is not satisfied.",
-                503,
+        async with self._storage_assurance_lock:
+            if self.readiness is None or not self.readiness.execution_available:
+                raise BrokerError(
+                    "execution_unavailable",
+                    "Broker execution security readiness is not satisfied.",
+                    503,
+                )
+            storage_ready, storage_reasons = await asyncio.to_thread(
+                self.quota_manager.verify_startup,
             )
-        storage_ready, storage_reasons = await asyncio.to_thread(
-            self.quota_manager.verify_startup,
-        )
-        if not storage_ready:
-            await self._handle_storage_assurance_loss(storage_reasons)
-            raise BrokerError(
-                "storage_inspection_unavailable",
-                "Fresh bounded-storage inspection is unavailable or inconsistent.",
-                503,
+            if not storage_ready:
+                await self._handle_storage_assurance_loss(storage_reasons)
+                raise BrokerError(
+                    "storage_inspection_unavailable",
+                    "Fresh bounded-storage inspection is unavailable or inconsistent.",
+                    503,
+                )
+            if claim.tool_kind == "prepare" and (
+                self.readiness is None
+                or self.readiness.checks.get("workspace_quota") is not True
+            ):
+                raise BrokerError(
+                    "workspace_quota_unverified",
+                    "No verified Broker quota slot is available for task preparation.",
+                    503,
+                )
+            eligible_slots = (
+                self.quota_manager.verified_slot_ids
+                if claim.tool_kind == "prepare"
+                else None
             )
-        if claim.tool_kind == "prepare" and (
-            self.readiness is None
-            or self.readiness.checks.get("workspace_quota") is not True
-        ):
-            raise BrokerError(
-                "workspace_quota_unverified",
-                "No verified Broker quota slot is available for task preparation.",
-                503,
+            self.registry.authorize(
+                claim, payload.claim_signature, eligible_slot_ids=eligible_slots,
             )
-        eligible_slots = (
-            self.quota_manager.verified_slot_ids
-            if claim.tool_kind == "prepare"
-            else None
-        )
-        self.registry.authorize(
-            claim, payload.claim_signature, eligible_slot_ids=eligible_slots,
-        )
         side_effects_started = False
         operation_completed = False
         try:
@@ -518,25 +606,24 @@ class BrokerService:
                 done, _ = await asyncio.wait({operation}, timeout=2)
                 if done:
                     return operation.result()
-                try:
-                    storage_ready, storage_reasons = await asyncio.to_thread(
-                        self.quota_manager.verify_startup,
-                    )
-                except (BrokerError, OSError, ValueError, sqlite3.Error):
-                    self.quota_manager.runtime_containment_available = False
-                    storage_ready = False
-                    storage_reasons = ("storage_verification_failed",)
-                if not storage_ready:
+                async with self._storage_assurance_lock:
                     try:
+                        storage_ready, storage_reasons = await asyncio.to_thread(
+                            self.quota_manager.verify_startup,
+                        )
+                    except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error):
+                        storage_ready = False
+                        storage_reasons = ("storage_verification_failed",)
+                    if not storage_ready:
                         await self._handle_storage_assurance_loss(storage_reasons)
-                    finally:
-                        operation.cancel()
-                        try:
-                            await operation
-                        except (
-                            asyncio.CancelledError, BrokerError, OSError, TimeoutError,
-                        ):
-                            pass
+                if not storage_ready:
+                    operation.cancel()
+                    try:
+                        await operation
+                    except (
+                        asyncio.CancelledError, BrokerError, OSError, TimeoutError,
+                    ):
+                        pass
                     raise BrokerError(
                         "storage_inspection_unavailable",
                         "Storage assurance was lost during task execution.",
@@ -763,7 +850,14 @@ class BrokerService:
 
 
 def create_app(service: BrokerService) -> FastAPI:
-    app = FastAPI(title="SynAI Sandbox Broker", version="1")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            await service.close()
+
+    app = FastAPI(title="SynAI Sandbox Broker", version="1", lifespan=lifespan)
     app.state.broker = service
 
     @app.exception_handler(BrokerError)

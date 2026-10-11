@@ -12,7 +12,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -1209,8 +1209,81 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             patch.object(service.runtime, "verify_startup", new_callable=AsyncMock) as verify_runtime,
         ):
             await service.start()
-        verify_runtime.assert_not_awaited()
+        try:
+            verify_runtime.assert_not_awaited()
+            self.assertFalse(service.readiness.execution_available)
+        finally:
+            await service.close()
+
+    async def test_storage_watchdog_detects_idle_loss_and_does_not_reenable_readiness(self) -> None:
+        service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
+        service.config = replace(
+            self.selected, storage_watchdog_interval_seconds=0.1,
+        )
+        service.quota_manager = FakeQuotaManager(self.selected, service.registry)
+        service.runtime.workspace_resolver = lambda task_id: service.task_paths(
+            task_id, allow_quarantined=True,
+        ).workspace
+        service.quota_manager.verify_startup = Mock(side_effect=[
+            (True, ()), (True, ()), (False, ("storage_role_unavailable",)),
+            (True, ()),
+        ])
+        with (
+            patch.object(
+                service.quota_manager, "verify_storage_role",
+                return_value=True, create=True,
+            ),
+            patch.object(
+                service.runtime, "verify_startup",
+                new_callable=AsyncMock,
+                return_value=BrokerReadiness(True, True, {"runtime": True}, ()),
+            ),
+        ):
+            await service.start()
+            self.assertIsNotNone(service._storage_watchdog_task)
+            deadline = asyncio.get_running_loop().time() + 2
+            while service.readiness.execution_available and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.02)
+            self.assertFalse(service.readiness.execution_available)
+            self.assertIn("storage_role_unavailable", service.readiness.reasons)
+            await asyncio.sleep(0.15)
+            self.assertFalse(service.readiness.execution_available)
+            self.assertEqual(service.quota_manager.verify_startup.call_count, 4)
+            await service.close()
+        self.assertIsNone(service._storage_watchdog_task)
+
+    async def test_storage_watchdog_unexpected_cancellation_revokes_readiness(self) -> None:
+        service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
+        service.config = replace(
+            self.selected, storage_watchdog_interval_seconds=0.1,
+        )
+        service.readiness = BrokerReadiness(True, True, {"workspace_quota": True}, ())
+        service._started = True
+        service._start_storage_watchdog()
+        watchdog = service._storage_watchdog_task
+        self.assertIsNotNone(watchdog)
+        watchdog.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await watchdog
+        await asyncio.sleep(0)
         self.assertFalse(service.readiness.execution_available)
+        self.assertIn("storage_watchdog_stopped", service.readiness.reasons)
+        self.assertIsNotNone(service._storage_watchdog_task)
+        self.assertIsNot(service._storage_watchdog_task, watchdog)
+        await service.close()
+
+    async def test_storage_watchdog_is_singleton_and_shutdown_is_deterministic(self) -> None:
+        service = BrokerService(self.selected, snapshot_retriever=self.snapshots)
+        service.config = replace(
+            self.selected, storage_watchdog_interval_seconds=0.1,
+        )
+        service._started = True
+        service._start_storage_watchdog()
+        watchdog = service._storage_watchdog_task
+        service._start_storage_watchdog()
+        self.assertIs(service._storage_watchdog_task, watchdog)
+        await service.close()
+        self.assertTrue(watchdog.cancelled())
 
     async def test_storage_assurance_loss_quarantines_and_verifies_exact_container(self) -> None:
         request = claim("prepare", {})

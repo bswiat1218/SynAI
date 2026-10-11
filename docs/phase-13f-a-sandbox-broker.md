@@ -191,6 +191,26 @@ hard bound; a root-backed or otherwise unbounded role fails inventory checks.
 External service-manager logging policy and helper confinement still require
 deployment acceptance.
 
+After startup has opened the verified registry and completed reconciliation,
+the Broker runs one independent storage-assurance watchdog. Its default
+interval is one second and can be configured with
+`SYNAI_BROKER_STORAGE_WATCHDOG_INTERVAL_SECONDS`; it must remain below the
+inspector evidence maximum age. The watchdog serializes its checks with
+operation admission, covers idle periods, and applies to every operation
+class. Missing, expired, inconsistent, or unavailable evidence immediately
+revokes Broker execution readiness. A watchdog exception also revokes
+readiness and is logged; it is not treated as a successful check.
+
+Readiness is deliberately latched unavailable after assurance loss. A later
+successful periodic observation cannot restore it: a service restart must
+reopen the verified registry, complete recovery/reconciliation, and pass all
+startup gates before readiness can return. If state-role verification prevents
+registry initialization, the service refuses startup recovery and creates no
+replacement database or fallback journal. Shutdown cancels and joins the
+watchdog before closing the Core client. The Python watchdog and fake-runtime
+tests do not establish privileged-inspector freshness, kernel quota
+enforcement, or real-container containment.
+
 For a 16 GiB candidate volume, total role entitlements and the 8 GiB /
 16,384-inode reserves must fit the observed capacity; live free capacity is
 rechecked at startup and before operations. Each task's snapshot, writable
