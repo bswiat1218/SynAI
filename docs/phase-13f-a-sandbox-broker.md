@@ -99,8 +99,9 @@ Runtime policy is fixed in Broker code: rootless Podman, a single operator-
 configured `repository@sha256:...` image, non-root container UID 65532,
 no added capabilities, dropped `ALL`, no-new-privileges, the configured
 seccomp profile, `--network=none`, private IPC, no host PID/IPC/network,
-read-only image root, a private bounded tmpfs, and one exact Broker workspace
-bind mount. No caller-supplied mount/image/privilege/runtime option is
+read-only image root, a private `/tmp` tmpfs limited to 64 MiB and 4096
+inodes, and one exact Broker workspace bind mount. No caller-supplied
+mount/image/privilege/runtime option is
 accepted. CPU, RAM, PIDs, wall time, and output have fixed ceilings. The
 Broker never pulls images.
 
@@ -203,9 +204,15 @@ custody require deployment-specific least-privilege review.
 
 ## Phase 13F-A.1 acceptance matrix
 
+Phase 13F-A.2 host findings, storage design, mTLS handshake evidence,
+operator provisioning/rollback procedure, and reviewer package are recorded
+in the
+[Phase 13F-A.2 qualification package](./security/phase-13f-a2-qualification.md).
+That package is not an independent security review or runtime acceptance.
+
 | Invariant | Enforcement | Test/evidence | Result |
 |---|---|---|---|
-| Core–Broker mTLS, no public listener | Loopback TLS listeners and mandatory client certs | TLS handshake with provisioned identities not run | BLOCKED |
+| Core–Broker mTLS, no public listener | Loopback TLS listeners and mandatory client certs | Disposable loopback TLS test; production identities/route unprovisioned | BLOCKED (production) |
 | Signed, bounded, replay-resistant claims | Core authority and Broker registry | `tests.test_broker_authority`, `tests.test_broker` | PASS (unit) |
 | Exact one-use snapshot grant | Core snapshot grant and Broker manifest/hash validation | `test_exact_snapshot_grant_is_scoped_one_use_and_digest_bound` and snapshot tests | PASS (unit) |
 | Live lease, revocation, monotonic fencing | Core authority checked before and during command operations | authority unit tests; real long-running container revocation not run | BLOCKED (runtime) |

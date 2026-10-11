@@ -9,6 +9,7 @@ import unittest
 import asyncio
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -25,6 +26,7 @@ from synai.broker.protocol import (
     verify_claim,
 )
 from synai.broker.registry import BrokerRegistry
+from synai.broker.runtime import RootlessPodmanRuntime
 from synai.broker.snapshots import (
     changed_files,
     load_staged_manifest,
@@ -407,6 +409,23 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         self.temporary.cleanup()
+
+    async def test_container_tmpfs_has_both_byte_and_inode_limits(self) -> None:
+        runtime = RootlessPodmanRuntime(self.selected, self.service.registry)
+        runtime.readiness = BrokerReadiness(True, True, {}, ())
+        with patch.object(runtime, "_run", new_callable=AsyncMock) as run:
+            run.return_value = "a" * 64
+            await runtime.create_task(
+                "1" * 32, "2" * 32,
+                self.root / "tasks" / ("1" * 32) / "workspace",
+            )
+
+        arguments = run.await_args.args
+        tmpfs = arguments[arguments.index("--tmpfs") + 1]
+        self.assertEqual(
+            tmpfs,
+            "/tmp:rw,noexec,nosuid,nodev,size=64m,nr_inodes=4096,mode=1777",
+        )
 
     async def test_prepare_and_scoped_read_uses_exact_immutable_snapshot(self) -> None:
         initial = claim("prepare", {})

@@ -111,7 +111,7 @@ class RootlessPodmanRuntime:
             "--security-opt", "seccomp=/usr/share/containers/seccomp.json",
             "--network", "none", "--ipc", "private",
             "--read-only", "--read-only-tmpfs=false",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,nr_inodes=4096,mode=1777",
             "--memory", str(self.config.profile.memory_bytes),
             "--cpus", str(self.config.profile.cpus),
             "--pids-limit", str(self.config.profile.pids),
