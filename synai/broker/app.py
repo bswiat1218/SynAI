@@ -5,9 +5,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
@@ -59,6 +61,15 @@ class OperationRequest(BaseModel):
     snapshot_grant: str | None = Field(default=None, min_length=32, max_length=128)
 
 
+@dataclass(frozen=True)
+class TaskWorkspacePaths:
+    slot_root: Path
+    task_root: Path
+    snapshot: Path
+    manifest: Path
+    workspace: Path
+
+
 class BrokerService:
     def __init__(
         self,
@@ -69,11 +80,17 @@ class BrokerService:
         operation_starter: OperationStarter | None = None,
         result_recorder: ResultRecorder | None = None,
         operation_outcome_recorder: OperationOutcomeRecorder | None = None,
+        quota_manager: Any | None = None,
     ) -> None:
         config.validate()
         self.config = config
         self.registry = BrokerRegistry(config)
         self.runtime = RootlessPodmanRuntime(config, self.registry)
+        from synai.broker.quota_slots import QuotaSlotManager
+        self.quota_manager = quota_manager or QuotaSlotManager(config, self.registry)
+        self.runtime.workspace_resolver = lambda task_id: self.task_paths(
+            task_id, allow_quarantined=True,
+        ).workspace
         self.core_client = None
         if config.readiness().checks.get("mtls_material") is True:
             from synai.broker.core_client import CoreBrokerClient
@@ -96,8 +113,51 @@ class BrokerService:
 
     async def start(self) -> None:
         self.registry.initialize()
-        self.readiness = await self.runtime.verify_startup()
+        quota_ready, _ = self.quota_manager.verify_startup()
+        base = self.config.readiness(workspace_quota_verified=quota_ready)
+        self.readiness = await self.runtime.verify_startup(base)
         await self.recover()
+        self.quota_manager.recover_pending_releases()
+        quota_ready, _ = self.quota_manager.verify_startup()
+        self.readiness = await self.runtime.verify_startup(
+            self.config.readiness(workspace_quota_verified=quota_ready),
+        )
+
+    def task_paths(self, task_id: str, *, allow_quarantined: bool = False) -> TaskWorkspacePaths:
+        root = self.quota_manager.resolve_task_root(
+            task_id, allow_quarantined=allow_quarantined,
+        )
+        return TaskWorkspacePaths(
+            slot_root=root.parent,
+            task_root=root,
+            snapshot=root / "snapshot",
+            manifest=root / "manifest.json",
+            workspace=root / "workspace",
+        )
+
+    def release_task_slot(self, task_id: str) -> None:
+        task_root = self.quota_manager.verify_releasable(task_id)
+        if task_root.exists():
+            if any(task_root.iterdir()):
+                self.registry.quarantine_slot(task_id)
+                raise BrokerError(
+                    "workspace_cleanup_incomplete",
+                    "Task slot is not empty and cannot be returned to the free pool.",
+                    409,
+                )
+            task_root.rmdir()
+        assignment = self.registry.task_slot(task_id)
+        evidence = hashlib.sha256(
+            f"{task_id}\n{assignment['release_evidence']}\nverified_empty".encode(),
+        ).hexdigest()
+        selected = next(
+            slot for slot in self.config.quota_slots
+            if slot.slot_id == assignment["slot_id"]
+        )
+        self.quota_manager.inspector.inspect(
+            selected, uid=self.config.service_uid, gid=self.config.service_gid,
+        )
+        self.registry.release_slot(task_id, evidence)
 
     async def close(self) -> None:
         if self.core_client is not None:
@@ -119,6 +179,20 @@ class BrokerService:
                     continue
         for record in self.registry.container_records():
             task_id = record["task_id"]
+            if record["lifecycle_state"] == "removed":
+                try:
+                    await self.runtime.verify_removed(task_id)
+                except (BrokerError, OSError, TimeoutError) as exc:
+                    self.registry.record_reconciliation(
+                        task_id, "quarantined",
+                        canonical_json({
+                            "state": "removal_unverified",
+                            "error_code": exc.code if isinstance(exc, BrokerError) else "runtime_unavailable",
+                            "observed_at": int(time.time()),
+                        }).decode(),
+                    )
+                    self.registry.quarantine_slot(task_id)
+                continue
             if not record["container_id"]:
                 self.registry.record_reconciliation(
                     task_id, "quarantined",
@@ -181,8 +255,25 @@ class BrokerService:
             raise BrokerError("lease_authority_unavailable", "Current task lease authority is unavailable.", 503) from exc
         if current_lease is not True:
             raise BrokerError("stale_fence", "Task lease is stale or no longer authorized.", 409)
-        self.registry.authorize(claim, payload.claim_signature)
+        if claim.tool_kind == "prepare" and (
+            self.readiness is None
+            or self.readiness.checks.get("workspace_quota") is not True
+        ):
+            raise BrokerError(
+                "workspace_quota_unverified",
+                "No verified Broker quota slot is available for task preparation.",
+                503,
+            )
+        eligible_slots = (
+            self.quota_manager.verified_slot_ids
+            if claim.tool_kind == "prepare"
+            else None
+        )
+        self.registry.authorize(
+            claim, payload.claim_signature, eligible_slot_ids=eligible_slots,
+        )
         side_effects_started = False
+        operation_completed = False
         try:
             remaining = min(
                 self.config.profile.operation_seconds,
@@ -244,12 +335,32 @@ class BrokerService:
                 raise BrokerError("operation_output_limit", "Task operation result exceeds its configured limit.", 413)
             if self.result_recorder is not None:
                 await self.result_recorder(claim, payload.claim_signature, result_envelope)
-            self.registry.complete_operation(claim.operation_id, "completed", encoded.decode("utf-8"))
+            audit_record: dict[str, Any] = {
+                "schema_version": 1,
+                "operation_id": claim.operation_id,
+                "task_id": claim.task_id,
+                "status": "completed",
+                "result_sha256": hashlib.sha256(encoded).hexdigest(),
+                "result_bytes": len(encoded),
+            }
+            if claim.tool_kind == "collect":
+                audit_record["artifact_manifest_path"] = (
+                    f"artifacts/{claim.operation_id}.json"
+                )
+            self.registry.complete_operation(
+                claim.operation_id, "completed",
+                canonical_json(audit_record).decode("utf-8"),
+            )
+            operation_completed = True
+            if self.registry.task(claim.task_id)["state"] == "removed":
+                self.release_task_slot(claim.task_id)
             return {
                 "schema_version": 1, "operation_id": claim.operation_id,
                 "task_id": claim.task_id, "status": "completed", "result": result,
             }
         except BrokerError:
+            if operation_completed:
+                raise
             terminal = "uncertain" if side_effects_started else "failed_before_effects"
             self.registry.complete_operation(
                 claim.operation_id, terminal,
@@ -265,6 +376,8 @@ class BrokerService:
                 )
             raise
         except (OSError, TimeoutError, asyncio.CancelledError):
+            if operation_completed:
+                raise
             terminal = "uncertain" if side_effects_started else "failed_before_effects"
             self.registry.complete_operation(claim.operation_id, terminal)
             if claim.tool_kind == "prepare":
@@ -278,6 +391,8 @@ class BrokerService:
                 )
             raise
         except Exception:
+            if operation_completed:
+                raise
             terminal = "uncertain" if side_effects_started else "failed_before_effects"
             self.registry.complete_operation(claim.operation_id, terminal)
             if claim.tool_kind == "prepare":
@@ -371,7 +486,16 @@ class BrokerService:
             if manifest["project_id"] != claim.project_id:
                 raise BrokerError("snapshot_project_mismatch", "Snapshot belongs to another logical project.", 403)
             mark_side_effect()
-            stage_snapshot(self.config.state_dir, claim.task_id, manifest, files)
+            task_root = self.quota_manager.create_task_root(claim.task_id)
+            paths = self.task_paths(claim.task_id)
+            if paths.task_root != task_root:
+                self.registry.quarantine_slot(claim.task_id)
+                raise BrokerError(
+                    "workspace_slot_mismatch",
+                    "Created task directory differs from its durable quota slot.",
+                    409,
+                )
+            stage_snapshot(paths.task_root, manifest, files)
             self.registry.transition(claim.task_id, "ready")
             return {
                 "state": "ready", "snapshot_id": claim.snapshot_id,
@@ -383,7 +507,7 @@ class BrokerService:
             allocation_id = claim.allocation_id
             mark_side_effect()
             self.registry.reserve_container(claim.task_id, allocation_id)
-            workspace = self.config.state_dir / "tasks" / claim.task_id / "workspace"
+            workspace = self.task_paths(claim.task_id).workspace
             try:
                 container_id = await self.runtime.create_task(claim.task_id, allocation_id, workspace)
                 self.registry.bind_container(claim.task_id, allocation_id, container_id)
@@ -421,7 +545,8 @@ class BrokerService:
             task = self.registry.task(claim.task_id)
             if task["state"] not in {"ready", "running"}:
                 raise BrokerError("task_state_invalid", "Task workspace is not available for an operation.", 409)
-            workspace = self.config.state_dir / "tasks" / claim.task_id / "workspace"
+            paths = self.task_paths(claim.task_id)
+            workspace = paths.workspace
             if kind in {"write_file", "patch_file", "delete_file"}:
                 mark_side_effect()
             result = execute_file_operation(workspace, kind, arguments, self.config.profile.output_bytes)
@@ -442,15 +567,21 @@ class BrokerService:
             return result
         if kind == "collect":
             task = self.registry.task(claim.task_id)
-            workspace = self.config.state_dir / "tasks" / claim.task_id / "workspace"
+            paths = self.task_paths(claim.task_id)
+            workspace = paths.workspace
             manifest = load_staged_manifest(
-                self.config.state_dir, claim.task_id, task["snapshot_digest"],
+                paths.task_root, task["snapshot_digest"],
             )
             changes = changed_files(
                 workspace, manifest, self.config.profile.workspace_bytes,
                 self.config.profile.output_bytes,
             )
-            artifact_digest = hashlib.sha256(canonical_json(changes)).hexdigest()
+            artifact_bytes = canonical_json(changes)
+            artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
+            mark_side_effect()
+            _persist_artifact_evidence(
+                paths.task_root, claim.operation_id, artifact_bytes,
+            )
             return {
                 "input_snapshot_digest": task["snapshot_digest"],
                 "changed_files": changes, "artifact_manifest_sha256": artifact_digest,
@@ -480,9 +611,15 @@ class BrokerService:
                 container = self.registry.container_record(claim.task_id)
                 if container is None:
                     mark_side_effect()
-                    task_root = self.config.state_dir / "tasks" / claim.task_id
+                    task_root = self.quota_manager.verify_releasable(claim.task_id)
                     _remove_task_tree(task_root)
                     self.registry.transition(claim.task_id, "removed")
+                    release_evidence = hashlib.sha256(
+                        f"{claim.allocation_id}\ncancelled_before_start".encode(),
+                    ).hexdigest()
+                    self.registry.mark_slot_release_pending(
+                        claim.task_id, claim.operation_id, release_evidence,
+                    )
                     return {"state": "removed", "cancelled_before_start": True}
                 if container["lifecycle_state"] not in {"owned", "terminated"}:
                     raise BrokerError("container_quarantined", "Task container allocation is uncertain and cannot be cleaned automatically.", 409)
@@ -492,6 +629,11 @@ class BrokerService:
                 if kind == "remove":
                     cleanup = await self.runtime.remove_owned(claim.task_id)
                     self.registry.transition(claim.task_id, "removed")
+                    task_root = self.quota_manager.verify_releasable(claim.task_id)
+                    _remove_task_tree(task_root)
+                    self.registry.mark_slot_release_pending(
+                        claim.task_id, claim.operation_id, cleanup,
+                    )
                     return {"state": "removed", "termination_evidence": evidence, "cleanup_evidence": cleanup}
                 return {"state": "cleaning_up", "termination_evidence": evidence}
             except BrokerError:
@@ -637,3 +779,65 @@ def _remove_task_tree(task_root: Path) -> None:
                 raise BrokerError("workspace_cleanup_refused", "Task workspace contains an untrusted filesystem entry.", 409)
     import shutil
     shutil.rmtree(task_root)
+
+
+def _persist_artifact_evidence(task_root: Path, operation_id: str, content: bytes) -> None:
+    if not re.fullmatch(r"[a-f0-9]{32}", operation_id):
+        raise BrokerError("artifact_identity_invalid", "Artifact operation identity is invalid.", 500)
+    artifacts = task_root / "artifacts"
+    try:
+        artifacts.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    try:
+        info = artifacts.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise BrokerError(
+                "artifact_storage_unsafe",
+                "Task artifact evidence directory is not safely owned.",
+                409,
+            )
+        directory_fd = os.open(
+            artifacts, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            info = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise BrokerError(
+                    "artifact_storage_unsafe",
+                    "Task artifact evidence directory changed during validation.",
+                    409,
+                )
+            descriptor = os.open(
+                f"{operation_id}.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                view = memoryview(content)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("Artifact evidence write made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BrokerError:
+        raise
+    except OSError as exc:
+        raise BrokerError(
+            "artifact_storage_unavailable",
+            "Task artifact evidence could not be durably stored inside its quota slot.",
+            507,
+        ) from exc

@@ -108,18 +108,83 @@ Broker never pulls images.
 Startup checks rootless mode, cgroup v2, seccomp support/profile, user-
 namespace mapping, an enforcing AppArmor/SELinux runtime, the local image
 digest, private state, and a workspace quota mechanism. Any missing check
-makes execution unavailable. The workspace-quota check is deliberately
-false until an enforceable aggregate writable-storage limit has been
-reviewed and implemented; counting files after a command is not an
-enforcement mechanism.
+makes execution unavailable. Workspace quota readiness is true only after
+live ext4 project-quota state and the complete configured slot inventory
+have been verified; it is not inferred from configuration or `df` output.
 
 The inspected host reports rootless Podman 5.7, cgroup v2, seccomp support,
 subordinate UID/GID ranges, and a user namespace. It has no local test image.
 Podman reports AppArmor disabled and SELinux disabled. No separate Broker
 identity or approved test image was provisioned. The process must not run
 under the current Core identity; the code does not create a service account.
-There is no enforceable aggregate workspace byte/inode quota. Therefore the
-current machine cannot pass Broker runtime readiness.
+The current host has no provisioned dedicated quota filesystem or approved
+Broker identity, so it cannot pass Broker runtime readiness.
+
+## Phase 13F-A.5 — quota-aware task workspace slots
+
+Broker configuration accepts an operator-defined inventory of at most four
+pre-provisioned slots. Each has a canonical path, expected ext4 UUID, unique
+project ID, and fixed byte/inode hard limits (at most 256 MiB and 4,096
+inodes). The initial active-container limit remains one. Claims and operation
+arguments cannot select paths, project IDs, or quota settings.
+
+The operator inventory is supplied only through
+`SYNAI_BROKER_QUOTA_SLOTS` (JSON entries with `slot_id`, `path`,
+`mount_path`, `filesystem_uuid`, `project_id`, `byte_limit`, and
+`inode_limit`). `SYNAI_BROKER_SERVICE_GID` binds the expected primary group.
+The aggregate capacity/reserve and active-task ceilings are
+`SYNAI_BROKER_QUOTA_VOLUME_BYTES`, `SYNAI_BROKER_QUOTA_RESERVE_BYTES`,
+`SYNAI_BROKER_QUOTA_RESERVE_INODES`, and
+`SYNAI_BROKER_MAX_ACTIVE_TASKS`. These are operator configuration only and
+are checked against live filesystem state.
+
+Before readiness, the Broker checks the live ext4 mount identity and
+`prjquota`/`pquota` mount state, the UUID-to-device mapping, slot and parent
+ownership, project ID/inheritance attributes, live project hard quotas and
+usage through read-only `quotactl(Q_GETQUOTA)`, aggregate capacity/reserve,
+directory inventory, private registry identity, and absence of effective
+Linux capabilities or extra service groups. Checks use no-follow directory
+opens and kernel mount IDs. If an unprivileged Broker cannot read any required
+state, the slot is unavailable and readiness remains false. New task
+directories are created under a verified slot and their inherited project
+ID is confirmed before snapshot bytes are staged.
+
+The SQLite registry transactionally binds each task and allocation to one
+fixed slot using a collision-resistant private ownership token. Slot states
+are `free`, `allocated`, `release_pending`, or `quarantined`. Restart marks
+in-flight tasks uncertain and quarantines their slot; it never moves task
+files or reuses an uncertain slot. Removal enters a durable release-pending
+state, and the slot returns to `free` only after operation evidence, empty
+workspace verification, and (when a container existed) independent Podman
+confirmation that its owned container is absent. Ambiguity quarantines the
+slot. Historical tasks without assignments are preserved and block new
+workspace readiness rather than being silently relocated.
+
+For the 16 GiB candidate volume, four 256 MiB hard-limited task slots cap
+task allocation at 1 GiB total and 16,384 inodes; one active task remains the
+initial runtime acceptance limit. Each task's immutable snapshot, writable
+copy, and collected artifacts consume the same per-slot quota. The verifier
+requires at least 8 GiB of free-byte reserve and 16,384 free inodes. Up to
+7 GiB is left for ext4 metadata and additional operational headroom after
+the slot ceilings and free reserve; it is not a larger task quota. Rootless
+Podman image storage must use a different filesystem with a separately
+operator-managed capacity limit. The Broker registry and logs remain in
+private state/system logging outside the task quota filesystem and require
+their own operator-managed capacity controls.
+
+Collected change manifests (including bounded artifact payloads) are fsynced
+under the assigned task root before Core result recording. The Broker's
+SQLite operation audit stores only the result digest/size and a slot-relative
+artifact reference, not a second copy of task file content.
+
+This is a fail-closed implementation, not proof of production enforcement.
+No host quota, identity, service, image, or policy was provisioned by this
+change. Unit tests use deterministic inspectors and do not count as kernel
+quota acceptance. An explicitly opt-in write harness is available at
+[`scripts/verify_broker_quota_lab.py`](../scripts/verify_broker_quota_lab.py);
+it requires `--confirm-write-test`, only writes below an empty operator-
+selected quota slot, and deliberately leaves its generated evidence in
+place. The prior loopback lab result remains development evidence only.
 
 ## Operations, state, and evidence
 
@@ -163,9 +228,11 @@ image, policy, and service-unit changes before applying them:
    `podman info` under that identity.
 2. Enable and verify the host's enforcing AppArmor or SELinux policy, seccomp
    profile, user namespaces, cgroup v2 CPU/memory/PID controllers, and an
-   actual per-task plus aggregate byte/inode quota on the filesystem used by
-   `SYNAI_BROKER_STATE_DIR`. Do not start the service unless write-time quota
-   behavior (including sparse files and concurrent writes) is demonstrated.
+   actual per-task plus aggregate byte/inode quota on the dedicated filesystem
+   used by `SYNAI_BROKER_QUOTA_SLOTS`. Keep `SYNAI_BROKER_STATE_DIR` and
+   rootless Podman image storage on different filesystems. Do not start the
+   service unless write-time quota behavior (including sparse files and
+   concurrent writes) is demonstrated.
 3. Create a Broker-only state directory and rootless Podman storage/run
    directories with restrictive ownership and modes. Do not share Podman
    sockets, storage, or credentials with Core. Place Core and Broker
@@ -219,7 +286,7 @@ That package is not an independent security review or runtime acceptance.
 | Durable operation provenance and Core result validation | Core metadata tables and bounded artifact recomputation | authority tests | PASS (unit) |
 | Uncertain side effects are not replayed | Broker operation registry and startup state transition | `test_restart_reports_durable_uncertainty_without_replaying_operation` | PASS (unit) |
 | Owned-container restart reconciliation | Registry-scoped inspect and verified-stop path | Real Podman restart/tamper/loss tests not run | BLOCKED |
-| Aggregate writable byte/inode quota | No enforcement mechanism implemented | `workspace_quota` readiness is always false | BLOCKED |
+| Aggregate writable byte/inode quota | Fixed project-quota slots, durable allocation, live fail-closed verifier | Broker quota-slot unit tests; no dedicated production filesystem or Broker identity | IMPLEMENTED (unit only); BLOCKED (runtime) |
 | Rootless isolation, LSM, network/resource limits | Fixed Podman options plus startup probes | No approved local image, separate UID, or enforcing LSM | BLOCKED |
 | No host fallback or browser execution | No Core runtime socket/API; no task route wiring | Static architecture and existing regressions | PASS (code path; regressions pending) |
 

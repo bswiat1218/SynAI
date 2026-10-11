@@ -82,13 +82,20 @@ def validate_snapshot(manifest: object, expected_snapshot: str, expected_digest:
     return manifest
 
 
-def stage_snapshot(root: Path, task_id: str, manifest: dict[str, Any], files: dict[str, bytes]) -> Path:
-    task_root = root / "tasks" / task_id
-    if task_root.exists() or task_root.is_symlink():
-        raise BrokerError("task_workspace_exists", "Task workspace already exists.", 409)
-    task_root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(task_root.parent, 0o700)
-    task_root.mkdir(mode=0o700)
+def stage_snapshot(task_root: Path, manifest: dict[str, Any], files: dict[str, bytes]) -> Path:
+    try:
+        info = task_root.lstat()
+    except OSError as exc:
+        raise BrokerError(
+            "task_workspace_unavailable",
+            "Quota-assigned task workspace was not provisioned before staging.",
+            409,
+        ) from exc
+    if (
+        not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+        or task_root.is_symlink() or any(task_root.iterdir())
+    ):
+        raise BrokerError("task_workspace_exists", "Task workspace is not an empty assigned task directory.", 409)
     source = task_root / "snapshot"
     work = task_root / "workspace"
     source.mkdir(mode=0o700)
@@ -144,8 +151,8 @@ def stage_snapshot(root: Path, task_id: str, manifest: dict[str, Any], files: di
         raise
 
 
-def load_staged_manifest(root: Path, task_id: str, expected_digest: str) -> dict[str, Any]:
-    path = root / "tasks" / task_id / "manifest.json"
+def load_staged_manifest(task_root: Path, expected_digest: str) -> dict[str, Any]:
+    path = task_root / "manifest.json"
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:

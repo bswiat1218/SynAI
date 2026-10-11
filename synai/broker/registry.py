@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import sqlite3
 import stat
 import time
@@ -70,6 +71,8 @@ class BrokerRegistry:
                     policy_decision_id TEXT NOT NULL,
                     policy_version INTEGER NOT NULL,
                     approval_id TEXT NOT NULL,
+                    slot_id TEXT,
+                    slot_owner_token_hash TEXT,
                     lease_generation INTEGER NOT NULL,
                     fencing_token_hash TEXT NOT NULL,
                     state TEXT NOT NULL,
@@ -108,6 +111,20 @@ class BrokerRegistry:
                     nonce TEXT PRIMARY KEY,
                     expires_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS broker_slots (
+                    slot_id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    filesystem_uuid TEXT NOT NULL,
+                    project_id INTEGER NOT NULL,
+                    byte_limit INTEGER NOT NULL,
+                    inode_limit INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('free', 'allocated', 'release_pending', 'quarantined')),
+                    task_id TEXT UNIQUE,
+                    allocation_id TEXT UNIQUE,
+                    owner_token_hash TEXT,
+                    release_evidence TEXT,
+                    updated_at INTEGER NOT NULL
+                );
             """)
             columns = {
                 row["name"]
@@ -130,6 +147,19 @@ class BrokerRegistry:
             }
             if "allocation_id" not in task_columns:
                 connection.execute("ALTER TABLE broker_tasks ADD COLUMN allocation_id TEXT")
+            if "slot_id" not in task_columns:
+                connection.execute("ALTER TABLE broker_tasks ADD COLUMN slot_id TEXT")
+            if "slot_owner_token_hash" not in task_columns:
+                connection.execute("ALTER TABLE broker_tasks ADD COLUMN slot_owner_token_hash TEXT")
+            for slot in self.config.quota_slots:
+                connection.execute(
+                    "INSERT OR IGNORE INTO broker_slots(slot_id, path, filesystem_uuid, project_id, "
+                    "byte_limit, inode_limit, state, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'free', ?)",
+                    (
+                        slot.slot_id, str(slot.path), slot.filesystem_uuid, slot.project_id,
+                        slot.byte_limit, slot.inode_limit, int(time.time()),
+                    ),
+                )
             connection.executescript("""
                 CREATE UNIQUE INDEX IF NOT EXISTS broker_operation_claim_id
                     ON broker_operations(claim_id) WHERE claim_id IS NOT NULL;
@@ -137,6 +167,8 @@ class BrokerRegistry:
                     ON broker_operations(replay_nonce) WHERE replay_nonce IS NOT NULL;
                 CREATE UNIQUE INDEX IF NOT EXISTS broker_operation_request_id
                     ON broker_operations(request_id) WHERE request_id IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS broker_slot_owner_token
+                    ON broker_slots(owner_token_hash) WHERE owner_token_hash IS NOT NULL;
             """)
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -147,7 +179,7 @@ class BrokerRegistry:
                 )
                 connection.execute(
                     "UPDATE broker_tasks SET state = 'uncertain', updated_at = ? "
-                    "WHERE state IN ('preparing', 'running', 'cancelling')",
+                    "WHERE state IN ('preparing', 'running', 'cancelling', 'cleaning_up')",
                     (int(time.time()),),
                 )
                 connection.execute(
@@ -160,6 +192,18 @@ class BrokerRegistry:
                     "UPDATE broker_containers SET lifecycle_state = 'quarantined' "
                     "WHERE lifecycle_state IN ('owned', 'allocating') AND task_id IN "
                     "(SELECT task_id FROM broker_tasks WHERE state = 'uncertain')",
+                )
+                connection.execute(
+                    "UPDATE broker_slots SET state = 'quarantined', updated_at = ? "
+                    "WHERE state IN ('allocated', 'release_pending') AND task_id IN "
+                    "(SELECT task_id FROM broker_tasks WHERE state = 'uncertain')",
+                    (int(time.time()),),
+                )
+                connection.execute(
+                    "UPDATE broker_slots SET state = 'quarantined', updated_at = ? "
+                    "WHERE state = 'release_pending' AND task_id IN "
+                    "(SELECT task_id FROM broker_operations WHERE state = 'uncertain')",
+                    (int(time.time()),),
                 )
                 connection.commit()
             except BaseException:
@@ -206,7 +250,14 @@ class BrokerRegistry:
                 connection.rollback()
                 raise
 
-    def authorize(self, claim: TaskClaim, signature: str, now: int | None = None) -> str:
+    def authorize(
+        self,
+        claim: TaskClaim,
+        signature: str,
+        now: int | None = None,
+        *,
+        eligible_slot_ids: frozenset[str] | None = None,
+    ) -> str:
         timestamp = int(time.time()) if now is None else now
         verify_claim(claim, signature, self.config.claim_key, timestamp)
         if (
@@ -236,16 +287,69 @@ class BrokerRegistry:
                 if claim.tool_kind == "prepare":
                     if task is not None:
                         raise BrokerError("task_exists", "Task identity is already registered.", 409)
+                    configured_ids = tuple(
+                        slot.slot_id for slot in self.config.quota_slots
+                        if eligible_slot_ids is None or slot.slot_id in eligible_slot_ids
+                    )
+                    if not configured_ids:
+                        raise BrokerError(
+                            "workspace_quota_unverified",
+                            "No pre-provisioned Broker quota slots are configured.",
+                            503,
+                        )
+                    marks = ",".join("?" for _ in configured_ids)
+                    slot = connection.execute(
+                        f"SELECT * FROM broker_slots WHERE state = 'free' "
+                        f"AND slot_id IN ({marks}) ORDER BY slot_id LIMIT 1",
+                        configured_ids,
+                    ).fetchone()
+                    if slot is None:
+                        raise BrokerError(
+                            "quota_slot_pool_exhausted",
+                            "No verified Broker quota slot is available.",
+                            409,
+                        )
+                    configured = next(item for item in self.config.quota_slots if item.slot_id == slot["slot_id"])
+                    if any(slot[column] != value for column, value in (
+                        ("path", str(configured.path)),
+                        ("filesystem_uuid", configured.filesystem_uuid),
+                        ("project_id", configured.project_id),
+                        ("byte_limit", configured.byte_limit),
+                        ("inode_limit", configured.inode_limit),
+                    )):
+                        raise BrokerError(
+                            "workspace_slot_mismatch",
+                            "Durable quota slot inventory differs from operator configuration.",
+                            503,
+                        )
+                    owner_token_hash = hashlib.sha256(secrets.token_bytes(32)).hexdigest()
+                    claimed = connection.execute(
+                        "UPDATE broker_slots SET state = 'allocated', task_id = ?, allocation_id = ?, "
+                        "owner_token_hash = ?, release_evidence = NULL, updated_at = ? "
+                        "WHERE slot_id = ? AND state = 'free'",
+                        (
+                            claim.task_id, claim.allocation_id, owner_token_hash,
+                            timestamp, slot["slot_id"],
+                        ),
+                    )
+                    if claimed.rowcount != 1:
+                        raise BrokerError(
+                            "quota_slot_pool_exhausted",
+                            "Quota slot ownership changed during allocation.",
+                            409,
+                        )
                     connection.execute(
                         "INSERT INTO broker_tasks(task_id, project_id, snapshot_id, snapshot_digest, allocation_id, "
                         "target_id, profile, image_digest, plan_digest, policy_decision_id, policy_version, "
-                        "approval_id, lease_generation, fencing_token_hash, state, created_at, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)",
+                        "approval_id, slot_id, slot_owner_token_hash, lease_generation, fencing_token_hash, "
+                        "state, created_at, updated_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'preparing', ?, ?)",
                         (
                             claim.task_id, claim.project_id, claim.snapshot_id, claim.snapshot_digest,
                             claim.allocation_id,
                             claim.target_id, claim.profile, claim.image_digest, claim.plan_digest,
                             claim.policy_decision_id, claim.policy_version, claim.approval_id,
+                            slot["slot_id"], owner_token_hash,
                             claim.lease_generation,
                             hashlib.sha256(claim.fencing_token.encode()).hexdigest(), timestamp, timestamp,
                         ),
@@ -327,21 +431,57 @@ class BrokerRegistry:
     def reserve_container(self, task_id: str, allocation_id: str, now: int | None = None) -> None:
         timestamp = int(time.time()) if now is None else now
         with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute("SELECT * FROM broker_tasks WHERE task_id = ?", (task_id,)).fetchone()
             if (
                 row is None or row["state"] != "ready"
                 or row["allocation_id"] != allocation_id
             ):
+                connection.rollback()
                 raise BrokerError("task_state_invalid", "Task is not ready to start.", 409)
-            connection.execute(
-                "INSERT INTO broker_containers(task_id, allocation_id, container_id, image_digest, "
-                "snapshot_digest, resource_profile, created_at, lifecycle_state) "
-                "VALUES (?, ?, NULL, ?, ?, ?, ?, 'allocating')",
-                (
-                    task_id, allocation_id, row["image_digest"],
-                    row["snapshot_digest"], row["profile"], timestamp,
-                ),
-            )
+            if not row["slot_id"] or row["slot_owner_token_hash"] is None:
+                connection.rollback()
+                raise BrokerError(
+                    "workspace_slot_missing",
+                    "Task has no durable quota-slot assignment.",
+                    409,
+                )
+            slot = connection.execute(
+                "SELECT state, task_id, allocation_id, owner_token_hash FROM broker_slots WHERE slot_id = ?",
+                (row["slot_id"],),
+            ).fetchone()
+            if (
+                slot is None or slot["state"] != "allocated"
+                or slot["task_id"] != task_id or slot["allocation_id"] != allocation_id
+                or not hmac.compare_digest(slot["owner_token_hash"] or "", row["slot_owner_token_hash"])
+            ):
+                connection.rollback()
+                raise BrokerError("workspace_slot_mismatch", "Task quota-slot ownership is not verified.", 409)
+            active = connection.execute(
+                "SELECT count(*) FROM broker_containers c JOIN broker_tasks t USING(task_id) "
+                "WHERE c.lifecycle_state != 'removed' AND t.state != 'removed'",
+            ).fetchone()[0]
+            if active >= self.config.max_active_tasks:
+                connection.rollback()
+                raise BrokerError(
+                    "active_task_limit",
+                    "Broker active task limit has been reached.",
+                    409,
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO broker_containers(task_id, allocation_id, container_id, image_digest, "
+                    "snapshot_digest, resource_profile, created_at, lifecycle_state) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, 'allocating')",
+                    (
+                        task_id, allocation_id, row["image_digest"],
+                        row["snapshot_digest"], row["profile"], timestamp,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def bind_container(self, task_id: str, allocation_id: str, container_id: str) -> None:
         if not container_id or len(container_id) > 128 or any(ch not in "0123456789abcdef" for ch in container_id):
@@ -421,6 +561,179 @@ class BrokerRegistry:
         if row is None:
             raise BrokerError("task_not_found", "Task identity was not found.", 404)
         return row
+
+    def slot_inventory_matches(self, slot: object) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM broker_slots WHERE slot_id = ?", (slot.slot_id,),
+            ).fetchone()
+        return row is not None and all(row[name] == value for name, value in (
+            ("path", str(slot.path)),
+            ("filesystem_uuid", slot.filesystem_uuid),
+            ("project_id", slot.project_id),
+            ("byte_limit", slot.byte_limit),
+            ("inode_limit", slot.inode_limit),
+        ))
+
+    def unassigned_legacy_tasks(self) -> tuple[str, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT task_id FROM broker_tasks WHERE slot_id IS NULL AND state != 'removed'",
+            ).fetchall()
+        return tuple(row["task_id"] for row in rows)
+
+    def task_slot(self, task_id: str, *, allow_quarantined: bool = False) -> dict[str, object]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT s.*, t.slot_id AS task_slot_id, "
+                "t.slot_owner_token_hash AS task_owner_hash, "
+                "t.allocation_id AS task_allocation_id "
+                "FROM broker_tasks t JOIN broker_slots s ON s.slot_id = t.slot_id "
+                "WHERE t.task_id = ?",
+                (task_id,),
+            ).fetchone()
+        allowed_states = {"allocated", "release_pending"}
+        if allow_quarantined:
+            allowed_states.add("quarantined")
+        if (
+            row is None or row["state"] not in allowed_states
+            or row["task_id"] != task_id
+            or row["allocation_id"] != row["task_allocation_id"]
+            or row["task_slot_id"] != row["slot_id"]
+            or not row["owner_token_hash"]
+            or not hmac.compare_digest(row["owner_token_hash"], row["task_owner_hash"] or "")
+        ):
+            raise BrokerError(
+                "workspace_slot_mismatch",
+                "Durable task-to-quota-slot ownership is unavailable or quarantined.",
+                409,
+            )
+        return dict(row)
+
+    def quarantine_slot(self, task_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE broker_slots SET state = 'quarantined', updated_at = ? "
+                "WHERE task_id = ? AND state != 'free'",
+                (int(time.time()), task_id),
+            )
+
+    def has_quarantined_slots(self) -> bool:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM broker_slots WHERE state = 'quarantined' LIMIT 1",
+            ).fetchone() is not None
+
+    def has_pending_slot_releases(self) -> bool:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM broker_slots WHERE state = 'release_pending' LIMIT 1",
+            ).fetchone() is not None
+
+    def slot_configurations(self) -> tuple[sqlite3.Row, ...]:
+        with self.connect() as connection:
+            return tuple(connection.execute(
+                "SELECT * FROM broker_slots ORDER BY slot_id",
+            ).fetchall())
+
+    def mark_slot_release_pending(self, task_id: str, operation_id: str, evidence: str) -> None:
+        if not evidence or len(evidence) > 4096:
+            raise BrokerError("slot_release_evidence_invalid", "Quota-slot release evidence is invalid.", 500)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                task = connection.execute(
+                    "SELECT state, slot_id FROM broker_tasks WHERE task_id = ?", (task_id,),
+                ).fetchone()
+                if task is None or task["state"] != "removed" or not task["slot_id"]:
+                    raise BrokerError("slot_release_refused", "Task is not safely terminal for quota-slot release.", 409)
+                container = connection.execute(
+                    "SELECT lifecycle_state FROM broker_containers WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if container is not None and container["lifecycle_state"] != "removed":
+                    raise BrokerError("slot_release_refused", "Task container removal is not durably verified.", 409)
+                unresolved = connection.execute(
+                    "SELECT operation_id, kind, state FROM broker_operations WHERE task_id = ? "
+                    "AND state IN ('claimed', 'running', 'uncertain')",
+                    (task_id,),
+                ).fetchall()
+                if (
+                    len(unresolved) == 1
+                    and unresolved[0]["operation_id"] == operation_id
+                    and unresolved[0]["kind"] in {"remove", "cancel"}
+                    and unresolved[0]["state"] == "running"
+                    and (container is None or unresolved[0]["kind"] == "remove")
+                ):
+                    cursor = connection.execute(
+                        "UPDATE broker_slots SET state = 'release_pending', release_evidence = ?, updated_at = ? "
+                        "WHERE slot_id = ? AND task_id = ? AND state = 'allocated'",
+                        (evidence, int(time.time()), task["slot_id"], task_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise BrokerError("slot_release_refused", "Quota-slot ownership changed during cleanup.", 409)
+                else:
+                    raise BrokerError("slot_release_refused", "Task has unresolved operation provenance.", 409)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def release_slot(self, task_id: str, evidence: str) -> None:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                task = connection.execute(
+                    "SELECT state, slot_id FROM broker_tasks WHERE task_id = ?", (task_id,),
+                ).fetchone()
+                slot = connection.execute(
+                    "SELECT * FROM broker_slots WHERE task_id = ?", (task_id,),
+                ).fetchone()
+                unresolved = connection.execute(
+                    "SELECT 1 FROM broker_operations WHERE task_id = ? "
+                    "AND state IN ('claimed', 'running', 'uncertain') LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                container = connection.execute(
+                    "SELECT lifecycle_state FROM broker_containers WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if (
+                    task is None or task["state"] != "removed"
+                    or slot is None or slot["state"] != "release_pending"
+                    or slot["slot_id"] != task["slot_id"]
+                    or unresolved is not None
+                    or (container is not None and container["lifecycle_state"] != "removed")
+                    or not evidence or len(evidence) > 4096
+                ):
+                    raise BrokerError("slot_release_refused", "Quota slot is not safe to return to the free pool.", 409)
+                connection.execute(
+                    "UPDATE broker_slots SET state = 'free', task_id = NULL, allocation_id = NULL, "
+                    "owner_token_hash = NULL, release_evidence = ?, updated_at = ? "
+                    "WHERE slot_id = ? AND state = 'release_pending'",
+                    (evidence, int(time.time()), task["slot_id"]),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def pending_slot_releases(self) -> tuple[sqlite3.Row, ...]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT s.*, t.state AS task_state FROM broker_slots s "
+                "JOIN broker_tasks t ON t.task_id = s.task_id "
+                "WHERE s.state = 'release_pending' ORDER BY s.updated_at, s.slot_id",
+            ).fetchall()
+        return tuple(rows)
+
+    def task_has_unresolved_operations(self, task_id: str) -> bool:
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT 1 FROM broker_operations WHERE task_id = ? "
+                "AND state IN ('claimed', 'running', 'uncertain') LIMIT 1",
+                (task_id,),
+            ).fetchone() is not None
 
     def mark_container(self, task_id: str, state: str, *, termination: str | None = None,
                        cleanup: str | None = None) -> None:

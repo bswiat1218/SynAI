@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,19 +24,31 @@ class RootlessPodmanRuntime:
         self.readiness: BrokerReadiness | None = None
         self.image_id: str | None = None
         self._active_processes: dict[str, asyncio.subprocess.Process] = {}
+        self.workspace_resolver: Callable[[str], Path] | None = None
 
-    async def verify_startup(self) -> BrokerReadiness:
-        base = self.config.readiness()
+    async def verify_startup(self, base_readiness: BrokerReadiness | None = None) -> BrokerReadiness:
+        base = base_readiness or self.config.readiness()
         checks = dict(base.checks)
-        reasons = list(base.reasons)
+        runtime_checks = {
+            "rootless_podman", "cgroup_v2", "seccomp_profile",
+            "linux_security_module", "user_namespace",
+            "approved_image_present", "podman_storage_separate",
+        }
+        reasons = [reason for reason in base.reasons if reason not in runtime_checks]
         if checks["podman_available"]:
             try:
                 info = await self._run(
                     "info", "--format", "json", timeout=10, maximum=256 * 1024,
                 )
                 runtime = json.loads(info)
+                if not isinstance(runtime, dict):
+                    raise ValueError("Podman information response is not an object")
                 host = runtime.get("host", runtime.get("Host", {}))
+                if not isinstance(host, dict):
+                    raise ValueError("Podman host information is invalid")
                 security = host.get("security", host.get("Security", {}))
+                if not isinstance(security, dict):
+                    raise ValueError("Podman security information is invalid")
                 rootless = security.get("rootless", security.get("Rootless", False))
                 checks["rootless_podman"] = rootless is True
                 checks["cgroup_v2"] = (
@@ -51,6 +65,16 @@ class RootlessPodmanRuntime:
                         host.get("apparmorEnabled", host.get("AppArmorEnabled")) is True
                         or host.get("selinuxEnabled", host.get("SelinuxEnabled")) is True
                     )
+                )
+                store = runtime.get("store", runtime.get("Store", {}))
+                if not isinstance(store, dict):
+                    raise ValueError("Podman storage information is invalid")
+                graph_root = store.get("graphRoot", store.get("GraphRoot"))
+                checks["podman_storage_separate"] = (
+                    isinstance(graph_root, str)
+                    and bool(self.config.quota_slots)
+                    and os.stat(graph_root).st_dev
+                    != os.stat(self.config.quota_slots[0].mount_path).st_dev
                 )
                 uid_map = await self._run(
                     "unshare", "cat", "/proc/self/uid_map", timeout=10, maximum=4096,
@@ -70,9 +94,13 @@ class RootlessPodmanRuntime:
                 checks["seccomp_profile"] = False
                 checks["user_namespace"] = False
                 checks["linux_security_module"] = False
+                checks["podman_storage_separate"] = False
             if not checks["rootless_podman"] and "rootless_podman" not in reasons:
                 reasons.append("rootless_podman")
-            for name in ("cgroup_v2", "seccomp_profile", "user_namespace", "linux_security_module"):
+            for name in (
+                "cgroup_v2", "seccomp_profile", "user_namespace",
+                "linux_security_module", "podman_storage_separate",
+            ):
                 if not checks[name] and name not in reasons:
                     reasons.append(name)
             # An image must be supplied by an operator before startup. This
@@ -83,7 +111,11 @@ class RootlessPodmanRuntime:
                     timeout=10, maximum=4096,
                 )
                 values = inspected.split()
-                checks["approved_image_present"] = bool(values and values[0] == self.config.image_digest)
+                checks["approved_image_present"] = (
+                    len(values) == 2
+                    and values[0] == self.config.image_digest
+                    and bool(values[1])
+                )
                 self.image_id = values[1] if len(values) == 2 else None
             except (OSError, TimeoutError, BrokerError):
                 checks["approved_image_present"] = False
@@ -163,9 +195,9 @@ class RootlessPodmanRuntime:
                 item for item in mounts
                 if item.get("Type") == "tmpfs" and item.get("Destination") == "/tmp"
             ]
-            expected_workspace = str(
-                self.config.state_dir / "tasks" / task_id / "workspace",
-            )
+            if self.workspace_resolver is None:
+                raise BrokerError("workspace_slot_missing", "Task workspace resolver is unavailable.", 503)
+            expected_workspace = str(self.workspace_resolver(task_id))
             expected_image_id = self.image_id
             security_options = host.get("SecurityOpt", [])
             if (
@@ -253,11 +285,81 @@ class RootlessPodmanRuntime:
             owned = self.registry.owned_container(task_id)
         await self.inspect_owned(task_id)
         await self._run("rm", owned["container_id"], timeout=10, maximum=4096)
+        if await self._container_exists(owned["container_id"]):
+            self.registry.mark_container(task_id, "quarantined")
+            raise BrokerError(
+                "container_removal_unconfirmed",
+                "Podman still reports the owned task container after removal.",
+                409,
+            )
         evidence = hashlib.sha256(
             f"{owned['container_id']}\n{owned['allocation_id']}\nremoved".encode(),
         ).hexdigest()
         self.registry.mark_container(task_id, "removed", cleanup=evidence)
+        self.registry.record_reconciliation(
+            task_id, "removed", f"verified_absent:{evidence}",
+        )
         return evidence
+
+    async def verify_removed(self, task_id: str) -> None:
+        owned = self.registry.container_record(task_id)
+        if owned is None:
+            return
+        if not owned["container_id"]:
+            raise BrokerError(
+                "container_removal_unconfirmed",
+                "Task container identity is incomplete and cannot be reconciled.",
+                409,
+            )
+        if await self._container_exists(owned["container_id"]):
+            self.registry.mark_container(task_id, "quarantined")
+            raise BrokerError(
+                "container_removal_unconfirmed",
+                "Podman still reports the owned task container.",
+                409,
+            )
+        evidence = hashlib.sha256(
+            f"{owned['container_id']}\n{owned['allocation_id']}\nverified_absent".encode(),
+        ).hexdigest()
+        self.registry.record_reconciliation(
+            task_id, "removed", f"verified_absent:{evidence}",
+        )
+
+    async def _container_exists(self, container_id: str) -> bool:
+        executable = shutil.which(self.config.podman)
+        if executable is None:
+            raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
+        process = await asyncio.create_subprocess_exec(
+            executable, "container", "exists", container_id,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={
+                "PATH": "/usr/bin:/bin", "HOME": str(self.config.state_dir),
+                "XDG_RUNTIME_DIR": f"/run/user/{self.config.service_uid}",
+            },
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_bounded(process.stdout, 4096),
+                    _read_bounded(process.stderr, 16 * 1024),
+                ),
+                timeout=10,
+            )
+            await process.wait()
+        except (TimeoutError, asyncio.CancelledError, BrokerError):
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        if process.returncode == 0:
+            return True
+        if process.returncode == 1:
+            return False
+        raise BrokerError(
+            "runtime_operation_failed",
+            "Podman could not verify task-container removal.",
+            502,
+        )
 
     async def execute(
         self, task_id: str, argv: list[str], cwd: str, timeout: int, output_limit: int,
