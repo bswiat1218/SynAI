@@ -1,15 +1,13 @@
 # Phase 13B web foundation
 
-Phase 13B introduced a read-only browser/API foundation alongside the existing
-Textual/GTK application. Phase 13D has since added authenticated browser chat
-and project activity streaming; those later capabilities are documented in
-[Phase 13D browser chat](phase-13d-web-chat.md). The former terminal interface was subsequently retired,
-dispatches tools, executes commands, edits project files, or starts a task runner. The
-approved revised Phase 13A plan was not present in the checked-out repository
-when this work was implemented; the detailed Phase 13B requirements are the
-implementation scope. The web foundation is not authorization to skip any
-existing `Agent`, `Tools`, approval, Phase 10 policy, execution-backend, or
-Phase 12 memory contract.
+Phase 13B established the read-only browser/API foundation. Phase 13D added
+authenticated browser chat and project activity streaming; those capabilities
+are documented in [Phase 13D browser chat](phase-13d-web-chat.md). Browser
+Chat is tool-disabled: it does not dispatch tools, execute commands, edit
+project files, or start a task runner. The revised Phase 13A plan was not
+available during the original Phase 13B implementation. This web foundation
+does not bypass the retained agent, approval, policy, execution-backend, or
+Phase 12 memory contracts.
 
 ## Service configuration and deployment
 

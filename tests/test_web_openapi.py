@@ -29,4 +29,15 @@ class OpenApiContractTests(unittest.TestCase):
         checked_in = json.loads(
             (Path(__file__).resolve().parents[1] / "web" / "openapi.json").read_text(),
         )
-        self.assertEqual(app.openapi(), checked_in)
+        generated = app.openapi()
+        self.assertEqual(generated, checked_in)
+        self.assertEqual(
+            generated["paths"]["/api/v1/device/{device_id}/snapshot-uploads"]["post"]
+            ["responses"]["413"]["description"],
+            "Content Too Large",
+        )
+        self.assertEqual(
+            generated["paths"]["/api/v1/auth/password"]["post"]
+            ["responses"]["422"]["description"],
+            "Unprocessable Content",
+        )

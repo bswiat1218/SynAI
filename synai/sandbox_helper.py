@@ -1,4 +1,4 @@
-"""Trusted subprocess helper for container and explicitly authorized host tools."""
+"""Trusted subprocess helper for the isolated container backend."""
 from __future__ import annotations
 
 import base64
@@ -187,19 +187,6 @@ def execute(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    global ROOT, TEMP
-    host = len(sys.argv) == 4 and sys.argv[1] == "--host"
-    if host:
-        import ctypes
-
-        ROOT = Path(sys.argv[2]).resolve(strict=True)
-        TEMP = Path(sys.argv[3]).resolve(strict=True)
-        if os.geteuid() == 0:
-            raise ToolFailure("Root tool execution is forbidden")
-        libc = ctypes.CDLL(None, use_errno=True)
-        set_no_new_privs, get_no_new_privs = 38, 39
-        if libc.prctl(set_no_new_privs, 1, 0, 0, 0) != 0 or libc.prctl(get_no_new_privs, 0, 0, 0, 0) != 1:
-            raise ToolFailure("Cannot enable no-new-privileges for host tools")
     request = json.loads(sys.stdin.read(4 * 1024 * 1024))
     token = request["token"]
     if not isinstance(token, str) or len(token) != 32 or any(char not in "0123456789abcdef" for char in token):

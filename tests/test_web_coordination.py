@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from pathlib import Path
 from synai.intelligence import RepositoryIndex
 from synai.web.config import WebConfig, WorkspaceMountConfig
 from synai.web.database import MetadataDatabase
-from synai.web.ownership import DataRootOwnership, OwnershipConflict
+from synai.web.ownership import DataRootOwnership, LockOwner, OwnershipConflict
 from synai.web.projects import ProjectRegistry
 from synai.web.workspaces import (
     InterruptedLease,
@@ -189,16 +190,29 @@ class DataRootOwnershipTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "synai-data"
 
-    def test_tui_and_web_cannot_own_same_data_root(self) -> None:
-        tui = DataRootOwnership(self.root, "tui")
+    def test_only_web_owner_can_hold_data_root(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Only the web service"):
+            DataRootOwnership(self.root, "tui")
         web = DataRootOwnership(self.root, "web")
-        owner = tui.acquire()
-        with self.assertRaisesRegex(OwnershipConflict, f"PID {os.getpid()} \\(tui\\)"):
-            web.acquire()
-        tui.release()
-        web.acquire()
+        owner = web.acquire()
+        with self.assertRaisesRegex(OwnershipConflict, f"PID {os.getpid()} \\(web\\)"):
+            DataRootOwnership(self.root, "web").acquire()
         web.release()
-        self.assertEqual(owner.mode, "tui")
+        self.assertEqual(owner.mode, "web")
+
+    def test_legacy_lock_owner_metadata_remains_readable(self) -> None:
+        self.root.mkdir(mode=0o700, parents=True)
+        descriptor = os.open(self.root / "application.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.write(descriptor, json.dumps({
+                "pid": os.getpid(), "mode": "tui", "started_at": 1,
+            }).encode())
+            self.assertEqual(
+                DataRootOwnership._read_owner(descriptor),
+                LockOwner(os.getpid(), "tui", 1),
+            )
+        finally:
+            os.close(descriptor)
 
     def test_cross_process_lock_and_automatic_crash_release(self) -> None:
         script = """
@@ -220,10 +234,10 @@ time.sleep(30)
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
             with self.assertRaises(OwnershipConflict):
-                DataRootOwnership(self.root, "tui").acquire()
+                DataRootOwnership(self.root, "web").acquire()
             process.kill()
             process.wait(timeout=5)
-            with DataRootOwnership(self.root, "tui"):
+            with DataRootOwnership(self.root, "web"):
                 pass
         finally:
             if process.poll() is None:

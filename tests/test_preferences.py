@@ -16,14 +16,14 @@ class PreferencesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = PreferencesStore(Path(directory) / "data")
             self.assertEqual(store.load(), Preferences())
-            value = Preferences("http://server:11434", 55, "textual-light")
+            value = Preferences("http://server:11434", 55, "custom-light")
             store.save(value)
             self.assertEqual(store.load(), value)
             self.assertEqual(store.path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(store.storage.root.stat().st_mode & 0o777, 0o700)
             with patch("pathlib.Path.replace", side_effect=OSError("write failed")):
                 with self.assertRaisesRegex(OSError, "write failed"):
-                    store.save(replace(value, theme="textual-dark"))
+                    store.save(replace(value, theme="custom-dark"))
             self.assertEqual(store.load(), value)
             self.assertEqual({path.name for path in store.storage.root.iterdir()}, {"settings.json", "conversations"})
 

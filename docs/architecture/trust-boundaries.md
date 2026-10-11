@@ -22,8 +22,8 @@ Implementation status is summarized in
    independently enforced.
 10. Project changes cannot be automatically applied to client devices.
 11. Uncertain operations must not replay automatically.
-12. Retired interfaces supply no execution fallback.
-   security semantics.
+12. Retired interfaces supply no execution fallback; compatibility data does
+    not grant execution authority.
 
 ## Authority matrix
 
@@ -36,8 +36,8 @@ authority. "Administer" is limited to the resource named in that column.
 | Browser | Its authenticated Core views; chat transcript/activity and project/device/snapshot metadata. No snapshot source bytes or local files. | Chat prompts and allowed metadata actions through authenticated/CSRF-protected APIs. No project source writes. | Browser rendering only; no tool, shell, task or container execution. | Authenticates the operator to Core. An operator can explicitly authorize paired-device metadata and request a snapshot; this is not local consent or execution approval. | No Core host, client, Broker or runtime administration. |
 | SynAI Core | Its authorized application state; validated immutable snapshots; configured legacy workspace identity/status metadata. | Private metadata, chat/history state, bounded upload staging and immutable snapshot objects. No arbitrary source-workspace mutation. | Own service logic and chat provider calls only; no distributed project code or general host commands. | Validates browser/device credentials and metadata actions. Cannot substitute for local consent or Broker policy/approval. | Its private metadata/snapshot storage and its own service lifecycle only; no client device or general container runtime administration. |
 | Linux Client Agent | Locally registered directory only after local binding authorization; its protected local identity/config. Per-capture consent gates transmission, not preview reads. | Its own protected state and local receipts; future changes only after a separately reviewed local policy and explicit consent. Current version writes no project content. | Its own bounded scan, hashing and network client. No shell, build/test or project-code execution. | Local user authorizes the directory for scoped reads and separately approves each upload after preview. Browser/Core requests cannot create either authorization. | Its local credential/binding state only; cannot administer Core/Broker/runtime. |
-| Sandbox Broker (planned) | Exact immutable task snapshot after authenticated task claim validation. | Only its own disposable task container/layer and bounded result objects. No client workspace writes. | Only approved task workload in task-scoped containers subject to independent policy/limits. | Enforces task claim, target, policy, approval, limits and cancellation independently; cannot create user approvals. | Only task containers it created and verifies as its own. No Core/retired local interface/foreign runtime objects. |
-| Task container (planned) | Its explicit task input and task-private filesystem. | Only task-private disposable writable storage. No host/client workspace. | Task code within Broker-imposed limits. | None. | None. |
+| Sandbox Broker | Exact immutable task snapshot after authenticated task-claim validation. | Only its own disposable task container/layer and bounded result objects. No client workspace writes. | Only approved task workload in task-scoped containers subject to independent policy/limits. | Enforces Broker-side claim checks, fixed operation limits and cancellation; a current Core claim authority is not yet integrated. | Only task containers it created and verifies as its own. No Core/foreign runtime objects. |
+| Task container | Its explicit task input and task-private filesystem. | Only task-private disposable writable storage. No host/client workspace. | Task code within Broker-imposed limits. | None. | None. |
 
 Retired local execution backends have no authority in the distributed design.
 
@@ -83,8 +83,8 @@ Retired local execution backends have no authority in the distributed design.
 - Storage protection assumes private ownership/modes and operating-system
   access controls. Disk theft, privileged host access and backups require
   separate protections.
-- A single data-root owner process is assumed. Current shared web/retired local interface data
-  root ownership is not a horizontally scalable multi-writer design.
+- A single data-root owner process is assumed. Only the web service can
+  acquire the lock; old owner labels remain readable for conflict reporting.
 
 ## Known limitations
 
@@ -95,12 +95,12 @@ Retired local execution backends have no authority in the distributed design.
   they are not separately signed by a Core signing key.
 - The existing task table and identity contract do not establish a durable
   claim/fencing authority.
-- No production Broker, rootless Podman identity, runtime policy, image
-  digest allowlist or deployment manifest exists.
-- Existing retired local interface Sandbox can use a configured container runtime and selected
-  image, binds a local workspace read-write and creates with bridge
-  networking; HostExecution explicitly runs outside a container. These are
-  legacy local semantics, not Broker guarantees.
+- The Broker has a restricted service/runtime implementation, but production
+  service identity, deployment evidence and security acceptance are missing.
+- Standalone local `Sandbox` code can use a configured runtime and image,
+  bridge networking and a read-write workspace mount. It is not used by Core
+  web dispatch and is not a Broker guarantee; direct host execution was
+  removed.
 - The existing architecture does not guarantee atomic multi-file restoration
   or mutation; it reports per-file state and does not replay uncertain work.
 - There is no distributed patch format, client-side application protocol or
