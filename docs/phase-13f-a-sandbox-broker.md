@@ -725,8 +725,80 @@ All runtime subprocess, bind-source, inspector, and SQLite VFS acceptance gates
 remain unchanged. Deterministic regression tests do not prove live containment.
 
 F3 local quota-authority latch consistency, F4 repeated-cancellation worker
-ownership, and F5 whole-process deadlines remain separate unresolved findings.
-This phase does not change those mechanisms or implement a Rust inspector.
+ownership, and F5 whole-process deadlines are addressed by the subsequent
+code-only phase below. F1/F2 did not implement those changes or a Rust inspector.
+
+### Phase 13F-A.5.1a.9: authority and lifetime reliability (F3/F4/F5)
+
+A persistent-file failure permanently revokes ordinary local quota/slot
+authority on the manager instance. Corrected observations cannot repopulate
+usable slots, verify roles for use, open ordinary role/task authority, or
+authorize cleanup/release. A separate short failure-state lock prevents
+concurrent observations from overwriting the latch or its first reason.
+Readiness includes `quota_file_failure`. Diagnostic inventory inspection may
+continue, but does not restore writable authority. Independently verified
+containment eligibility remains distinct: a log/task-file failure alone does
+not revoke otherwise safe containment domains; failure within a required
+containment role does. A new manager still requires historical registry
+identity and recovery checks; there is no reset API.
+
+All Broker threaded verification calls use one explicitly tracked,
+serialized authority-worker owner shared by service and runtime. The executor
+future is shielded separately from its task, so even direct cancellation of
+the worker task cannot make a running thread appear finished. Startup,
+admission, active monitoring, watchdog and runtime configuration checks
+shield the worker and join it despite repeated cancellation. The serialization
+lock stays owned until thread completion. Shutdown has a single shielded
+owner, refuses new workers, joins existing work, and only then disposes
+registry descriptors. Cancellation is propagated after the necessary join.
+Readiness reports in-flight workers and sticky shutdown uncertainty.
+
+Python cannot stop a thread in uninterruptible filesystem I/O. After a
+one-second verification/join observation window, the Broker reports uncertainty
+and operator intervention while continuing to own/join the worker. This is
+**not a one-second shutdown guarantee**: shutdown may remain pending
+indefinitely, resources stay open, readiness remains false, and a restart on
+the same service is refused. Future deployment requires independently
+accepted process-level supervision/containment; forcibly ending the Broker
+is not proof of container termination or durable recovery.
+
+Runtime subprocess entrypoints share a child-lifetime adapter using an
+absolute event-loop monotonic deadline. Spawn, both bounded output streams,
+and process exit share that budget; EOF does not prove exit. Up to 500 ms
+(at most one quarter of the budget) is reserved **within** the deadline for
+exact-child kill/reap cleanup. This can time out work before the advertised
+total interval, but never adds a cleanup interval on top of it. Timeout
+results are not authoritative inspection or absence evidence.
+
+Cancellation during spawn leaves the shielded spawn task explicitly owned;
+when it supplies an exact child handle, only that child is killed. Unknown
+spawn ownership, kill failure, or unconfirmed reap produces sticky unresolved
+status and operator escalation, refuses further child launches, and preserves
+necessary lifecycle ownership, including tracked pending spawn and reap tasks.
+Readiness reports their counts without inventing a process identity.
+Repeated cancellation cannot abandon cleanup.
+Shutdown makes a bounded additional supervision pass and retains registry
+resources if native child lifetime remains unresolved. A stuck spawn or
+unkillable child cannot be guaranteed gone by Python; no arbitrary PID is
+guessed and no runtime-wide cleanup is used. Exiting the CLI child never
+proves that a task container stopped: exact-container verification remains
+independent.
+
+These adapters are reached only after the existing unconditional runtime
+acceptance refusal. No production CLI test bypass, Podman inspection,
+emergency command, create/start/exec, Rust inspector, or readiness enablement
+was added. Tests use fake child adapters and disposable ordinary files,
+not native kernel quota or container acceptance.
+
+Latency scope: startup quota/configuration checks and periodic/admission
+thread checks no longer block the event loop while their filesystem worker
+is running. Other synchronous registry hashing/checkpoint/fsync, recovery
+and verified diagnostic writes remain real possible event-loop blockers.
+A local disposable 106,496-byte registry benchmark measured five ownership
+checks at 66-70 ms (median 68.5 ms); this is not a worst-case capacity or
+production guarantee. Slow-task debug messages also include fixture setup
+and concurrent test overhead. Verification was not weakened for performance,
+and broader serving-loop I/O isolation remains deployment qualification work.
 
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-

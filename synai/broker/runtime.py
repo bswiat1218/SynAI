@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
 import os
 import re
 import shutil
@@ -19,6 +18,8 @@ from synai.broker.protocol import BrokerError
 from synai.broker.registry import BrokerRegistry
 from synai.broker.filesystem import Directory
 from synai.broker.runtime_storage import RuntimeStoragePolicy
+from synai.broker.workers import AuthorityWorkers
+from synai.broker.processes import ChildProcesses
 
 
 ContainmentState = Literal[
@@ -55,6 +56,26 @@ class RootlessPodmanRuntime:
         self.storage_authority: Callable[[str], Directory] | None = None
         self.storage_path_verifier: Callable[[str, Path], None] | None = None
         self.storage_observer: Callable[[], Awaitable[object]] | None = None
+        self.authority_workers = AuthorityWorkers(self._lifetime_failure)
+        self.child_processes = ChildProcesses(self._lifetime_failure)
+        self.failure_callback: Callable[[str], None] | None = None
+
+    def _lifetime_failure(self, code: str) -> None:
+        self.storage_policy.failure_code = self.storage_policy.failure_code or code
+        if self.readiness is not None:
+            self.readiness = BrokerReadiness(
+                False, False, dict(self.readiness.checks),
+                tuple(dict.fromkeys((*self.readiness.reasons, code))),
+            )
+        if self.failure_callback is not None:
+            self.failure_callback(code)
+
+    @property
+    def processes_unresolved(self) -> bool:
+        return self.child_processes.unresolved
+
+    async def close_processes(self) -> None:
+        await self.child_processes.close()
 
     async def verify_startup(self, base_readiness: BrokerReadiness | None = None) -> BrokerReadiness:
         base = base_readiness or self.config.readiness()
@@ -212,24 +233,8 @@ class RootlessPodmanRuntime:
             return False, (code,)
         return True, ()
 
-    @staticmethod
-    async def _storage_worker(check: Callable[[], object]) -> None:
-        worker = asyncio.create_task(asyncio.to_thread(check))
-        try:
-            await asyncio.shield(worker)
-        except asyncio.CancelledError:
-            while not worker.done():
-                try:
-                    await asyncio.shield(worker)
-                except asyncio.CancelledError:
-                    continue
-                except (BrokerError, OSError, ValueError):
-                    break
-            try:
-                worker.result()
-            except (BrokerError, OSError, ValueError):
-                logging.getLogger(__name__).error("Runtime storage verification failed while joining shutdown worker")
-            raise
+    async def _storage_worker(self, check: Callable[[], object]) -> None:
+        await self.authority_workers.run(check)
 
     async def create_task(self, task_id: str, allocation_id: str, workspace: Path) -> str:
         self.registry.require_execution_authority()
@@ -662,30 +667,13 @@ class RootlessPodmanRuntime:
         executable = shutil.which(self.config.podman)
         if executable is None:
             raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
-        process = await asyncio.create_subprocess_exec(
-            executable, "container", "exists", container_id,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env={
-                **self._runtime_environment(),
-            },
+        returncode, _, _ = await self.child_processes.run(
+            executable, ("container", "exists", container_id),
+            self._runtime_environment(), 10, 4096, 16 * 1024, _read_bounded,
         )
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    _read_bounded(process.stdout, 4096),
-                    _read_bounded(process.stderr, 16 * 1024),
-                ),
-                timeout=10,
-            )
-            await process.wait()
-        except (TimeoutError, asyncio.CancelledError, BrokerError):
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
-            raise
-        if process.returncode == 0:
+        if returncode == 0:
             return True
-        if process.returncode == 1:
+        if returncode == 1:
             return False
         raise BrokerError(
             "runtime_operation_failed",
@@ -705,39 +693,25 @@ class RootlessPodmanRuntime:
         executable = shutil.which(self.config.podman)
         if executable is None:
             raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
-        process = await asyncio.create_subprocess_exec(
-            executable, "exec", "--user", "65532:65532", "--workdir", workdir,
-            owned["container_id"], *argv,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env={
-                **self._runtime_environment(),
-            },
-        )
-        self._active_processes[task_id] = process
         started = time.monotonic()
         try:
-            stdout, stderr = await asyncio.wait_for(
-                asyncio.gather(
-                    _read_bounded(process.stdout, output_limit),
-                    _read_bounded(process.stderr, output_limit),
-                ),
-                timeout=min(timeout, self.config.profile.operation_seconds),
+            returncode, stdout, stderr = await self.child_processes.run(
+                executable,
+                ("exec", "--user", "65532:65532", "--workdir", workdir, owned["container_id"], *argv),
+                self._runtime_environment(), min(timeout, self.config.profile.operation_seconds),
+                output_limit, output_limit, _read_bounded,
+                lambda process: self._active_processes.__setitem__(task_id, process),
             )
-            await process.wait()
             if self.registry.task(task_id)["state"] != "running":
                 raise BrokerError("operation_cancelled", "Task operation was cancelled.", 409)
         except (TimeoutError, asyncio.CancelledError, BrokerError):
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
             try:
                 await self.terminate_owned(task_id)
             except BrokerError:
                 self.registry.mark_container(task_id, "quarantined")
             raise
         finally:
-            if self._active_processes.get(task_id) is process:
-                self._active_processes.pop(task_id, None)
+            self._active_processes.pop(task_id, None)
         duration = time.monotonic() - started
         if len(stdout) + len(stderr) > output_limit:
             try:
@@ -746,7 +720,7 @@ class RootlessPodmanRuntime:
                 self.registry.mark_container(task_id, "quarantined")
             raise BrokerError("operation_output_limit", "Task output exceeded its configured limit; the task container was terminated.", 413)
         return {
-            "exit_status": process.returncode,
+            "exit_status": returncode,
             "stdout": stdout.decode("utf-8", errors="replace"),
             "stderr": stderr.decode("utf-8", errors="replace"),
             "duration_seconds": duration,
@@ -769,11 +743,8 @@ class RootlessPodmanRuntime:
         process = self._active_processes.get(task_id)
         if process is None or process.returncode is not None:
             return
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+        if not await self.child_processes.cleanup(process, asyncio.get_running_loop().time() + 2):
+            raise BrokerError("runtime_process_lifetime_unresolved", "Cancelled child remains unresolved.", 503)
 
     async def _run(self, *args: str, timeout: float, maximum: int) -> str:
         if any(not isinstance(arg, str) or "\x00" in arg for arg in args):
@@ -782,30 +753,10 @@ class RootlessPodmanRuntime:
         executable = shutil.which(self.config.podman)
         if executable is None:
             raise BrokerError("runtime_unavailable", "Rootless Podman is unavailable.", 503)
-        process = await asyncio.create_subprocess_exec(
-            executable, *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env=self._runtime_environment(),
+        returncode, stdout, _ = await self.child_processes.run(
+            executable, args, self._runtime_environment(), timeout, maximum, 16 * 1024, _read_bounded,
         )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                asyncio.gather(
-                    _read_bounded(process.stdout, maximum),
-                    _read_bounded(process.stderr, 16 * 1024),
-                ),
-                timeout,
-            )
-            await process.wait()
-        except (TimeoutError, asyncio.CancelledError):
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
-            raise
-        except BrokerError:
-            if process.returncode is None:
-                process.kill()
-            await process.wait()
-            raise
-        if process.returncode:
+        if returncode:
             raise BrokerError("runtime_operation_failed", "Rootless Podman task operation failed.", 502)
         return stdout.decode("utf-8", errors="strict")
 

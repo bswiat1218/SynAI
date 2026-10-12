@@ -50,7 +50,11 @@ class ExistingFileQuotaTests(unittest.TestCase):
 
     def tearDown(self):
         if self.log_handler is not None:
-            self.log_handler.close()
+            if self.manager.persistent_file_failure_code is not None:
+                with self.assertRaises(BrokerError):
+                    self.log_handler.close()
+            else:
+                self.log_handler.close()
         logging.getLogger().handlers[:] = self.handlers
         logging.getLogger().setLevel(self.level)
         self.registry.close()
@@ -239,7 +243,7 @@ class ExistingFileQuotaTests(unittest.TestCase):
         path.write_bytes(b"audit")
         path.chmod(0o600)
         self.projects[path.stat().st_ino] = 0
-        with patch.object(self.manager, "open_storage_role", side_effect=lambda _: self.authority()):
+        with patch.object(self.manager, "open_storage_role", side_effect=lambda _, **kwargs: self.authority()):
             with self.assertRaises(BrokerError):
                 self.manager.verify_existing_files(self.role.role_id)
         self.assertEqual(path.read_bytes(), b"audit")
@@ -468,10 +472,9 @@ class ExistingFileQuotaTests(unittest.TestCase):
         self.assertFalse(self.manager.verified)
         self.assertFalse(self.manager.verified_slot_ids)
         self.projects[path.stat().st_ino] = self.role.project_id
-        # Reading newly reverified evidence does not clear the assurance-loss latch.
         with self.authority() as directory:
-            descriptor = directory.open(path.name, os.O_RDONLY)
-            os.close(descriptor)
+            with self.assertRaises(BrokerError):
+                directory.open(path.name, os.O_RDONLY)
         self.assertEqual(self.manager.persistent_file_failure_code, "filesystem_file_quota_mismatch")
         self.assertFalse(self.manager.verified)
 

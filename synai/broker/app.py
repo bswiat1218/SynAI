@@ -33,6 +33,7 @@ from synai.broker.protocol import (
 from synai.broker.registry import BrokerRegistry, RegistryTrust
 from synai.broker.filesystem import Directory, directory_access, remove_tree, write_new
 from synai.broker.runtime import ContainmentResult, RootlessPodmanRuntime
+from synai.broker.workers import AuthorityWorkers
 from synai.broker.snapshots import (
     changed_files,
     load_staged_manifest,
@@ -132,6 +133,10 @@ class BrokerService:
         self._closed = False
         self._lifespan_active = False
         self.last_diagnostic_failure: dict[str, str | int | bool] | None = None
+        self.authority_workers = AuthorityWorkers(self._invalidate_storage_readiness)
+        self.runtime.authority_workers = self.authority_workers
+        self.runtime.failure_callback = self._invalidate_storage_readiness
+        self._close_task: asyncio.Task[None] | None = None
         self.registry.failure_callback = self._registry_failure
         self.registry.storage_check = self._registry_storage_verified
         self.registry.directory_factory = self._registry_directory
@@ -172,7 +177,7 @@ class BrokerService:
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
-        if self._closed or self._lifecycle_loop is not None and self._lifecycle_loop is not loop:
+        if self._closed or self._close_task is not None or self._lifecycle_loop is not None and self._lifecycle_loop is not loop:
             self._invalidate_storage_readiness("service_lifecycle_invalid")
             raise BrokerError("service_lifecycle_invalid", "Broker service requires a fresh verified lifecycle.", 503)
         self._lifecycle_loop = loop
@@ -184,19 +189,19 @@ class BrokerService:
             return
         self.readiness = _readiness_with_storage(self.config, False)
         try:
-            if not await asyncio.to_thread(self._registry_storage_verified):
+            if not await self.authority_workers.run(self._registry_storage_verified):
                 self.registry.fail(RegistryTrust.STORAGE_UNVERIFIED, "state_storage_unverified")
                 return
-            self.registry.initialize(storage_verified=True)
+            await self.authority_workers.run(lambda: self.registry.initialize(storage_verified=True))
             self.registry.trust = RegistryTrust.RECOVERY_INCOMPLETE
-            quota_ready, _ = self.quota_manager.verify_startup()
+            quota_ready, _ = await self.authority_workers.run(self.quota_manager.verify_startup)
             base = _readiness_with_storage(self.config, quota_ready)
             if quota_ready:
                 self.readiness = await self.runtime.verify_startup(base)
             await self.recover()
             if quota_ready and self.registry.trust == RegistryTrust.COMPLETE:
-                self.quota_manager.recover_pending_releases()
-                quota_ready, _ = self.quota_manager.verify_startup()
+                await self.authority_workers.run(self.quota_manager.recover_pending_releases)
+                quota_ready, _ = await self.authority_workers.run(self.quota_manager.verify_startup)
                 if quota_ready:
                     self.readiness = await self.runtime.verify_startup(
                         _readiness_with_storage(self.config, quota_ready),
@@ -241,7 +246,22 @@ class BrokerService:
         self.registry.release_slot(task_id, evidence)
 
     async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+                self._invalidate_storage_readiness("shutdown_cancelled")
+        self._close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self) -> None:
         self._closed = True
+        self.authority_workers.closing = True
         self._invalidate_storage_readiness("service_stopped")
         watchdog = self._storage_watchdog_task
         self._storage_watchdog_task = None
@@ -268,7 +288,9 @@ class BrokerService:
                     task.exception()
         if self.core_client is not None:
             await self.core_client.close()
-        if not pending:
+        await self.authority_workers.close()
+        await self.runtime.close_processes()
+        if not pending and not self.runtime.processes_unresolved:
             self.registry.close()
 
     def _start_storage_watchdog(self) -> None:
@@ -331,18 +353,7 @@ class BrokerService:
                 self.registry.verify_ownership()
             return self.quota_manager.verify_startup()
 
-        verification = asyncio.create_task(asyncio.to_thread(verify))
-        try:
-            return await asyncio.shield(verification)
-        except asyncio.CancelledError:
-            # Cancelling the asyncio waiter cannot stop its filesystem/inspector thread.
-            # Join the in-flight check before closing registry descriptors.
-            try:
-                await verification
-            except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                self._invalidate_storage_readiness("storage_watchdog_failed")
-                self._diagnostic_error("Broker storage verification failed during shutdown: %s", type(exc).__name__)
-            raise
+        return await self.authority_workers.run(verify)
 
     def _storage_watchdog_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -509,7 +520,7 @@ class BrokerService:
                     "Broker execution security readiness is not satisfied.",
                     503,
                 )
-            storage_ready, storage_reasons = await asyncio.to_thread(
+            storage_ready, storage_reasons = await self.authority_workers.run(
                 self.quota_manager.verify_startup,
             )
             if self.runtime.storage_policy.observed is not None or self.runtime.storage_policy.failure_code:
@@ -911,7 +922,7 @@ class BrokerService:
                     return operation.result()
                 async with self._storage_assurance_lock:
                     try:
-                        storage_ready, storage_reasons = await asyncio.to_thread(
+                        storage_ready, storage_reasons = await self.authority_workers.run(
                             self.quota_manager.verify_startup,
                         )
                         if self.runtime.storage_policy.observed is not None or self.runtime.storage_policy.failure_code:
@@ -1218,6 +1229,10 @@ def create_app(service: BrokerService, *, startup_callback: Callable[[], Callabl
                 "reasons": ["startup_verification_incomplete"],
                 "registry": service.registry.status(),
                 "diagnostics": {"last_emission_failure": service.last_diagnostic_failure},
+                "workers": service.authority_workers.status(),
+                "runtime_processes_unresolved": service.runtime.processes_unresolved,
+                "runtime_processes": service.runtime.child_processes.status(),
+                "quota_file_failure": getattr(service.quota_manager, "persistent_file_failure_code", None),
             }
         return {
             "schema_version": 1, "ready": state.ready,
@@ -1225,6 +1240,10 @@ def create_app(service: BrokerService, *, startup_callback: Callable[[], Callabl
             "checks": state.checks, "reasons": list(state.reasons),
             "registry": service.registry.status(),
             "diagnostics": {"last_emission_failure": service.last_diagnostic_failure},
+            "workers": service.authority_workers.status(),
+            "runtime_processes_unresolved": service.runtime.processes_unresolved,
+            "runtime_processes": service.runtime.child_processes.status(),
+            "quota_file_failure": getattr(service.quota_manager, "persistent_file_failure_code", None),
         }
 
     @app.post("/v1/tasks/{task_id}/operations")

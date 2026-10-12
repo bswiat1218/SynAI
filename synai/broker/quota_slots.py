@@ -102,6 +102,7 @@ class QuotaSlotManager:
         self.persistent_file_failure_callback: Callable[[str], None] | None = None
         self.persistent_file_failure_code: str | None = None
         self._failed_file_roles: set[str] = set()
+        self._file_failure_lock = threading.Lock()
 
     def verify_startup(self) -> tuple[bool, tuple[str, ...]]:
         with self._verification_lock:
@@ -175,15 +176,16 @@ class QuotaSlotManager:
             "quota_slot_inventory_mismatch", "quota_slot_registry_unavailable",
             "legacy_task_slot_assignment_missing",
         }
-        self.runtime_containment_available = (
-            self._production_inspector
-            and containment_roles <= self.verified_role_ids
-            and not containment_roles & self._failed_file_roles
-            and not any(reason in containment_blockers for reason in reasons)
-            and _process_identity_is_restricted(
-                self.config.service_uid, self.config.service_gid,
+        with self._file_failure_lock:
+            self.runtime_containment_available = (
+                self._production_inspector
+                and containment_roles <= self.verified_role_ids
+                and not containment_roles & self._failed_file_roles
+                and not any(reason in containment_blockers for reason in reasons)
+                and _process_identity_is_restricted(
+                    self.config.service_uid, self.config.service_gid,
+                )
             )
-        )
         if len(observations) == len(self.config.storage_roles) and observations:
             reasons.extend(aggregate_storage_reasons(self.config, observations))
             first = observations[self.config.storage_roles[0].role_id]
@@ -227,11 +229,14 @@ class QuotaSlotManager:
             "storage_mount_identity_changed",
             "legacy_task_slot_assignment_missing",
         }
-        self.verified = bool(verified_ids) and not any(
-            reason in blocked_inventory or reason.startswith("storage_role_")
-            for reason in self.reasons
-        )
-        self.verified_slot_ids = frozenset(verified_ids if self.verified else ())
+        with self._file_failure_lock:
+            if self.persistent_file_failure_code is not None:
+                self.reasons = tuple(dict.fromkeys((*self.reasons, self.persistent_file_failure_code)))
+            self.verified = self.persistent_file_failure_code is None and bool(verified_ids) and not any(
+                reason in blocked_inventory or reason.startswith("storage_role_")
+                for reason in self.reasons
+            )
+            self.verified_slot_ids = frozenset(verified_ids if self.verified else ())
         return self.verified, self.reasons
 
     def verify_storage_role(self, role_id: str) -> bool:
@@ -240,6 +245,7 @@ class QuotaSlotManager:
 
     def verify_runtime_path(self, role_id: str, path: Path) -> None:
         with self._verification_lock:
+            self._require_file_authority()
             role = next((role for role in self.config.storage_roles if role.role_id == role_id), None)
             if role is None or not path.is_absolute() or path != Path(os.path.normpath(path)):
                 raise BrokerError("runtime_storage_path_invalid", "Runtime path is not canonical.", 503)
@@ -269,7 +275,8 @@ class QuotaSlotManager:
 
     def _verify_storage_role(self, role_id: str) -> bool:
         if (
-            not self._production_inspector
+            self.persistent_file_failure_code is not None
+            or not self._production_inspector
             or not _process_identity_is_restricted(
                 self.config.service_uid, self.config.service_gid,
             )
@@ -286,7 +293,7 @@ class QuotaSlotManager:
             self._verify_observation(role, observation)
             self._verify_local_role_path(role, observation)
             self.verify_existing_files(role_id)
-            return True
+            return self.persistent_file_failure_code is None
         except (
             InspectorFailure, BrokerError, OSError, ValueError,
             AttributeError, TypeError,
@@ -447,6 +454,7 @@ class QuotaSlotManager:
 
     def task_path_for_inspection(self, task_id: str, *, allow_quarantined: bool = False) -> Path:
         """Diagnostic runtime source spelling only; callers must not use it for filesystem I/O."""
+        self._require_file_authority()
         if not re.fullmatch(r"[a-f0-9]{32}", task_id):
             raise BrokerError("task_identity_invalid", "Task identity is invalid.", 422)
         if not self.verified:
@@ -537,7 +545,9 @@ class QuotaSlotManager:
                 os.close(descriptor)
         return slot.path / task_id
 
-    def open_storage_role(self, role_id: str) -> Directory:
+    def open_storage_role(self, role_id: str, *, _inspection_only: bool = False) -> Directory:
+        if not _inspection_only:
+            self._require_file_authority()
         role = next(item for item in self.config.storage_roles if item.role_id == role_id)
         try:
             live = self.inspector.inspect(role_id)
@@ -564,14 +574,18 @@ class QuotaSlotManager:
                 if previous != identity:
                     raise BrokerError("filesystem_identity_changed", "Storage role was substituted.", 409)
             authority.revalidate()
-            authority.file_verifier = lambda descriptor: self.verify_persistent_file(role_id, descriptor)
+            authority.file_verifier = lambda descriptor: self.verify_persistent_file(
+                role_id, descriptor, _inspection_only=_inspection_only,
+            )
             authority.file_failure_callback = lambda code: self._persistent_file_failed(role_id, code)
             return authority
         except BaseException:
             authority.close()
             raise
 
-    def verify_persistent_file(self, role_id: str, descriptor: int) -> None:
+    def verify_persistent_file(self, role_id: str, descriptor: int, *, _inspection_only: bool = False) -> None:
+        if not _inspection_only:
+            self._require_file_authority()
         role = next(item for item in self.config.storage_roles if item.role_id == role_id)
         try:
             live = self.inspector.inspect(role_id)
@@ -599,12 +613,18 @@ class QuotaSlotManager:
             raise BrokerError(code, "Persistent file quota identity cannot be verified.", 503) from exc
 
     def _persistent_file_failed(self, role_id: str, code: str) -> None:
-        first_failure = self.persistent_file_failure_code is None
-        if first_failure:
-            self.persistent_file_failure_code = code
-        self._failed_file_roles.add(role_id)
-        self.verified = False
-        self.verified_slot_ids = frozenset()
+        with self._file_failure_lock:
+            first_failure = self.persistent_file_failure_code is None
+            if first_failure:
+                self.persistent_file_failure_code = code
+            self._failed_file_roles.add(role_id)
+            self.verified = False
+            self.verified_slot_ids = frozenset()
+            self.reasons = tuple(dict.fromkeys((*self.reasons, self.persistent_file_failure_code)))
+            if any(role.role_id == role_id and role.kind in {
+                "broker_state", "podman_graph", "podman_runtime", "temporary",
+            } for role in self.config.storage_roles):
+                self.runtime_containment_available = False
         if first_failure and self.persistent_file_failure_callback is not None:
             self.persistent_file_failure_callback(code)
 
@@ -629,11 +649,12 @@ class QuotaSlotManager:
                     os.close(descriptor)
             directory.revalidate()
 
-        with self.open_storage_role(role_id) as root:
+        with self.open_storage_role(role_id, _inspection_only=True) as root:
             inspect(root, 0)
 
     def open_task_root(self, task_id: str, *, allow_quarantined: bool = False,
                        create: bool = False) -> Directory:
+        self._require_file_authority()
         if not re.fullmatch(r"[a-f0-9]{32}", task_id) or not self.verified:
             raise BrokerError("workspace_quota_unverified", "Task authority is unavailable.", 503)
         assignment = self.registry.task_slot(task_id, allow_quarantined=allow_quarantined)
@@ -678,6 +699,7 @@ class QuotaSlotManager:
         return self.open_task_root(task_id, create=True)
 
     def clean_task_root(self, task_id: str) -> None:
+        self._require_file_authority()
         assignment = self.registry.task_slot(task_id)
         try:
             with self.open_storage_role(f"task-{assignment['slot_id']}") as slot:
@@ -702,6 +724,7 @@ class QuotaSlotManager:
             raise
 
     def remove_empty_task_root(self, task_id: str) -> None:
+        self._require_file_authority()
         assignment = self.registry.task_slot(task_id, allow_quarantined=True)
         with self.open_storage_role(f"task-{assignment['slot_id']}") as slot:
             try:
@@ -729,6 +752,7 @@ class QuotaSlotManager:
                 os.fsync(slot.fd)
 
     def recover_pending_releases(self) -> None:
+        self._require_file_authority()
         for slot_record in self.registry.pending_slot_releases():
             task_id = slot_record["task_id"]
             try:
@@ -754,6 +778,14 @@ class QuotaSlotManager:
             except (BrokerError, OSError):
                 self.registry.quarantine_slot(task_id)
         self.verify_startup()
+
+    def _require_file_authority(self) -> None:
+        if self.persistent_file_failure_code is not None:
+            raise BrokerError(
+                self.persistent_file_failure_code,
+                "Persistent file authority is revoked; fresh lifecycle and recovery are required.",
+                503,
+            )
 
 
 def aggregate_storage_reasons(
