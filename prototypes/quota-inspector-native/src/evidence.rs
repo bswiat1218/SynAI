@@ -131,6 +131,7 @@ pub(crate) struct InventoryAttestation {
     pub generation: String,
     pub approval_identity: String,
     pub consumer_namespace: Option<NamespaceId>,
+    pub acquired_at: SampleTime,
 }
 
 pub struct TrustedInventory {

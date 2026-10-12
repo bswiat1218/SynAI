@@ -122,6 +122,11 @@ Broker identity, so it cannot pass Broker runtime readiness.
 
 ## Phase 13F-A.5 — quota-aware task workspace slots
 
+The [authoritative A.5 acceptance inventory](security/phase-13f-a5-acceptance.md)
+tracks the coordinated offline program, existing components, independently
+pending kernel/runtime evidence and production blockers. Passing a model or
+candidate check does not promote any live acceptance row.
+
 Broker configuration accepts an operator-defined inventory of at most four
 pre-provisioned slots. Each has a canonical path, expected ext4 UUID, unique
 project ID, and fixed byte/inode hard limits (at most 256 MiB and 4,096

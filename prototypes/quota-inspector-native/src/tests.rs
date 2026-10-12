@@ -123,7 +123,7 @@ fn candidate(value: &Value) -> Result<CandidateInventory, Failure> {
     CandidateInventory::parse(&serde_json::to_vec(value).unwrap())
 }
 
-fn policy() -> CandidateInventory {
+pub(crate) fn policy() -> CandidateInventory {
     candidate(&document()).unwrap()
 }
 
@@ -141,6 +141,7 @@ fn binding(policy: &CandidateInventory, role: &str) -> BoundRequest {
 }
 
 type JobLease = Arc<Mutex<Option<Arc<DescriptorSet>>>>;
+type SupervisorLease = Arc<Mutex<crate::supervision::WorkerLease<DescriptorSet>>>;
 
 struct FakeBackend {
     disposable: Disposable,
@@ -165,6 +166,8 @@ struct FakeBackend {
     job: JobLease,
     query_calls: usize,
     open_names: Vec<String>,
+    supervised: bool,
+    supervisor: Option<SupervisorLease>,
 }
 
 impl FakeBackend {
@@ -221,6 +224,8 @@ impl FakeBackend {
             job: Arc::new(Mutex::new(None)),
             query_calls: 0,
             open_names: vec![],
+            supervised: false,
+            supervisor: None,
         }
     }
 
@@ -244,6 +249,7 @@ impl ReadOnlyBackend for FakeBackend {
             generation: self.generation.clone(),
             approval_identity: "b".repeat(64),
             consumer_namespace: Some(self.filesystem.namespace),
+            acquired_at: self.time,
         };
         if let Some(mutate) = self.attestation_mutator {
             mutate(&mut attestation);
@@ -372,6 +378,12 @@ impl ReadOnlyBackend for FakeBackend {
             _ => None,
         };
         if self.pending || pending_reason.is_some() {
+            if self.supervised {
+                self.supervisor = Some(Arc::new(Mutex::new(
+                    crate::supervision::WorkerLease::new(worker_identity(), Arc::clone(&lease))
+                        .unwrap(),
+                )));
+            }
             *self.job.lock().unwrap() = Some(lease);
             return QueryProgress::Pending(pending_reason.unwrap_or(Unavailable::Blocked));
         }
@@ -389,6 +401,11 @@ impl ReadOnlyBackend for FakeBackend {
             };
             return QueryProgress::Pending(reason);
         }
+        if let Some(supervisor) = &self.supervisor
+            && supervisor.lock().unwrap().finalize().is_err()
+        {
+            return QueryProgress::Pending(Unavailable::UnresolvedOwnership);
+        }
         self.job.lock().unwrap().take();
         if let Some(error) = self.query_error {
             return QueryProgress::Complete(Err(error));
@@ -396,7 +413,138 @@ impl ReadOnlyBackend for FakeBackend {
         QueryProgress::Complete(Ok(Box::new(self.quota.clone())))
     }
 }
+fn worker_identity() -> crate::supervision::WorkerIdentity {
+    crate::supervision::WorkerIdentity {
+        pid: 4242,
+        start_ticks: 100,
+        generation: 1,
+        boot_epoch: [1; 16],
+        pid_namespace: NamespaceId {
+            device: 4,
+            inode: 2001,
+        },
+    }
+}
 
+#[test]
+fn inventory_attestation_requires_fresh_per_request_acquisition() {
+    for mutate in [
+        (|attestation: &mut InventoryAttestation| {
+            attestation.acquired_at.monotonic -= Duration::from_nanos(1);
+        }) as fn(&mut InventoryAttestation),
+        |attestation| attestation.acquired_at.monotonic += Duration::from_nanos(1),
+        |attestation| attestation.acquired_at.unix_seconds += 1,
+        |attestation| attestation.acquired_at.unix_seconds -= 6,
+    ] {
+        let policy = policy();
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.attestation_mutator = Some(mutate);
+        assert_eq!(
+            operation(backend, &policy, "state").err(),
+            Some(Failure::Unavailable(Unavailable::StaleEvidence))
+        );
+    }
+}
+
+#[test]
+fn exact_worker_finalization_is_required_before_native_completion() {
+    for terminal in [Unavailable::Cancelled, Unavailable::DeadlineExceeded] {
+        let policy = policy();
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.pending = true;
+        backend.supervised = true;
+        let mut inspection = operation(backend, &policy, "state").unwrap();
+        assert!(inspection.poll().is_err());
+        let supervisor = Arc::clone(inspection.backend.supervisor.as_ref().unwrap());
+        if terminal == Unavailable::Cancelled {
+            inspection.cancel();
+        } else {
+            inspection.backend.time.monotonic += MAX_OPERATION_TIME;
+        }
+        inspection.backend.completed = true; // output/cancellation is not physical completion.
+        let id = worker_identity();
+        for wrong in [
+            crate::supervision::WorkerIdentity {
+                pid: id.pid + 1,
+                ..id
+            },
+            crate::supervision::WorkerIdentity {
+                start_ticks: id.start_ticks + 1,
+                ..id
+            },
+            crate::supervision::WorkerIdentity {
+                generation: id.generation + 1,
+                ..id
+            },
+            crate::supervision::WorkerIdentity {
+                boot_epoch: [2; 16],
+                ..id
+            },
+            crate::supervision::WorkerIdentity {
+                pid_namespace: NamespaceId {
+                    inode: 2002,
+                    ..id.pid_namespace
+                },
+                ..id
+            },
+        ] {
+            assert!(supervisor.lock().unwrap().exited(wrong).is_err());
+        }
+        assert!(supervisor.lock().unwrap().reaped(id).is_err());
+        assert!(supervisor.lock().unwrap().cleaned(id).is_err());
+        for _ in 0..5 {
+            assert_eq!(
+                inspection.poll().unwrap_err(),
+                Failure::Unavailable(terminal)
+            );
+            assert!(inspection.pending());
+            assert!(inspection.descriptor_count() > 0);
+        }
+        supervisor.lock().unwrap().exited(id).unwrap();
+        assert!(inspection.poll().is_err());
+        assert!(inspection.pending());
+        supervisor.lock().unwrap().reaped(id).unwrap();
+        assert!(inspection.poll().is_err());
+        assert!(inspection.pending());
+        supervisor.lock().unwrap().cleaned(id).unwrap();
+        assert_eq!(
+            inspection.poll().unwrap_err(),
+            Failure::Unavailable(terminal)
+        );
+        assert!(!inspection.pending());
+        assert_eq!(inspection.descriptor_count(), 0);
+        assert!(inspection.backend.job.lock().unwrap().is_none());
+        let fresh = FakeBackend::new(&policy, "state");
+        assert!(operation(fresh, &policy, "state").unwrap().poll().is_ok());
+    }
+}
+
+#[test]
+fn simulated_supervisor_survives_dropped_request_and_crash_until_reaped() {
+    let policy = policy();
+    let mut backend = FakeBackend::new(&policy, "state");
+    backend.pending = true;
+    backend.supervised = true;
+    let mut inspection = operation(backend, &policy, "state").unwrap();
+    assert!(inspection.poll().is_err());
+    let supervisor = Arc::clone(inspection.backend.supervisor.as_ref().unwrap());
+    let job = Arc::clone(&inspection.backend.job);
+    let retained = Arc::downgrade(job.lock().unwrap().as_ref().unwrap());
+    inspection.cancel();
+    drop(inspection);
+    job.lock().unwrap().take();
+    assert!(retained.upgrade().is_some());
+    let id = worker_identity();
+    // Reconciliation has no completion evidence yet: no new worker/lease release.
+    assert!(supervisor.lock().unwrap().finalize().is_err());
+    supervisor.lock().unwrap().exited(id).unwrap();
+    assert!(supervisor.lock().unwrap().finalize().is_err());
+    supervisor.lock().unwrap().reaped(id).unwrap();
+    assert!(supervisor.lock().unwrap().finalize().is_err());
+    supervisor.lock().unwrap().cleaned(id).unwrap();
+    supervisor.lock().unwrap().finalize().unwrap();
+    assert!(retained.upgrade().is_none());
+}
 fn operation(
     backend: FakeBackend,
     selected: &CandidateInventory,

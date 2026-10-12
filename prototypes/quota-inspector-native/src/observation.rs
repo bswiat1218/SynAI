@@ -367,6 +367,11 @@ impl<B: ReadOnlyBackend> Inspection<B> {
             .ok_or(Failure::Unavailable(Unavailable::ArithmeticOverflow))?;
         let attestation = backend.attest(policy)?;
         validate_attestation(policy, &attestation)?;
+        crate::contracts::check_acquisition_time(
+            started,
+            attestation.acquired_at,
+            backend.clock(),
+        )?;
         let inventory = TrustedInventory {
             policy: policy.clone(),
             attestation,

@@ -51,6 +51,20 @@
 //! ```compile_fail
 //! use quota_inspector_abi::ioctl;
 //! ```
+//! An acquisition cannot outlive its descriptor owner:
+//! ```compile_fail
+//! use std::os::fd::AsFd;
+//! use quota_inspector_abi::{Acquisition, ReadCommand};
+//! let acquisition = {
+//!     let file = std::fs::File::open("Cargo.toml").unwrap();
+//!     Acquisition::new(file.as_fd(), ReadCommand::GetInfo)
+//! };
+//! let _ = acquisition.descriptor();
+//! ```
+//! ```compile_fail
+//! use quota_inspector_abi::Acquisition;
+//! let _ = Acquisition::from_path("/host/device");
+//! ```
 
 #[cfg(not(all(
     target_os = "linux",
@@ -61,12 +75,16 @@
 )))]
 compile_error!("quota-inspector-abi supports only x86_64 Linux GNU LP64 little-endian");
 
+mod acquisition;
 mod command;
 mod decode;
 mod error;
 mod layout;
 mod target;
 
+pub use acquisition::{
+    Acquisition, AcquisitionError, DecodedCandidate, KernelSignature, OutputBuffer, ReportedStatus,
+};
 pub use command::{ProjectId, ReadCommand};
 pub use decode::{ByteLimit, InfoCandidate, InodeLimit, QuotaCandidate};
 pub use error::{AbiError, ErrnoClass, classify_errno};

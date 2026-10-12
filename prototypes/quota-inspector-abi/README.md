@@ -7,6 +7,23 @@ feature, environment switch, executable, daemon, listener or production wiring.
 The native validator does not depend on this crate and still returns unavailable.
 No successful decode is a storage observation or authorization.
 
+The [acquisition contract](src/acquisition.rs) borrows an owned descriptor and
+binds the typed command to a fixed initialized output kind. It does not qualify
+the FD, its project assignment or its owner. Its signature alias is a compile-only
+type shape, not an FFI declaration, symbol or callable real wrapper; kernel entry
+register conventions are not established by an `extern "C"` function type.
+There is no address-taking or registration path. Future invocation still requires
+separate authorization and ABI review.
+
+Caller-reported status distinguishes Linux raw negative errno (-1 through -4095)
+from GNU libc's -1/positive errno convention. Only zero is success; malformed
+returns/errno and command/output mismatches fail before decoding. Failed output
+is never decoded even if its bytes appear valid. Reported success and decoded
+candidates remain untrusted: matching caller-supplied bits cannot establish that
+an actual kernel wrote the buffer, that a partial write did not occur, or that
+physical work completed. The acquisition borrow is compile-time scoped, while
+a future asynchronous worker must independently retain an owned descriptor lease.
+
 ## Target and local authoritative headers
 
 Only `x86_64-unknown-linux-gnu`, little-endian LP64 is supported. Other targets

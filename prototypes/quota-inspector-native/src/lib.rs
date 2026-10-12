@@ -1,8 +1,33 @@
 #![forbid(unsafe_code)]
 
+//! Untrusted handoff candidates cannot be promoted to a validated observation:
+//! ```compile_fail
+//! use quota_inspector_native::{MountedSourceCandidate, ValidatedObservation};
+//! fn promote(candidate: MountedSourceCandidate) -> ValidatedObservation {
+//!     candidate.into()
+//! }
+//! ```
+//! ```compile_fail
+//! use quota_inspector_native::{InventoryAcquisitionCandidate, TrustedInventory};
+//! fn promote(candidate: InventoryAcquisitionCandidate) -> TrustedInventory {
+//!     candidate.into()
+//! }
+//! ```
+//! ```compile_fail
+//! use quota_inspector_native::supervision::WorkerLease;
+//! ```
+
+mod contracts;
 mod evidence;
 mod inventory;
 mod observation;
+#[cfg(test)]
+mod supervision;
+
+pub use contracts::{
+    ConfinementCandidate, InventoryAcquisitionCandidate, MountedSourceCandidate, VfsFileCandidate,
+    VfsFileKind, VfsOperation,
+};
 
 pub use evidence::{
     Capacity, HardLimits, NodeEvidence, NodeType, PinnedDescriptor, ProjectAttributes, ProjectId,
@@ -107,5 +132,7 @@ impl Failure {
     }
 }
 
+#[cfg(test)]
+mod contract_tests;
 #[cfg(test)]
 mod tests;

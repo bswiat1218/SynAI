@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::{Arc, Weak};
 
 use crate::*;
@@ -521,4 +522,76 @@ fn dropped_cancelled_owner_cannot_orphan_physical_work_or_admit_overlap() {
             .poll(&mut transport, Reply::Complete(Ok(quota_bytes().to_vec())))
             .is_ok()
     );
+}
+
+#[test]
+fn reported_kernel_and_libc_status_are_distinct_and_checked() {
+    assert!(ReportedStatus::from_kernel(0).is_ok());
+    assert!(ReportedStatus::from_libc(0, 38).is_ok());
+    for errno in [1, 4, 9, 22, 38, 95, 4095] {
+        let expected = Err(AcquisitionError::Errno(classify_errno(errno)));
+        assert_eq!(ReportedStatus::from_kernel(-i64::from(errno)), expected);
+        assert_eq!(ReportedStatus::from_libc(-1, errno), expected);
+    }
+    for value in [1, i64::MAX, -4096, i64::MIN] {
+        assert_eq!(
+            ReportedStatus::from_kernel(value),
+            Err(AcquisitionError::InvalidReturn)
+        );
+    }
+    for errno in [0, -1, 4096, i32::MAX] {
+        assert_eq!(
+            ReportedStatus::from_libc(-1, errno),
+            Err(AcquisitionError::InvalidErrno)
+        );
+    }
+    for value in [-38, -2, 1, i64::MIN] {
+        assert_eq!(
+            ReportedStatus::from_libc(value, 38),
+            Err(AcquisitionError::InvalidReturn)
+        );
+    }
+}
+
+#[test]
+fn acquisition_kind_and_reported_failure_gate_untrusted_decoding() {
+    let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    for command in [command(), ReadCommand::GetInfo] {
+        let acquisition = Acquisition::new(file.as_fd(), command);
+        assert_eq!(acquisition.command(), command);
+        assert_eq!(acquisition.descriptor().as_raw_fd(), file.as_raw_fd());
+        let output = match command {
+            ReadCommand::GetQuota(_) => OutputBuffer::Quota(quota_bytes()),
+            ReadCommand::GetInfo => OutputBuffer::Info(info_bytes()),
+        };
+        assert!(
+            acquisition
+                .decode_reported_output(ReportedStatus::from_kernel(0), output.clone())
+                .is_ok()
+        );
+        for errno in [4, 22, 38, 95] {
+            assert_eq!(
+                acquisition.decode_reported_output(
+                    ReportedStatus::from_kernel(-i64::from(errno)),
+                    output.clone()
+                ),
+                Err(AcquisitionError::Errno(classify_errno(errno)))
+            );
+        }
+        assert_eq!(
+            acquisition.decode_reported_output(
+                ReportedStatus::from_kernel(0),
+                acquisition.initialized_output()
+            ),
+            Err(AcquisitionError::Decode(AbiError::MissingValidity))
+        );
+        let wrong = match command {
+            ReadCommand::GetQuota(_) => OutputBuffer::Info(info_bytes()),
+            ReadCommand::GetInfo => OutputBuffer::Quota(quota_bytes()),
+        };
+        assert_eq!(
+            acquisition.decode_reported_output(ReportedStatus::from_kernel(0), wrong),
+            Err(AcquisitionError::OutputKind)
+        );
+    }
 }

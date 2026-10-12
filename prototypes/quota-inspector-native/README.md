@@ -194,6 +194,50 @@ finalizes only the old request, not a fresh independently admitted request.
 work or cleanup must remain `Pending`. Releasing an owned descriptor is not a
 claim of independently supervised process cleanup or kernel enforcement.
 
+## Coordinated offline acquisition and handoff contracts
+
+[Candidate contracts](src/contracts.rs) check untrusted inventory-source
+before/after identity, policy/generation binding, size and acquisition time;
+same-namespace mounted-source descriptor correspondence; per-kind SQLite
+DB/WAL/SHM/journal identity; and required claimed confinement properties.
+These checks return no authority token. Expected metadata supplied by a caller
+is NOT authenticated acquisition, and matching values cannot create
+TrustedInventory or ValidatedObservation. Non-test inspection remains unavailable.
+
+The sealed inventory attestation now additionally requires a sample acquired
+during the current request, within the same monotonic clock domain and not from
+the future or stale wall-clock window. The trusted backend remains responsible
+for independently acquiring/authenticating that sample and source. No loader,
+FS ioctl, kernel quota query, VFS or mounted-source handoff is enabled.
+
+The [test-only supervisor contract](src/supervision.rs) models an exact worker
+instance using PID, start ticks, generation, boot epoch and PID namespace.
+It retains a lease until exit, reap and safe cleanup are all reported for that
+same instance. It is compiled only under cfg(test) and wired into a fake backend
+to test the actual Inspection state machine; it cannot supervise a real process
+or grant production authority. A simulated output being available is insufficient
+to finalize pending physical work. An independent simulated worker lease survives
+request-owner drop. Actual restart persistence and process-instance acquisition
+are separately required, not demonstrated by these models.
+
+Cross-namespace mounted-source evidence stays unavailable; equal mount numbers
+are not correspondence proof. VFS candidates model individual operations only:
+future native callbacks must establish independently approved descriptors at
+every open/create/read/write/truncate/lock/sync/checkpoint/close boundary, including
+sidecar lifecycle, absence, crashes and cleanup. Existing Python registry tests
+cover interruption, checkpoint, sidecars and sealing; no fake is a native VFS.
+SQLite VFS and runtime bind-source readiness refusals remain unconditional.
+
+Complete role acquisition still requires bounded recursive enumeration beyond
+the four listed native leaves: reuse the Broker's inode/depth bounds and actual
+per-file project checks; refuse truncation, omission, cycles, special files,
+cross-mount entries or an unverifiable namespace edge. This is an integration
+contract, not a new native enumerator or evidence of complete role charging.
+Empirical sparse/concurrent byte/inode write denial needs separate approval.
+
+The authoritative [A.5 matrix](../../docs/security/phase-13f-a5-acceptance.md)
+distinguishes verified offline code, test-only models and pending live acceptance.
+
 Deterministic blocked-work tests use an **independently owned simulated worker**
 holding an `Arc` descriptor lease; even dropping the request owner does not release
 that worker's descriptors until it confirms completion. A later actual worker must

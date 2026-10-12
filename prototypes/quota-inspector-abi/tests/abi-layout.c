@@ -11,6 +11,9 @@
 #endif
 _Static_assert(CHAR_BIT == 8 && sizeof(long) == 8 && sizeof(void *) == 8, "LP64");
 _Static_assert(sizeof(unsigned int) == 4, "command and ID width");
+_Static_assert((unsigned int)-1 > 0, "unsigned arguments");
+_Static_assert((__u64)-1 > 0 && (__u32)-1 > 0, "unsigned record fields");
+_Static_assert(sizeof(__kernel_uid32_t) == 4, "kernel quota ID width");
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "byte order");
 _Static_assert(__NR_quotactl_fd == 443, "syscall identity only");
 _Static_assert(PRJQUOTA == 2 && SUBCMDSHIFT == 8 && SUBCMDMASK == 255, "encoding");

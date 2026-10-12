@@ -371,6 +371,28 @@ class RuntimeStorageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(readiness.execution_available)
         self.assertIn("runtime_storage_acceptance_pending", readiness.reasons)
 
+    async def test_every_runtime_lifecycle_command_retains_launch_refusal(self):
+        commands = (
+            ("info", "--format", "json"),
+            ("image", "inspect", self.selected.image),
+            ("unshare", "cat", "/proc/self/uid_map"),
+            ("create", self.selected.image),
+            ("start", "a" * 64),
+            ("exec", "a" * 64, "false"),
+            ("inspect", "a" * 64),
+            ("container", "exists", "a" * 64),
+            ("stop", "--time", "3", "a" * 64),
+            ("kill", "a" * 64),
+            ("rm", "a" * 64),
+        )
+        with patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as launch:
+            for arguments in commands:
+                with self.subTest(arguments=arguments):
+                    with self.assertRaises(BrokerError) as denied:
+                        await self.runtime._run(*arguments, timeout=1, maximum=1024)
+                    self.assertEqual(denied.exception.code, "runtime_storage_acceptance_pending")
+            launch.assert_not_awaited()
+
     async def test_missing_runtime_observer_and_restart_drift_fail_closed(self):
         ready, reasons = await self.runtime.verify_storage_assurance()
         self.assertFalse(ready)
