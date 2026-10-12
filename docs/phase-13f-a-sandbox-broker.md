@@ -800,6 +800,47 @@ production guarantee. Slow-task debug messages also include fixture setup
 and concurrent test overhead. Verification was not weakened for performance,
 and broader serving-loop I/O isolation remains deployment qualification work.
 
+### Phase 13F-A.5.1b: offline Rust inspector prototype
+
+The standalone [quota-inspector prototype](../prototypes/quota-inspector/README.md)
+is a bounded ordinary-user fixture harness, not an installed inspector, daemon
+or privileged kernel backend. It compiles independently of the Python Broker.
+The existing Python v1 client remains unchanged. Shared synthetic golden
+fixtures and disposable Unix-socket tests check compatibility, actual connected
+`SO_PEERCRED`, replay/freshness/epoch checks and malformed-input refusal.
+
+Fixture observations never query the synthetic inventory paths, real devices,
+quotas or mounts. The native backend remains explicitly unavailable. No
+production configuration, CLI toggle, environment switch or startup wiring
+selects this fixture harness. Protocol v1 success itself is **not**
+cryptographically distinguishable from a genuine helper's response; it must
+not be deployed at a trusted inspector endpoint. Isolation rests on the offline
+test boundary plus the Broker's independent local mount/project-file checks,
+historical registry verification, SQLite VFS refusal, bind-source identity
+refusal and unconditional runtime subprocess acceptance guard. No fixture
+success authorizes execution or proves write denial.
+
+For future separately approved isolated-VM kernel work, resolve immutable
+inventory paths descriptor-relatively with no-follow component traversal.
+Check filesystem UUID/device correspondence and namespace-local mount IDs
+before and after read-only observation. Verify actual project IDs on existing
+files and directories separately from directory inheritance. A future
+`quotactl_fd()` query must use a validated filesystem descriptor and report
+kernel-observed configuration, limits and usage; empirical byte/inode
+write-denial tests remain separate acceptance evidence. `CAP_SYS_ADMIN` is
+broad administrative authority, not a quota-only privilege. Strict syscall
+restrictions, enforcing AppArmor, privilege minimization and independent
+review are prerequisites to any privileged experiment, not work performed
+by this prototype. ext4 observations do not prove tmpfs, memory, cgroup,
+Podman or container-resource enforcement. Native inspection, container
+containment and post-crash supervision remain unaccepted.
+
+Storage planning retains 7.5 GiB hard-quota entitlements, 8 GiB continuous
+reserve, 256 MiB allowance, 15.75 GiB required initial available capacity
+and 241,664 required available inodes. 24, 32, 64 and 128 GiB are planning
+candidates only; **128 GiB is the planning maximum**, not an authorization
+to provision or alter geometry, entitlements, reserves, mounts or quotas.
+
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-
 collection contracts. Workspace file reads/mutations use no-follow

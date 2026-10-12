@@ -1,0 +1,16 @@
+[package]
+name = "quota-inspector"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+getrandom = "0.3"
+rustix = { version = "1", features = ["fs", "net", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "fixture-harness"
+path = "src/bin/fixture-harness.rs"

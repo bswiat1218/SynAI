@@ -1,0 +1,40 @@
+{
+  "label": "synthetic_offline_only",
+  "roles": [
+    {
+      "role_id": "fixture-role",
+      "kind": "task_slot",
+      "path": "/synthetic/fixture-volume/task",
+      "mount_path": "/synthetic/fixture-volume",
+      "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+      "project_id": 4242,
+      "byte_limit": 1048576,
+      "inode_limit": 128,
+      "owner_uid": 4242,
+      "owner_gid": 4242
+    }
+  ],
+  "observations": {
+    "fixture-role": {
+      "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+      "mount_target": "/synthetic/fixture-volume",
+      "mount_id": 42,
+      "filesystem_type": "ext4",
+      "quota_mode": "project",
+      "quota_configuration_enabled": true,
+      "project_id": 4242,
+      "inheritance_enabled": true,
+      "byte_limit": 1048576,
+      "inode_limit": 128,
+      "bytes_used": 64,
+      "inodes_used": 1,
+      "filesystem_bytes": 34359738368,
+      "filesystem_bytes_available": 32212254720,
+      "filesystem_inodes": 1048576,
+      "filesystem_inodes_available": 1000000,
+      "owner_uid": 4242,
+      "owner_gid": 4242
+    }
+  },
+  "expected_generation": "dceeb2679fd90065e786f689b67ca00545c8f50bb5158f7043d03b9812a6d609"
+}
