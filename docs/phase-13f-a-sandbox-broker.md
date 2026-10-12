@@ -696,6 +696,38 @@ place. The prior loopback lab result remains development evidence only.
 
 ## Operations, state, and evidence
 
+### Phase 13F-A.5.1a.8: safety-transition reliability (F1/F2)
+
+Safety-path error diagnostics use a narrowly scoped best-effort emission
+boundary. Ordinary logger/handler exceptions cannot interrupt readiness
+revocation, registry failure callbacks, quarantine classification, exact-owned
+containment scheduling, evidence-failure handling, watchdog restart, or
+shutdown cleanup. The verified persistent handler still raises and retains
+its failure latch; direct logging operations do not become successful.
+There is no alternate disk sink or diagnostic queue. The readiness response
+includes only the last emission failure in structured in-memory diagnostics,
+explicitly marked `durable: false`; emission failure also revokes readiness.
+Cancellation and process-level termination exceptions are not swallowed.
+
+Watchdog negative results, malformed evidence, and verification exceptions
+all revoke admission and enter the existing storage-assurance-loss transition.
+Verification runs under the assurance lock; quarantine and slow containment
+run after it is released. Admission-time negative verification likewise
+releases that lock before safety handling. Single-flight containment remains
+task-scoped, and later successful observations do not restore readiness.
+
+Failed quarantine persistence does not prevent a containment attempt where
+existing exact-container policy permits it, but the runtime still independently
+requires trustworthy ownership. Missing/untrusted registry identity never
+authorizes speculative termination. Unpersisted quarantine/evidence remains
+unresolved with operator escalation; no quota slot is released on that basis.
+All runtime subprocess, bind-source, inspector, and SQLite VFS acceptance gates
+remain unchanged. Deterministic regression tests do not prove live containment.
+
+F3 local quota-authority latch consistency, F4 repeated-cancellation worker
+ownership, and F5 whole-process deadlines remain separate unresolved findings.
+This phase does not change those mechanisms or implement a Rust inspector.
+
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-
 collection contracts. Workspace file reads/mutations use no-follow

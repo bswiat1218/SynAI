@@ -131,6 +131,7 @@ class BrokerService:
         self._lifecycle_loop: asyncio.AbstractEventLoop | None = None
         self._closed = False
         self._lifespan_active = False
+        self.last_diagnostic_failure: dict[str, str | int | bool] | None = None
         self.registry.failure_callback = self._registry_failure
         self.registry.storage_check = self._registry_storage_verified
         self.registry.directory_factory = self._registry_directory
@@ -154,7 +155,20 @@ class BrokerService:
         self._invalidate_storage_readiness(code)
         self._invalidate_storage_readiness("operator_intervention_required")
         self._invalidate_storage_readiness("storage_containment_unconfirmed")
-        logger.error("Broker registry authority revoked: %s; containment unresolved", code)
+        self._diagnostic_error("Broker registry authority revoked: %s; containment unresolved", code)
+
+    def _diagnostic_error(self, message: str, *arguments: object) -> None:
+        try:
+            logger.error(message, *arguments)
+        except Exception as exc:
+            # Only diagnostic emission is best effort; security operations stay outside this boundary.
+            self.last_diagnostic_failure = {
+                "message": message[:256],
+                "error_type": type(exc).__name__,
+                "observed_at": int(time.time()),
+                "durable": False,
+            }
+            self._invalidate_storage_readiness("diagnostic_emission_failed")
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -245,7 +259,7 @@ class BrokerService:
                 self._invalidate_storage_readiness(
                     "storage_containment_unconfirmed",
                 )
-                logger.error(
+                self._diagnostic_error(
                     "Broker shutdown left %d exact-container containment attempt(s) unresolved",
                     len(pending),
                 )
@@ -272,18 +286,26 @@ class BrokerService:
             await asyncio.sleep(interval)
             async with self._storage_assurance_lock:
                 try:
-                    storage_ready, reasons = await self._watchdog_storage_check()
+                    result = await self._watchdog_storage_check()
+                    if (
+                        not isinstance(result, tuple) or len(result) != 2
+                        or type(result[0]) is not bool
+                        or not isinstance(result[1], tuple)
+                        or not all(isinstance(reason, str) and reason for reason in result[1])
+                    ):
+                        raise ValueError("Storage verification returned malformed evidence")
+                    storage_ready, reasons = result
                     if self.runtime.storage_policy.observed is not None or self.runtime.storage_policy.failure_code:
                         runtime_ready, runtime_reasons = await self.runtime.verify_storage_assurance()
                         storage_ready = storage_ready and runtime_ready
                         reasons = (*reasons, *runtime_reasons)
-                except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                except Exception as exc:
                     self._invalidate_storage_readiness("storage_watchdog_failed")
-                    logger.error(
-                        "Broker storage watchdog could not verify assurance: %s",
-                        type(exc).__name__,
-                    )
-                    continue
+                    storage_ready = False
+                    reasons = ("storage_watchdog_failed",)
+                    verification_error = type(exc).__name__
+                else:
+                    verification_error = None
                 if not storage_ready:
                     self._invalidate_storage_readiness("storage_assurance_lost")
             if not storage_ready:
@@ -293,9 +315,14 @@ class BrokerService:
                     self._invalidate_storage_readiness(
                         "storage_loss_handling_failed",
                     )
-                    logger.error(
+                    self._diagnostic_error(
                         "Broker storage assurance loss handling failed: %s",
                         type(exc).__name__,
+                    )
+                if verification_error is not None:
+                    self._diagnostic_error(
+                        "Broker storage watchdog could not verify assurance: %s",
+                        verification_error,
                     )
 
     async def _watchdog_storage_check(self) -> tuple[bool, tuple[str, ...]]:
@@ -314,27 +341,27 @@ class BrokerService:
                 await verification
             except (BrokerError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                 self._invalidate_storage_readiness("storage_watchdog_failed")
-                logger.error("Broker storage verification failed during shutdown: %s", type(exc).__name__)
+                self._diagnostic_error("Broker storage verification failed during shutdown: %s", type(exc).__name__)
             raise
 
     def _storage_watchdog_finished(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
             if self._storage_watchdog_task is task:
                 self._invalidate_storage_readiness("storage_watchdog_stopped")
-                logger.error("Broker storage watchdog was cancelled unexpectedly")
                 self._storage_watchdog_task = None
                 self._start_storage_watchdog()
+                self._diagnostic_error("Broker storage watchdog was cancelled unexpectedly")
             return
         error = task.exception()
         if error is not None:
             self._invalidate_storage_readiness("storage_watchdog_stopped")
-            logger.error(
-                "Broker storage watchdog stopped unexpectedly: %s",
-                type(error).__name__,
-            )
             if self._storage_watchdog_task is task:
                 self._storage_watchdog_task = None
                 self._start_storage_watchdog()
+            self._diagnostic_error(
+                "Broker storage watchdog stopped unexpectedly: %s",
+                type(error).__name__,
+            )
 
     def _invalidate_storage_readiness(self, reason: str) -> None:
         checks = dict(self.readiness.checks) if self.readiness is not None else {}
@@ -490,13 +517,8 @@ class BrokerService:
                 storage_ready = storage_ready and runtime_ready
                 storage_reasons = (*storage_reasons, *runtime_reasons)
             if not storage_ready:
-                await self._handle_storage_assurance_loss(storage_reasons)
-                raise BrokerError(
-                    "storage_inspection_unavailable",
-                    "Fresh bounded-storage inspection is unavailable or inconsistent.",
-                    503,
-                )
-            if claim.tool_kind == "prepare" and (
+                self._invalidate_storage_readiness("storage_assurance_lost")
+            elif claim.tool_kind == "prepare" and (
                 self.readiness is None
                 or self.readiness.checks.get("workspace_quota") is not True
             ):
@@ -505,14 +527,22 @@ class BrokerService:
                     "No verified Broker quota slot is available for task preparation.",
                     503,
                 )
-            eligible_slots = (
-                self.quota_manager.verified_slot_ids
-                if claim.tool_kind == "prepare"
-                else None
-            )
-            self.registry.verify_ownership()
-            self.registry.authorize(
-                claim, payload.claim_signature, eligible_slot_ids=eligible_slots,
+            if storage_ready:
+                eligible_slots = (
+                    self.quota_manager.verified_slot_ids
+                    if claim.tool_kind == "prepare"
+                    else None
+                )
+                self.registry.verify_ownership()
+                self.registry.authorize(
+                    claim, payload.claim_signature, eligible_slot_ids=eligible_slots,
+                )
+        if not storage_ready:
+            await self._handle_storage_assurance_loss(storage_reasons)
+            raise BrokerError(
+                "storage_inspection_unavailable",
+                "Fresh bounded-storage inspection is unavailable or inconsistent.",
+                503,
             )
         side_effects_started = False
         operation_completed = False
@@ -660,6 +690,7 @@ class BrokerService:
         container_records: tuple[Any, ...] = ()
         task_ids: tuple[str, ...] = ()
         container_records_available = False
+        quarantine_error = None
         try:
             container_records = self.registry.container_records()
             container_records_available = True
@@ -669,10 +700,8 @@ class BrokerService:
             task_ids = self.registry.quarantine_all_for_storage_loss(reason)
             durable_quarantine = True
         except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
-            logger.error(
-                "Broker could not persist storage-loss quarantine: %s",
-                type(exc).__name__,
-            )
+            quarantine_error = type(exc).__name__
+            self._invalidate_storage_readiness("operator_intervention_required")
             if container_records:
                 task_ids = tuple(dict.fromkeys(
                     str(row["task_id"]) for row in container_records
@@ -687,6 +716,10 @@ class BrokerService:
         )
         if not container_records_available:
             unresolved.append("registry_ownership_unavailable")
+            self._invalidate_storage_readiness("registry_ownership_unavailable")
+            self._invalidate_storage_readiness("operator_intervention_required")
+        if not durable_quarantine:
+            self._invalidate_storage_readiness("registry_quarantine_not_durable")
         for task_id in task_ids:
             container = records_by_task.get(task_id)
             if container is None:
@@ -706,6 +739,11 @@ class BrokerService:
                 task_id, durable_quarantine=durable_quarantine,
             ))
 
+        if quarantine_error is not None:
+            self._diagnostic_error(
+                "Broker could not persist storage-loss quarantine: %s",
+                quarantine_error,
+            )
         if pending:
             done, still_pending = await asyncio.wait(pending, timeout=45)
             if still_pending:
@@ -822,7 +860,7 @@ class BrokerService:
                 evidence,
             )
         except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
-            logger.error(
+            self._diagnostic_error(
                 "Broker could not persist containment result for an owned container: %s",
                 type(exc).__name__,
             )
@@ -849,7 +887,7 @@ class BrokerService:
                 }).decode("utf-8"),
             )
         except (BrokerError, OSError, sqlite3.Error, ValueError) as exc:
-            logger.error(
+            self._diagnostic_error(
                 "Broker could not persist unresolved containment state: %s",
                 type(exc).__name__,
             )
@@ -1179,12 +1217,14 @@ def create_app(service: BrokerService, *, startup_callback: Callable[[], Callabl
                 "schema_version": 1, "ready": False, "execution_available": False,
                 "reasons": ["startup_verification_incomplete"],
                 "registry": service.registry.status(),
+                "diagnostics": {"last_emission_failure": service.last_diagnostic_failure},
             }
         return {
             "schema_version": 1, "ready": state.ready,
             "execution_available": state.execution_available,
             "checks": state.checks, "reasons": list(state.reasons),
             "registry": service.registry.status(),
+            "diagnostics": {"last_emission_failure": service.last_diagnostic_failure},
         }
 
     @app.post("/v1/tasks/{task_id}/operations")
