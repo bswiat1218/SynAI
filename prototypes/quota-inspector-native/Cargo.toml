@@ -1,0 +1,11 @@
+[package]
+name = "quota-inspector-native"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+quota-inspector-protocol = { path = "../quota-inspector-protocol" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.10.9"

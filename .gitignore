@@ -3,6 +3,8 @@ __pycache__/
 .venv/
 web/node_modules/
 prototypes/quota-inspector/target/
+prototypes/quota-inspector-native/target/
+prototypes/quota-inspector-protocol/target/
 *.egg-info/
 build/
 dist/

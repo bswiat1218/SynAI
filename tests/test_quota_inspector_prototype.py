@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -36,6 +37,7 @@ from synai.broker.storage_inspector import (
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures/quota_inspector_v1"
 BINARY = ROOT / "prototypes/quota-inspector/target/debug/fixture-harness"
+NATIVE_TESTS = ROOT / "prototypes/quota-inspector-native/target/debug/deps"
 
 
 def fixture_document(name: str) -> dict:
@@ -72,6 +74,67 @@ def receive_exact(connection: socket.socket, size: int) -> bytes:
 
 
 class GoldenProtocolTests(unittest.TestCase):
+    def test_native_dependency_closure_has_no_fixture_package_or_backend_feature(self):
+        pending = [ROOT / "prototypes/quota-inspector-native/Cargo.toml"]
+        seen = set()
+        while pending:
+            manifest = pending.pop().resolve()
+            if manifest in seen:
+                continue
+            seen.add(manifest)
+            package = tomllib.loads(manifest.read_text())
+            self.assertNotEqual(package["package"]["name"], "quota-inspector")
+            self.assertNotIn("features", package)
+            self.assertNotIn("bin", package)
+            for name, dependency in package.get("dependencies", {}).items():
+                self.assertNotEqual(name, "quota-inspector")
+                if isinstance(dependency, dict) and "path" in dependency:
+                    pending.append(manifest.parent / dependency["path"] / "Cargo.toml")
+        self.assertEqual(len(seen), 2)
+
+    def test_native_candidate_generation_preserves_python_v1(self):
+        document = json.loads(
+            (ROOT / "tests/fixtures/quota_inspector_native/inventory.json").read_text(),
+        )
+        roles = tuple(StorageRole.from_dict(entry["role"]) for entry in document["roles"])
+        for role in roles:
+            role.validate()
+        self.assertEqual(inventory_generation(roles), document["inventory_generation"])
+
+    @unittest.skipUnless(
+        any(path.is_file() and os.access(path, os.X_OK)
+            for path in NATIVE_TESTS.glob("production_boundary-*")),
+        "Build native integration tests with cargo first",
+    )
+    def test_non_test_native_library_refusal_matches_actual_python_client(self):
+        executables = [
+            path for path in NATIVE_TESTS.glob("production_boundary-*")
+            if path.is_file() and os.access(path, os.X_OK)
+        ]
+        document = json.loads(
+            (ROOT / "tests/fixtures/quota_inspector_native/inventory.json").read_text(),
+        )
+        roles = tuple(StorageRole.from_dict(entry["role"]) for entry in document["roles"])
+        client = UnixStorageInspectorClient(
+            None, roles, inspector_uid=os.geteuid(), inspector_gid=os.getegid(),
+            timeout_seconds=0.8, max_age_seconds=5,
+            inventory_generation=inventory_generation(roles),
+        )
+        for executable in executables:
+            result = subprocess.run(
+                [str(executable), "--exact", "non_test_backend_returns_only_unavailable", "--nocapture"],
+                capture_output=True, timeout=5, check=True,
+            )
+            responses = [
+                json.loads(line.removeprefix("NATIVE_V1_RESPONSE="))
+                for line in result.stdout.decode().splitlines()
+                if line.startswith("NATIVE_V1_RESPONSE=")
+            ]
+            self.assertEqual(len(responses), 10)
+            for response in responses:
+                with self.assertRaises(InspectorUnavailable):
+                    client._parse_response(response, "state", "a" * 64)
+
     def test_synthetic_inventory_uses_authoritative_canonical_generation(self):
         document = fixture_document("inventory.json")
         self.assertEqual(document["label"], "synthetic_offline_only")

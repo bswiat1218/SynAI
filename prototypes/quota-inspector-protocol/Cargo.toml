@@ -1,0 +1,9 @@
+[package]
+name = "quota-inspector-protocol"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+sha2 = "=0.10.9"

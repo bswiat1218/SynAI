@@ -122,9 +122,17 @@ name = "quota-inspector"
 version = "0.1.0"
 dependencies = [
  "getrandom",
+ "quota-inspector-protocol",
  "rustix",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "quota-inspector-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "sha2",
 ]
 

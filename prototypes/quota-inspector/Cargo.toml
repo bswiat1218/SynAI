@@ -9,7 +9,7 @@ getrandom = "0.3"
 rustix = { version = "1", features = ["fs", "net", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+quota-inspector-protocol = { path = "../quota-inspector-protocol" }
 
 [[bin]]
 name = "fixture-harness"

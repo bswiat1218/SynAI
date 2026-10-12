@@ -8,6 +8,12 @@ operations. Role paths and mount targets in its inventory are data only and are
 never opened.
 Do not deploy it or treat its successful fixture response as authoritative.
 
+The ten-field role type and unchanged canonical generation now live in the
+fixture-free [protocol identity library](../quota-inspector-protocol/README.md).
+The separately built [native foundation](../quota-inspector-native/README.md)
+does not depend on this harness package and cannot select fixture observations.
+This harness and all R1-R6 controls remain disposable and test-only.
+
 ## Build and tests
 
 From this directory, using an existing Rust toolchain:

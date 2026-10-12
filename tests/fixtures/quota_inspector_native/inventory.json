@@ -1,0 +1,95 @@
+{
+  "root": {
+    "path": "/synthetic/native",
+    "owner_uid": 0,
+    "owner_gid": 0,
+    "mode": 488,
+    "filesystem": {
+      "uuid": "11111111-2222-4333-8444-555555555555",
+      "device": {"major": 253, "minor": 7},
+      "mount_id": 42,
+      "mount_root": "/",
+      "filesystem_type": "ext4",
+      "namespace": {"device": 4, "inode": 1001}
+    }
+  },
+  "roles": [
+    {
+      "role": {
+        "role_id": "task-slot-00", "kind": "task_slot",
+        "path": "/synthetic/native/task-slot-00", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4242, "byte_limit": 268435456, "inode_limit": 4096,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "task_slot", "mode": 448, "existing_files": []
+    },
+    {
+      "role": {
+        "role_id": "graph", "kind": "podman_graph",
+        "path": "/synthetic/native/graph", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4243, "byte_limit": 4294967296, "inode_limit": 131072,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "podman_graph", "mode": 448, "existing_files": []
+    },
+    {
+      "role": {
+        "role_id": "runtime", "kind": "podman_runtime",
+        "path": "/synthetic/native/runtime", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4244, "byte_limit": 536870912, "inode_limit": 16384,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "podman_runtime", "mode": 448, "existing_files": []
+    },
+    {
+      "role": {
+        "role_id": "images", "kind": "image_scratch",
+        "path": "/synthetic/native/images", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4245, "byte_limit": 536870912, "inode_limit": 16384,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "image_scratch", "mode": 448, "existing_files": []
+    },
+    {
+      "role": {
+        "role_id": "state", "kind": "broker_state",
+        "path": "/synthetic/native/state", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4246, "byte_limit": 536870912, "inode_limit": 16384,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "broker_state", "mode": 448,
+      "existing_files": [
+        {"name": "broker.db", "purpose": "sqlite_db", "mode": 384},
+        {"name": "broker.db-wal", "purpose": "sqlite_wal", "mode": 384},
+        {"name": "broker.db-shm", "purpose": "sqlite_shm", "mode": 384}
+      ]
+    },
+    {
+      "role": {
+        "role_id": "logs", "kind": "broker_logs",
+        "path": "/synthetic/native/logs", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4247, "byte_limit": 536870912, "inode_limit": 8192,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "broker_logs", "mode": 448,
+      "existing_files": [{"name": "broker.log", "purpose": "log", "mode": 384}]
+    },
+    {
+      "role": {
+        "role_id": "temporary", "kind": "temporary",
+        "path": "/synthetic/native/temporary", "mount_path": "/synthetic/native",
+        "filesystem_uuid": "11111111-2222-4333-8444-555555555555",
+        "project_id": 4248, "byte_limit": 536870912, "inode_limit": 16384,
+        "owner_uid": 4242, "owner_gid": 4242
+      },
+      "purpose": "temporary", "mode": 448, "existing_files": []
+    }
+  ],
+  "inventory_generation": "d472cbe76c95c3a8501b17a15d593d73338ee88c4774d30d852bc9a18e94ee8f"
+}

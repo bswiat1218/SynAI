@@ -874,6 +874,39 @@ helper, including a fixture socket; no fixture/genuine cryptographic distinction
 was added to v1. Independent local filesystem, VFS, bind-source and runtime
 acceptance gates remain active. No native backend or A.5.1c work is introduced.
 
+#### Phase 13F-A.5.1c.0: offline native inspector foundation
+
+The [native library](../prototypes/quota-inspector-native/README.md) is physically
+and build-separated from the fixture server. Both reuse only the unchanged
+[v1 role/canonical identity library](../prototypes/quota-inspector-protocol/README.md).
+No daemon, listener, service configuration, production fixture switch, installed
+inventory loader or kernel query is introduced. Synthetic adapters are compiled
+only in Rust unit-test builds; integration tests link the non-test native library
+and verify explicit unavailable envelopes through the unchanged Python client.
+
+The native model separates bounded parsed policy from independently attested
+trusted inventory. It requires all seven role purposes, distinct project IDs,
+nonoverlapping paths, exact ownership/modes and full-policy binding in addition
+to unchanged v1 generation. Descriptor-owned resolution contracts, namespace-local
+mount/UUID/device identity, pre/post validation and separate DB/WAL/SHM/log
+project checks cannot be replaced by pathname or parent-inheritance assumptions.
+The sealed quota adapter permits only reviewed read-only observations of a pinned
+filesystem and inventory-bound project. No `quotactl_fd()` or alternative query
+is executed or implemented; the default backend and acquisition remain unavailable.
+
+Deterministic tests cover unknown/missing/malformed evidence, accounting-only
+state, identity drift, checked quota units/overflow, freshness, bounded resources
+and cancellation retaining blocked descriptor ownership until confirmed completion.
+Fake observations do not prove actual descriptor restrictions, privileged inventory
+trust, kernel quota enforcement, write denial or cross-process containment.
+Same-UID races and uninterruptible kernel work still require separate design,
+confinement and external supervision acceptance.
+
+Storage entitlements/reserve/allowance and the 128 GiB planning maximum are
+unchanged. Privileged VM setup, kernel experiments, installation, runtime acceptance,
+SQLite native VFS, external bind-source acceptance and Phase 13F-B remain gated.
+**Production Broker execution is still unavailable.**
+
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-
 collection contracts. Workspace file reads/mutations use no-follow
