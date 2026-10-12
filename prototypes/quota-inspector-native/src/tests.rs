@@ -1408,3 +1408,228 @@ fn acquisition_consumes_budget_and_clock_regression_or_overflow_is_unavailable()
     assert!(!operation.pending());
     assert_eq!(operation.backend.query_calls, 0);
 }
+
+#[test]
+fn original_terminal_pending_then_valid_completion_reproduction_is_refused() {
+    let policy = policy();
+    for reason in [Unavailable::Cancelled, Unavailable::DeadlineExceeded] {
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.query_error = Some(Failure::Unavailable(reason));
+        let mut request = operation(backend, &policy, "state").unwrap();
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        request.backend.query_error = None;
+        request.backend.completed = true;
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        assert!(!request.pending());
+        assert_eq!(request.descriptor_count(), 0);
+    }
+}
+
+#[test]
+fn terminal_pending_outcomes_survive_all_completion_and_serialization_paths() {
+    let policy = policy();
+    let request = binding(&policy, "state");
+    let budget = ObservationBudget::new(MAX_OPERATION_TIME).unwrap();
+    for reason in [Unavailable::Cancelled, Unavailable::DeadlineExceeded] {
+        for completion in 0..3 {
+            let mut backend = FakeBackend::new(&policy, "state");
+            backend.query_error = Some(Failure::Unavailable(reason));
+            let job = Arc::clone(&backend.job);
+            let mut controller = crate::observation::Controller { active: None };
+            let first = controller.inspect(&policy, &request, budget, backend);
+            assert!(matches!(first.outcome(), Outcome::Failed(error)
+                if *error == Failure::Unavailable(reason)));
+            let lease = Arc::downgrade(job.lock().unwrap().as_ref().unwrap());
+            let count = controller.active.as_ref().unwrap().descriptor_count();
+            for pending_reason in [
+                None,
+                Some(Failure::Unavailable(Unavailable::UnresolvedOwnership)),
+                Some(Failure::Unavailable(Unavailable::Cancelled)),
+                Some(Failure::Unavailable(Unavailable::DeadlineExceeded)),
+            ] {
+                controller.active.as_mut().unwrap().backend.query_error = pending_reason;
+                for _ in 0..5 {
+                    let result = controller.poll().unwrap();
+                    assert!(matches!(result.outcome(), Outcome::Failed(error)
+                        if *error == Failure::Unavailable(reason)));
+                    let wire: Value =
+                        serde_json::from_slice(&result.protocol_response(&"c".repeat(32)).unwrap())
+                            .unwrap();
+                    assert_eq!(wire["status"], "unavailable");
+                    assert_eq!(wire["error_code"], Failure::Unavailable(reason).code());
+                    assert_eq!(wire.as_object().unwrap().len(), 8);
+                    assert!(wire.get("observed_at").is_none());
+                    assert!(controller.active.as_ref().unwrap().pending());
+                    assert_eq!(
+                        controller.active.as_ref().unwrap().descriptor_count(),
+                        count
+                    );
+                    assert!(lease.upgrade().is_some());
+                    controller.cancel();
+                }
+            }
+            let busy = controller.inspect(
+                &policy,
+                &request,
+                budget,
+                FakeBackend::new(&policy, "state"),
+            );
+            assert!(matches!(
+                busy.outcome(),
+                Outcome::Failed(Failure::Unavailable(Unavailable::Busy))
+            ));
+            let backend = &mut controller.active.as_mut().unwrap().backend;
+            backend.query_error = match completion {
+                1 => Some(Failure::Unavailable(Unavailable::PermissionDenied)),
+                _ => None,
+            };
+            if completion == 2 {
+                backend.quota.after.project_id.0 += 1;
+                backend.quota.after.usage.bytes += 1;
+            }
+            backend.completed = true;
+            let result = controller.poll().unwrap();
+            assert!(matches!(result.outcome(), Outcome::Failed(error)
+                if *error == Failure::Unavailable(reason)));
+            assert!(controller.active.is_none());
+            assert!(controller.poll().is_none());
+            assert!(job.lock().unwrap().is_none());
+            assert!(lease.upgrade().is_none());
+            let fresh = controller.inspect(
+                &policy,
+                &request,
+                budget,
+                FakeBackend::new(&policy, "state"),
+            );
+            assert!(matches!(fresh.outcome(), Outcome::Observed(_)));
+            assert!(controller.active.is_none());
+        }
+    }
+}
+
+#[test]
+fn transient_blocking_and_unresolved_work_remain_recoverable_before_expiry() {
+    let policy = policy();
+    for reason in [Unavailable::Blocked, Unavailable::UnresolvedOwnership] {
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.query_error = Some(Failure::Unavailable(reason));
+        let job = Arc::clone(&backend.job);
+        let mut request = operation(backend, &policy, "state").unwrap();
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        let lease = Arc::downgrade(job.lock().unwrap().as_ref().unwrap());
+        for _ in 0..20 {
+            assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+            assert!(request.pending());
+            assert!(lease.upgrade().is_some());
+        }
+        request.backend.query_error = None;
+        request.backend.completed = true;
+        assert!(request.poll().is_ok());
+        assert!(!request.pending());
+        assert!(lease.upgrade().is_none());
+        assert!(request.poll().is_err());
+    }
+}
+
+#[test]
+fn first_terminal_reason_wins_at_local_and_adapter_deadline_boundaries() {
+    let policy = policy();
+    for cancel_before_deadline in [true, false] {
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.pending = true;
+        let mut request = operation(backend, &policy, "state").unwrap();
+        assert!(request.poll().is_err());
+        request.backend.time.monotonic += MAX_OPERATION_TIME - Duration::from_nanos(1);
+        if !cancel_before_deadline {
+            request.backend.time.monotonic += Duration::from_nanos(1);
+        }
+        request.cancel();
+        let reason = if cancel_before_deadline {
+            Unavailable::Cancelled
+        } else {
+            Unavailable::DeadlineExceeded
+        };
+        request.backend.time.monotonic += Duration::from_nanos(1);
+        for _ in 0..20 {
+            request.cancel();
+            assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+            assert!(request.pending());
+        }
+        request.backend.completed = true;
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        assert!(!request.pending());
+        request.cancel();
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+    }
+    for reason in [Unavailable::Cancelled, Unavailable::DeadlineExceeded] {
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.query_error = Some(Failure::Unavailable(reason));
+        let mut request = operation(backend, &policy, "state").unwrap();
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        request.backend.time.monotonic += MAX_OPERATION_TIME;
+        request.cancel();
+        request.backend.query_error = None;
+        request.backend.completed = true;
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+    }
+}
+
+#[test]
+fn dropping_terminal_owner_preserves_independent_worker_lease_until_finalization() {
+    let policy = policy();
+    for reason in [Unavailable::Cancelled, Unavailable::DeadlineExceeded] {
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.query_error = Some(Failure::Unavailable(reason));
+        let job = Arc::clone(&backend.job);
+        let mut request = operation(backend, &policy, "state").unwrap();
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        let lease = Arc::downgrade(job.lock().unwrap().as_ref().unwrap());
+        request.cancel();
+        request.cancel();
+        drop(request);
+        assert!(lease.upgrade().is_some());
+        assert_eq!(lease.strong_count(), 1);
+        // The independently owned simulated worker confirms finalization.
+        job.lock().unwrap().take();
+        assert!(lease.upgrade().is_none());
+    }
+}
+
+#[test]
+fn nontransient_pending_failure_and_clock_loss_cannot_restore_success() {
+    let policy = policy();
+    for reason in [
+        Unavailable::MissingEvidence,
+        Unavailable::DescriptorUnavailable,
+    ] {
+        let mut backend = FakeBackend::new(&policy, "state");
+        backend.pending = true;
+        let mut request = operation(backend, &policy, "state").unwrap();
+        assert!(request.poll().is_err());
+        request.backend.query_error = Some(Failure::Unavailable(reason));
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        assert!(request.pending());
+        request.backend.query_error = None;
+        request.backend.completed = true;
+        assert_eq!(request.poll().unwrap_err(), Failure::Unavailable(reason));
+        assert!(!request.pending());
+    }
+    let mut backend = FakeBackend::new(&policy, "state");
+    backend.pending = true;
+    let mut request = operation(backend, &policy, "state").unwrap();
+    assert!(request.poll().is_err());
+    request.backend.time.monotonic -= Duration::from_secs(1);
+    assert_eq!(
+        request.poll().unwrap_err(),
+        Failure::Unavailable(Unavailable::MalformedEvidence)
+    );
+    assert!(request.pending());
+    request.backend.time.monotonic += Duration::from_secs(1);
+    request.backend.completed = true;
+    assert_eq!(
+        request.poll().unwrap_err(),
+        Failure::Unavailable(Unavailable::MalformedEvidence)
+    );
+    assert!(!request.pending());
+}

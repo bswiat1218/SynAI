@@ -191,6 +191,7 @@ pub(crate) struct DescriptorSet {
     )
 )]
 pub(crate) enum QueryProgress {
+    // The backend has finished using the lease; unresolved work or cleanup stays Pending.
     Complete(Result<Box<QuotaEvidence>, Failure>),
     Pending(Unavailable),
 }

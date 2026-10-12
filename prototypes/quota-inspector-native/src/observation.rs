@@ -331,6 +331,13 @@ fn result(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdapterWork {
+    NotStarted,
+    Pending,
+    Complete,
+}
+
 pub(crate) struct Inspection<B: ReadOnlyBackend> {
     pub backend: B,
     inventory: TrustedInventory,
@@ -338,8 +345,8 @@ pub(crate) struct Inspection<B: ReadOnlyBackend> {
     started: SampleTime,
     deadline: Duration,
     descriptors: Option<Arc<DescriptorSet>>,
-    queried: bool,
-    cancelled: bool,
+    work: AdapterWork,
+    terminal_failure: Option<Failure>,
 }
 
 impl<B: ReadOnlyBackend> Inspection<B> {
@@ -371,8 +378,8 @@ impl<B: ReadOnlyBackend> Inspection<B> {
             started,
             deadline,
             descriptors: None,
-            queried: false,
-            cancelled: false,
+            work: AdapterWork::NotStarted,
+            terminal_failure: None,
         };
         operation.check_deadline()?;
         operation.pin()?;
@@ -381,7 +388,7 @@ impl<B: ReadOnlyBackend> Inspection<B> {
     }
 
     pub(crate) fn pending(&self) -> bool {
-        self.descriptors.is_some()
+        self.work == AdapterWork::Pending
     }
 
     #[cfg(test)]
@@ -390,19 +397,29 @@ impl<B: ReadOnlyBackend> Inspection<B> {
     }
 
     pub(crate) fn cancel(&mut self) {
-        self.cancelled = true;
+        if self.work != AdapterWork::Complete {
+            let failure = self
+                .check_deadline()
+                .err()
+                .unwrap_or(Failure::Unavailable(Unavailable::Cancelled));
+            self.fail(failure);
+        }
+    }
+
+    fn fail(&mut self, failure: Failure) -> Failure {
+        *self.terminal_failure.get_or_insert(failure)
     }
 
     fn check_deadline(&self) -> Result<(), Failure> {
+        if let Some(failure) = self.terminal_failure {
+            return Err(failure);
+        }
         let now = self.backend.clock().monotonic;
         if now < self.started.monotonic {
             return Err(Failure::Unavailable(Unavailable::MalformedEvidence));
         }
         if now >= self.deadline {
             return Err(Failure::Unavailable(Unavailable::DeadlineExceeded));
-        }
-        if self.cancelled {
-            return Err(Failure::Unavailable(Unavailable::Cancelled));
         }
         Ok(())
     }
@@ -508,16 +525,20 @@ impl<B: ReadOnlyBackend> Inspection<B> {
 
     pub(crate) fn poll(&mut self) -> Result<ValidatedObservation, Failure> {
         if self.descriptors.is_none() {
-            return Err(Failure::Unavailable(Unavailable::DescriptorUnavailable));
+            return Err(self.fail(Failure::Unavailable(Unavailable::DescriptorUnavailable)));
         }
         // A started query must be polled to confirmed completion even after cancellation/expiry.
-        if !self.queried
+        if self.work == AdapterWork::NotStarted
             && let Err(error) = self.check_deadline().and_then(|()| self.revalidate())
         {
+            self.work = AdapterWork::Complete;
             self.descriptors = None;
-            return Err(error);
+            return Err(self.fail(error));
         }
-        let query = if self.queried {
+        if let Err(error) = self.check_deadline() {
+            self.fail(error);
+        }
+        let query = if self.work == AdapterWork::Pending {
             self.backend.poll_quota()
         } else {
             let set = self.descriptors.as_ref().expect("owned descriptor set");
@@ -528,14 +549,23 @@ impl<B: ReadOnlyBackend> Inspection<B> {
                     .role
                     .project_id as u32,
             );
-            self.queried = true;
+            self.work = AdapterWork::Pending;
             self.backend
                 .read_project_quota(set.nodes[0].fd(), project, Arc::clone(set))
         };
         match query {
             QueryProgress::Pending(reason) => {
-                self.check_deadline()?;
-                Err(Failure::Unavailable(reason))
+                if let Err(error) = self.check_deadline() {
+                    self.fail(error);
+                }
+                let failure = Failure::Unavailable(reason);
+                if !matches!(
+                    reason,
+                    Unavailable::Blocked | Unavailable::UnresolvedOwnership
+                ) {
+                    self.fail(failure);
+                }
+                Err(self.terminal_failure.unwrap_or(failure))
             }
             QueryProgress::Complete(completed) => {
                 let outcome = (|| {
@@ -552,8 +582,9 @@ impl<B: ReadOnlyBackend> Inspection<B> {
                     self.check_deadline()?;
                     Ok(observation)
                 })();
+                self.work = AdapterWork::Complete;
                 self.descriptors = None;
-                outcome
+                outcome.map_err(|error| self.fail(error))
             }
         }
     }

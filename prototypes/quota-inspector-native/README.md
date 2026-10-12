@@ -182,6 +182,18 @@ declaration before descriptor release; an adapter timeout/cancellation is not an
 implicit completed syscall. Regression tests cover both adapter-reported and
 controller-reported cancellation/expiry.
 
+The request's first terminal failure is latched independently of physical work
+progress and descriptor ownership. Adapter-reported cancellation/timeout cannot
+be cleared by later valid or erroneous completion, repeated blocking, or another
+failure. Local cancellation records the already-expired deadline if observed
+first; otherwise cancellation remains authoritative across later expiry.
+Only `Blocked` and `UnresolvedOwnership` are nonterminal pending reasons; all
+other pending failures revoke success for that request. Confirmed completion
+finalizes only the old request, not a fresh independently admitted request.
+`Complete` requires the backend to have finished using its lease; unresolved
+work or cleanup must remain `Pending`. Releasing an owned descriptor is not a
+claim of independently supervised process cleanup or kernel enforcement.
+
 Deterministic blocked-work tests use an **independently owned simulated worker**
 holding an `Arc` descriptor lease; even dropping the request owner does not release
 that worker's descriptors until it confirms completion. A later actual worker must
