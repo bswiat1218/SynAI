@@ -19,6 +19,7 @@ pub const REPLAY_CAPACITY: usize = 1024;
 pub const REPLAY_TTL: Duration = Duration::from_secs(30);
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_millis(500);
 pub const MAX_LIFETIME: Duration = Duration::from_secs(30);
+const MAX_ADMISSIONS_PER_SECOND: usize = 10;
 const MAX_JSON_DEPTH: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +238,92 @@ struct OwnedRuntimeDirectory {
     inode: u64,
 }
 
+struct OwnedRuntimeGuard {
+    directory: OwnedRuntimeDirectory,
+    socket: PathBuf,
+    socket_identity: Option<(u64, u64)>,
+    cleaned: bool,
+}
+
+impl OwnedRuntimeGuard {
+    fn new(directory: OwnedRuntimeDirectory) -> Self {
+        let socket = directory.path.join("inspector.sock");
+        Self {
+            directory,
+            socket,
+            socket_identity: None,
+            cleaned: false,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        let mut operations = RealCleanupOps;
+        let result = cleanup_owned(
+            &mut operations,
+            &self.directory.path,
+            (self.directory.device, self.directory.inode),
+            &self.socket,
+            self.socket_identity,
+        );
+        if result.is_ok() {
+            self.cleaned = true;
+        }
+        result
+    }
+}
+
+impl Drop for OwnedRuntimeGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupMetadata {
+    uid: u32,
+    device: u64,
+    inode: u64,
+    is_directory: bool,
+    is_socket: bool,
+    is_symlink: bool,
+}
+
+trait CleanupOps {
+    fn inspect(&self, path: &Path) -> io::Result<Option<CleanupMetadata>>;
+    fn remove_file(&mut self, path: &Path) -> io::Result<()>;
+    fn remove_dir(&mut self, path: &Path) -> io::Result<()>;
+}
+
+struct RealCleanupOps;
+
+impl CleanupOps for RealCleanupOps {
+    fn inspect(&self, path: &Path) -> io::Result<Option<CleanupMetadata>> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => Ok(Some(CleanupMetadata {
+                uid: metadata.uid(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                is_directory: metadata.is_dir(),
+                is_socket: metadata.file_type().is_socket(),
+                is_symlink: metadata.file_type().is_symlink(),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+
+    fn remove_dir(&mut self, path: &Path) -> io::Result<()> {
+        std::fs::remove_dir(path)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Fixture,
@@ -271,6 +358,7 @@ impl ReplayCache {
         if self.entries.contains_key(challenge) {
             return ReplayDecision::Replayed;
         }
+
         if self.entries.len() >= REPLAY_CAPACITY {
             return ReplayDecision::Full;
         }
@@ -284,6 +372,44 @@ impl ReplayCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+#[derive(Debug)]
+struct AdmissionWindow {
+    entries: VecDeque<Instant>,
+    capacity: usize,
+    interval: Duration,
+}
+
+impl Default for AdmissionWindow {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(MAX_ADMISSIONS_PER_SECOND),
+            capacity: MAX_ADMISSIONS_PER_SECOND,
+            interval: Duration::from_secs(1),
+        }
+    }
+}
+
+impl AdmissionWindow {
+    fn admit(&mut self, now: Instant) -> bool {
+        while self.entries.front().is_some_and(|time| {
+            now.checked_duration_since(*time)
+                .is_some_and(|age| age >= self.interval)
+        }) {
+            self.entries.pop_front();
+        }
+        if self.entries.len() == self.capacity {
+            return false;
+        }
+        self.entries.push_back(now);
+        true
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -513,6 +639,7 @@ fn python_json_string(value: &str) -> String {
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),
             c if c <= '\u{1f}' => result.push_str(&format!("\\u{:04x}", c as u32)),
+            '\u{7f}' => result.push_str("\\u007f"),
             c if c.is_ascii() => result.push(c),
             c if (c as u32) <= 0xffff => result.push_str(&format!("\\u{:04x}", c as u32)),
             c => {
@@ -567,10 +694,156 @@ pub fn parse_response(
     }
     let text = std::str::from_utf8(payload).map_err(|_| ResponseValidationError::Invalid)?;
     check_json_depth(text, MAX_JSON_DEPTH).map_err(|_| ResponseValidationError::Invalid)?;
-    let response: Response =
+    let wire: StrictResponse =
         serde_json::from_str(text).map_err(|_| ResponseValidationError::Invalid)?;
+    let response = wire
+        .into_response()
+        .ok_or(ResponseValidationError::Invalid)?;
     validate_response(&response, request, inventory, now, max_age_seconds)?;
     Ok(response)
+}
+
+#[derive(Debug, Default)]
+struct Present<T>(Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Present<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(|value| Self(Some(value)))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictResponse {
+    #[serde(default)]
+    schema_version: Present<u8>,
+    #[serde(default)]
+    message_type: Present<String>,
+    #[serde(default)]
+    role_id: Present<String>,
+    #[serde(default)]
+    challenge: Present<String>,
+    #[serde(default)]
+    status: Present<String>,
+    #[serde(default)]
+    helper_boot_epoch: Present<String>,
+    #[serde(default)]
+    inventory_generation: Present<String>,
+    #[serde(default)]
+    observed_at: Present<u64>,
+    #[serde(default)]
+    filesystem_uuid: Present<String>,
+    #[serde(default)]
+    mount_target: Present<String>,
+    #[serde(default)]
+    mount_id: Present<u64>,
+    #[serde(default)]
+    filesystem_type: Present<String>,
+    #[serde(default)]
+    quota_mode: Present<String>,
+    #[serde(default)]
+    quota_configuration_enabled: Present<bool>,
+    #[serde(default)]
+    project_id: Present<u64>,
+    #[serde(default)]
+    inheritance_enabled: Present<bool>,
+    #[serde(default)]
+    byte_limit: Present<u64>,
+    #[serde(default)]
+    inode_limit: Present<u64>,
+    #[serde(default)]
+    bytes_used: Present<u64>,
+    #[serde(default)]
+    inodes_used: Present<u64>,
+    #[serde(default)]
+    filesystem_bytes: Present<u64>,
+    #[serde(default)]
+    filesystem_bytes_available: Present<u64>,
+    #[serde(default)]
+    filesystem_inodes: Present<u64>,
+    #[serde(default)]
+    filesystem_inodes_available: Present<u64>,
+    #[serde(default)]
+    owner_uid: Present<u64>,
+    #[serde(default)]
+    owner_gid: Present<u64>,
+    #[serde(default)]
+    error_code: Present<String>,
+}
+
+impl StrictResponse {
+    fn into_response(self) -> Option<Response> {
+        let status = self.status.0.as_deref()?;
+        let required_common = self.schema_version.0.is_some()
+            && self.message_type.0.is_some()
+            && self.role_id.0.is_some()
+            && self.challenge.0.is_some()
+            && self.helper_boot_epoch.0.is_some()
+            && self.inventory_generation.0.is_some();
+        let observation_fields = [
+            self.observed_at.0.is_some(),
+            self.filesystem_uuid.0.is_some(),
+            self.mount_target.0.is_some(),
+            self.mount_id.0.is_some(),
+            self.filesystem_type.0.is_some(),
+            self.quota_mode.0.is_some(),
+            self.quota_configuration_enabled.0.is_some(),
+            self.project_id.0.is_some(),
+            self.inheritance_enabled.0.is_some(),
+            self.byte_limit.0.is_some(),
+            self.inode_limit.0.is_some(),
+            self.bytes_used.0.is_some(),
+            self.inodes_used.0.is_some(),
+            self.filesystem_bytes.0.is_some(),
+            self.filesystem_bytes_available.0.is_some(),
+            self.filesystem_inodes.0.is_some(),
+            self.filesystem_inodes_available.0.is_some(),
+            self.owner_uid.0.is_some(),
+            self.owner_gid.0.is_some(),
+        ];
+        let observations_absent = observation_fields.iter().all(|present| !present);
+        let observations_complete = observation_fields.iter().all(|present| *present);
+        let status_fields_valid = match status {
+            "ok" => observations_complete && self.error_code.0.is_none(),
+            "unavailable" | "inconsistent" => observations_absent && self.error_code.0.is_some(),
+            _ => false,
+        };
+        if !required_common || !status_fields_valid {
+            return None;
+        }
+        Some(Response {
+            schema_version: self.schema_version.0?,
+            message_type: self.message_type.0?,
+            role_id: self.role_id.0?,
+            challenge: self.challenge.0?,
+            status: self.status.0?,
+            helper_boot_epoch: self.helper_boot_epoch.0?,
+            inventory_generation: self.inventory_generation.0?,
+            observed_at: self.observed_at.0,
+            filesystem_uuid: self.filesystem_uuid.0,
+            mount_target: self.mount_target.0,
+            mount_id: self.mount_id.0,
+            filesystem_type: self.filesystem_type.0,
+            quota_mode: self.quota_mode.0,
+            quota_configuration_enabled: self.quota_configuration_enabled.0,
+            project_id: self.project_id.0,
+            inheritance_enabled: self.inheritance_enabled.0,
+            byte_limit: self.byte_limit.0,
+            inode_limit: self.inode_limit.0,
+            bytes_used: self.bytes_used.0,
+            inodes_used: self.inodes_used.0,
+            filesystem_bytes: self.filesystem_bytes.0,
+            filesystem_bytes_available: self.filesystem_bytes_available.0,
+            filesystem_inodes: self.filesystem_inodes.0,
+            filesystem_inodes_available: self.filesystem_inodes_available.0,
+            owner_uid: self.owner_uid.0,
+            owner_gid: self.owner_gid.0,
+            error_code: self.error_code.0,
+        })
+    }
 }
 
 pub fn validate_response(
@@ -707,6 +980,81 @@ pub fn unix_time_seconds() -> Result<u64, String> {
         .map_err(|error| format!("system clock precedes Unix epoch: {error}"))
 }
 
+pub fn write_stderr_before(message: &str, deadline: Instant) {
+    let mut diagnostic = String::from("fixture-harness: ");
+    for character in message.chars() {
+        if diagnostic.len() >= 1006 {
+            break;
+        }
+        diagnostic.push(if character.is_ascii_graphic() || character == ' ' {
+            character
+        } else {
+            '?'
+        });
+    }
+    diagnostic.push('\n');
+    let _ = write_fd_before_or_once(
+        std::io::stderr().as_fd(),
+        diagnostic.as_bytes(),
+        deadline.min(Instant::now()),
+        true,
+    );
+}
+
+fn write_stdout_before(bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    write_fd_before(std::io::stdout().as_fd(), bytes, deadline)
+}
+
+fn write_fd_before(descriptor: impl AsFd, bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    write_fd_before_or_once(descriptor, bytes, deadline, false)
+}
+
+fn write_fd_before_or_once(
+    descriptor: impl AsFd,
+    bytes: &[u8],
+    deadline: Instant,
+    allow_expired_attempt: bool,
+) -> io::Result<()> {
+    let original_flags = rustix::fs::fcntl_getfl(&descriptor)?;
+    rustix::fs::fcntl_setfl(&descriptor, original_flags | rustix::fs::OFlags::NONBLOCK)?;
+    let write_result = (|| {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if remaining(deadline).is_err() {
+                if allow_expired_attempt {
+                    // One nonblocking attempt preserves diagnostics without extending the budget.
+                    let count = rustix::io::write(&descriptor, &bytes[offset..])?;
+                    if count == bytes.len() - offset {
+                        return Ok(());
+                    }
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "standard stream deadline elapsed",
+                ));
+            }
+            match rustix::io::write(&descriptor, &bytes[offset..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "standard stream write returned zero",
+                    ));
+                }
+                Ok(count) => offset += count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let delay = remaining(deadline)?.min(Duration::from_millis(2));
+                    std::thread::sleep(delay);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    })();
+    let restore_result = rustix::fs::fcntl_setfl(&descriptor, original_flags).map_err(Into::into);
+    write_result.and(restore_result)
+}
+
 pub fn run_harness(
     parent: &Path,
     inventory: &Inventory,
@@ -715,50 +1063,107 @@ pub fn run_harness(
     lifetime: Duration,
     backend: Backend,
 ) -> Result<(), String> {
-    inventory.validate()?;
     if lifetime.is_zero() || lifetime > MAX_LIFETIME {
         return Err("lifetime must be between 1 ms and 30000 ms".to_owned());
     }
+    let deadline = Instant::now()
+        .checked_add(lifetime)
+        .ok_or_else(|| "harness deadline is out of range".to_owned())?;
+    run_harness_before(
+        parent,
+        inventory,
+        allowed_uid,
+        allowed_gid,
+        deadline,
+        backend,
+    )
+}
+
+pub fn run_harness_before(
+    parent: &Path,
+    inventory: &Inventory,
+    allowed_uid: u32,
+    allowed_gid: u32,
+    deadline: Instant,
+    backend: Backend,
+) -> Result<(), String> {
+    let remaining_lifetime = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| "harness lifetime deadline elapsed".to_owned())?;
+    if remaining_lifetime > MAX_LIFETIME {
+        return Err("lifetime must be between 1 ms and 30000 ms".to_owned());
+    }
+    ensure_before(deadline)?;
+    inventory.validate()?;
+    ensure_before(deadline)?;
     if unsafe_root() {
         return Err("fixture harness refuses to run as root".to_owned());
     }
     let effective_uid = rustix::process::geteuid().as_raw();
-    verify_parent(parent, effective_uid)?;
-    let child_dir = owned_child_directory(parent)?;
-    let socket_path = child_dir.path.join("inspector.sock");
-    let mut socket_identity = None;
+    verify_parent(parent, effective_uid, deadline)?;
+    ensure_before(deadline)?;
+    let mut guard = owned_child_directory(parent, deadline)?;
     let settings = HarnessSettings {
         inventory,
         allowed_uid,
         allowed_gid,
         backend,
     };
-    let result = run_in_directory(&socket_path, &settings, lifetime, &mut socket_identity);
-    cleanup_owned(
-        &child_dir.path,
-        (child_dir.device, child_dir.inode),
-        &socket_path,
-        socket_identity,
+    let result = run_in_directory(
+        &guard.socket,
+        &settings,
+        deadline,
+        &mut guard.socket_identity,
     );
-    result
+    let cleanup = guard.cleanup();
+    finish_harness(result, cleanup)
+}
+
+fn finish_harness(
+    operation: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
+    match (operation, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (operation, cleanup) => {
+            let mut failures = Vec::new();
+            if let Err(error) = operation {
+                failures.push(error);
+            }
+            if let Err(error) = cleanup {
+                failures.push(error);
+            }
+            Err(failures.join("; "))
+        }
+    }
+}
+
+fn ensure_before(deadline: Instant) -> Result<(), String> {
+    remaining(deadline)
+        .map(|_| ())
+        .map_err(|_| "harness lifetime deadline elapsed".to_owned())
 }
 
 fn unsafe_root() -> bool {
     rustix::process::geteuid().as_raw() == 0
 }
 
-fn verify_parent(parent: &Path, uid_hint: u32) -> Result<(), String> {
+fn verify_parent(parent: &Path, uid_hint: u32, deadline: Instant) -> Result<(), String> {
+    ensure_before(deadline)?;
     if parent.to_str().is_none() {
         return Err("parent path must be UTF-8 for the startup protocol".to_owned());
     }
     let canonical = parent
         .canonicalize()
         .map_err(|error| format!("invalid parent: {error}"))?;
+    ensure_before(deadline)?;
     if canonical != parent {
         return Err("parent directory must be canonical".to_owned());
     }
     let metadata =
         std::fs::symlink_metadata(parent).map_err(|error| format!("invalid parent: {error}"))?;
+    ensure_before(deadline)?;
     if !metadata.is_dir()
         || metadata.file_type().is_symlink()
         || metadata.uid() != uid_hint
@@ -768,9 +1173,11 @@ fn verify_parent(parent: &Path, uid_hint: u32) -> Result<(), String> {
     }
     let mut current = PathBuf::from("/");
     for part in parent.components().skip(1) {
+        ensure_before(deadline)?;
         current.push(part);
         let item = std::fs::symlink_metadata(&current)
             .map_err(|error| format!("unsafe parent ancestor: {error}"))?;
+        ensure_before(deadline)?;
         if !item.is_dir()
             || item.file_type().is_symlink()
             || (item.permissions().mode() & 0o022 != 0
@@ -783,30 +1190,38 @@ fn verify_parent(parent: &Path, uid_hint: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn owned_child_directory(parent: &Path) -> Result<OwnedRuntimeDirectory, String> {
+fn owned_child_directory(parent: &Path, deadline: Instant) -> Result<OwnedRuntimeGuard, String> {
     for _ in 0..8 {
+        ensure_before(deadline)?;
         let name = format!("quota-inspector-{}", random_hex(16)?);
         let path = parent.join(name);
         let mut builder = std::fs::DirBuilder::new();
         builder.mode(0o700);
+        ensure_before(deadline)?;
         match builder.create(&path) {
             Ok(()) => {
-                let metadata = std::fs::symlink_metadata(&path)
-                    .map_err(|error| format!("cannot verify private child directory: {error}"))?;
+                let metadata = std::fs::symlink_metadata(&path).map_err(|_| {
+                    "cleanup unresolved: cannot identify newly created private directory".to_owned()
+                })?;
                 if !metadata.is_dir()
                     || metadata.file_type().is_symlink()
                     || metadata.uid() != rustix::process::geteuid().as_raw()
                 {
-                    return Err("private child directory identity is unsafe".to_owned());
+                    return Err(
+                        "cleanup unresolved: newly created private directory identity is unsafe"
+                            .to_owned(),
+                    );
                 }
                 let owned = OwnedRuntimeDirectory {
                     path,
                     device: metadata.dev(),
                     inode: metadata.ino(),
                 };
+                let mut guard = OwnedRuntimeGuard::new(owned);
                 let protect = (|| {
+                    ensure_before(deadline)?;
                     let descriptor = rustix::fs::open(
-                        &owned.path,
+                        &guard.directory.path,
                         rustix::fs::OFlags::RDONLY
                             | rustix::fs::OFlags::DIRECTORY
                             | rustix::fs::OFlags::NOFOLLOW
@@ -817,7 +1232,8 @@ fn owned_child_directory(parent: &Path) -> Result<OwnedRuntimeDirectory, String>
                     let stat = rustix::fs::fstat(&descriptor)
                         .map_err(|error| format!("cannot verify private directory: {error}"))?;
                     if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_dir()
-                        || (stat.st_dev, stat.st_ino) != (owned.device, owned.inode)
+                        || (stat.st_dev, stat.st_ino)
+                            != (guard.directory.device, guard.directory.inode)
                     {
                         return Err("private directory changed during creation".to_owned());
                     }
@@ -828,22 +1244,21 @@ fn owned_child_directory(parent: &Path) -> Result<OwnedRuntimeDirectory, String>
                     let stat = rustix::fs::fstat(&descriptor)
                         .map_err(|error| format!("cannot verify protected directory: {error}"))?;
                     if rustix::fs::Mode::from_raw_mode(stat.st_mode).bits() & 0o777 != 0o700
-                        || (stat.st_dev, stat.st_ino) != (owned.device, owned.inode)
+                        || (stat.st_dev, stat.st_ino)
+                            != (guard.directory.device, guard.directory.inode)
                     {
                         return Err("protected child directory identity changed".to_owned());
                     }
+                    ensure_before(deadline)?;
                     Ok(())
                 })();
                 if let Err(error) = protect {
-                    cleanup_owned(
-                        &owned.path,
-                        (owned.device, owned.inode),
-                        &owned.path.join("inspector.sock"),
-                        None,
-                    );
-                    return Err(error);
+                    return match guard.cleanup() {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(format!("{error}; {cleanup}")),
+                    };
                 }
-                return Ok(owned);
+                return Ok(guard);
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(format!("cannot create private child directory: {error}")),
@@ -855,9 +1270,10 @@ fn owned_child_directory(parent: &Path) -> Result<OwnedRuntimeDirectory, String>
 fn run_in_directory(
     socket_path: &Path,
     settings: &HarnessSettings<'_>,
-    lifetime: Duration,
+    deadline: Instant,
     socket_identity: &mut Option<(u64, u64)>,
 ) -> Result<(), String> {
+    ensure_before(deadline)?;
     let address = rustix::net::SocketAddrUnix::new(socket_path)
         .map_err(|error| format!("cannot form socket address: {error}"))?;
     let socket = rustix::net::socket_with(
@@ -867,6 +1283,7 @@ fn run_in_directory(
         None,
     )
     .map_err(|error| format!("cannot create listener socket: {error}"))?;
+    ensure_before(deadline)?;
     rustix::net::bind(&socket, &address).map_err(|error| format!("cannot bind socket: {error}"))?;
     let metadata = std::fs::symlink_metadata(socket_path)
         .map_err(|error| format!("cannot verify bound socket: {error}"))?;
@@ -876,6 +1293,7 @@ fn run_in_directory(
     *socket_identity = Some((metadata.dev(), metadata.ino()));
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("cannot secure socket: {error}"))?;
+    ensure_before(deadline)?;
     rustix::net::listen(&socket, 4).map_err(|error| format!("cannot listen on socket: {error}"))?;
     let listener = UnixListener::from(socket);
     let epoch = random_hex(16)?;
@@ -885,34 +1303,32 @@ fn run_in_directory(
         "helper_boot_epoch": epoch,
         "fixture_only": true
     });
-    println!("{startup}");
-    io::stdout()
-        .flush()
-        .map_err(|error| format!("cannot flush startup line: {error}"))?;
-    let end = Instant::now() + lifetime;
+    write_stdout_before(format!("{startup}\n").as_bytes(), deadline)
+        .map_err(|error| format!("cannot write startup line: {error}"))?;
     let mut replay = ReplayCache::default();
-    let mut accepted: VecDeque<Instant> = VecDeque::new();
-    while Instant::now() < end {
+    let mut accepted = AdmissionWindow::default();
+    while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
                 let now = Instant::now();
-                while accepted.front().is_some_and(|time| {
-                    now.checked_duration_since(*time)
-                        .is_some_and(|age| age >= Duration::from_secs(1))
-                }) {
-                    accepted.pop_front();
-                }
-                accepted.push_back(now);
-                if accepted.len() > 10 {
+                if !accepted.admit(now) {
                     continue;
                 }
-                let deadline = (now + CONNECTION_TIMEOUT).min(end);
-                if serve_one(&mut stream, settings, &epoch, &mut replay, deadline).is_err() {
+                let connection_deadline = (now + CONNECTION_TIMEOUT).min(deadline);
+                if serve_one(
+                    &mut stream,
+                    settings,
+                    &epoch,
+                    &mut replay,
+                    connection_deadline,
+                )
+                .is_err()
+                {
                     continue;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                let remaining = end.saturating_duration_since(Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 std::thread::sleep(Duration::from_millis(5).min(remaining));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -1065,34 +1481,80 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
 }
 
 fn cleanup_owned(
+    operations: &mut impl CleanupOps,
     directory: &Path,
     directory_identity: (u64, u64),
     socket: &Path,
     socket_identity: Option<(u64, u64)>,
-) {
-    if !directory_matches(directory, directory_identity) {
-        return;
+) -> Result<(), String> {
+    let effective_uid = rustix::process::geteuid().as_raw();
+    match operations.inspect(directory) {
+        Ok(None) => return Ok(()),
+        Ok(Some(metadata))
+            if metadata.is_directory
+                && !metadata.is_symlink
+                && metadata.uid == effective_uid
+                && (metadata.device, metadata.inode) == directory_identity => {}
+        Ok(Some(_)) => {
+            return Err("cleanup unresolved: runtime directory identity changed".to_owned());
+        }
+        Err(_) => return Err("cleanup unresolved: cannot inspect runtime directory".to_owned()),
     }
-    if let Ok(metadata) = std::fs::symlink_metadata(socket)
-        && metadata.file_type().is_socket()
-        && metadata.uid() == rustix::process::geteuid().as_raw()
-        && socket_identity == Some((metadata.dev(), metadata.ino()))
-        && directory_matches(directory, directory_identity)
-    {
-        let _ = std::fs::remove_file(socket);
+
+    match operations.inspect(socket) {
+        Ok(Some(metadata)) => {
+            let Some(identity) = socket_identity else {
+                return Err("cleanup unresolved: socket has no recorded identity".to_owned());
+            };
+            if !metadata.is_socket
+                || metadata.is_symlink
+                || metadata.uid != effective_uid
+                || (metadata.device, metadata.inode) != identity
+            {
+                return Err("cleanup unresolved: socket identity changed".to_owned());
+            }
+            if !owned_directory_present(operations, directory, directory_identity, effective_uid)? {
+                return Ok(());
+            }
+            match operations.remove_file(socket) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return Err("cleanup unresolved: cannot remove owned socket".to_owned()),
+            }
+        }
+        Ok(None) => {}
+        Err(_) => return Err("cleanup unresolved: cannot inspect socket".to_owned()),
     }
-    if directory_matches(directory, directory_identity) {
-        let _ = std::fs::remove_dir(directory);
+
+    if !owned_directory_present(operations, directory, directory_identity, effective_uid)? {
+        return Ok(());
+    }
+    match operations.remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("cleanup unresolved: cannot remove owned runtime directory".to_owned()),
     }
 }
 
-fn directory_matches(directory: &Path, identity: (u64, u64)) -> bool {
-    std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == rustix::process::geteuid().as_raw()
-            && (metadata.dev(), metadata.ino()) == identity
-    })
+fn owned_directory_present(
+    operations: &mut impl CleanupOps,
+    directory: &Path,
+    identity: (u64, u64),
+    effective_uid: u32,
+) -> Result<bool, String> {
+    match operations.inspect(directory) {
+        Ok(None) => Ok(false),
+        Ok(Some(metadata))
+            if metadata.is_directory
+                && !metadata.is_symlink
+                && metadata.uid == effective_uid
+                && (metadata.device, metadata.inode) == identity =>
+        {
+            Ok(true)
+        }
+        Ok(Some(_)) => Err("cleanup unresolved: runtime directory identity changed".to_owned()),
+        Err(_) => Err("cleanup unresolved: cannot recheck runtime directory".to_owned()),
+    }
 }
 
 fn validate_role(role: &StorageRole) -> Result<(), String> {
@@ -1216,6 +1678,75 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct FakeCleanupOps {
+        entries: HashMap<PathBuf, CleanupMetadata>,
+        fail_file: bool,
+        fail_dir: bool,
+        removed_files: usize,
+        removed_dirs: usize,
+    }
+
+    impl CleanupOps for FakeCleanupOps {
+        fn inspect(&self, path: &Path) -> io::Result<Option<CleanupMetadata>> {
+            Ok(self.entries.get(path).copied())
+        }
+
+        fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+            if self.fail_file {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if self.entries.remove(path).is_some() {
+                self.removed_files += 1;
+                Ok(())
+            } else {
+                Err(io::ErrorKind::NotFound.into())
+            }
+        }
+
+        fn remove_dir(&mut self, path: &Path) -> io::Result<()> {
+            if self.fail_dir {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            if self.entries.remove(path).is_some() {
+                self.removed_dirs += 1;
+                Ok(())
+            } else {
+                Err(io::ErrorKind::NotFound.into())
+            }
+        }
+    }
+
+    fn fake_cleanup_ops() -> (FakeCleanupOps, PathBuf, PathBuf) {
+        let directory = PathBuf::from("/runtime/private");
+        let socket = directory.join("inspector.sock");
+        let mut operations = FakeCleanupOps::default();
+        operations.entries.insert(
+            directory.clone(),
+            CleanupMetadata {
+                uid: rustix::process::geteuid().as_raw(),
+                device: 7,
+                inode: 11,
+                is_directory: true,
+                is_socket: false,
+                is_symlink: false,
+            },
+        );
+        operations.entries.insert(
+            socket.clone(),
+            CleanupMetadata {
+                uid: rustix::process::geteuid().as_raw(),
+                device: 7,
+                inode: 12,
+                is_directory: false,
+                is_socket: true,
+                is_symlink: false,
+            },
+        );
+        (operations, directory, socket)
+    }
 
     fn fixture_inventory() -> Inventory {
         Inventory::from_json(include_str!(
@@ -1292,6 +1823,7 @@ mod tests {
                     candidate[key] = value.clone();
                 }
             }
+
             if let Some(key) = mutation["remove"].as_str() {
                 candidate
                     .as_object_mut()
@@ -1321,6 +1853,51 @@ mod tests {
     }
 
     #[test]
+    fn shared_response_presence_cases_preserve_missing_and_null_distinctions() {
+        let inventory = fixture_inventory();
+        let exchanges: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/quota_inspector_v1/exchanges.json"
+        ))
+        .expect("exchanges");
+        let request: Request =
+            serde_json::from_value(exchanges["request"].clone()).expect("request");
+        for case in exchanges["response_presence_cases"]
+            .as_array()
+            .expect("response presence cases")
+        {
+            let mut candidate = match case["template"].as_str().expect("template") {
+                "response" => exchanges["response"].clone(),
+                "unavailable" => exchanges["unavailable"].clone(),
+                unexpected => panic!("unexpected response template: {unexpected}"),
+            };
+            if let Some(changes) = case["changes"].as_object() {
+                for (key, value) in changes {
+                    candidate[key] = value.clone();
+                }
+            }
+            if let Some(key) = case["remove"].as_str() {
+                candidate
+                    .as_object_mut()
+                    .expect("response object")
+                    .remove(key);
+            }
+            let result = parse_response(
+                candidate.to_string().as_bytes(),
+                &request,
+                &inventory,
+                1_700_000_000,
+                5,
+            );
+            assert_eq!(
+                result.is_ok(),
+                case["valid"].as_bool().expect("valid"),
+                "presence case {}",
+                case["name"]
+            );
+        }
+    }
+
+    #[test]
     fn inventory_generation_uses_python_ascii_escaping_and_role_sorting() {
         let role = StorageRole {
             role_id: "fixture-role".to_owned(),
@@ -1345,6 +1922,30 @@ mod tests {
             inventory_generation(&[second, role.clone()])
         );
         assert_eq!(python_json_string("é😀"), "\"\\u00e9\\ud83d\\ude00\"");
+    }
+
+    #[test]
+    fn shared_python_canonical_escaping_hashes_cover_boundary_strings() {
+        let canonical: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/quota_inspector_v1/canonical_escaping.json"
+        ))
+        .expect("Python canonical escaping vectors");
+        let mut role = fixture_inventory().roles[0].clone();
+        for case in canonical["cases"].as_array().expect("cases") {
+            let suffix = case["suffix"].as_str().expect("suffix");
+            role.path = format!("/synthetic/fixture-volume/task{suffix}");
+            let expected = case["generation"].as_str().expect("generation");
+            assert_eq!(inventory_generation(std::slice::from_ref(&role)), expected);
+        }
+        assert_eq!(python_json_string("\u{7f}"), "\"\\u007f\"");
+        assert_eq!(
+            python_json_string("\u{0}\u{1f}\u{7f}\"\\"),
+            "\"\\u0000\\u001f\\u007f\\\"\\\\\""
+        );
+        assert_eq!(
+            python_json_string("é中文🙂😀"),
+            "\"\\u00e9\\u4e2d\\u6587\\ud83d\\ude42\\ud83d\\ude00\""
+        );
     }
 
     #[test]
@@ -1467,6 +2068,168 @@ mod tests {
     }
 
     #[test]
+    fn admission_window_is_bounded_under_rejects_and_recovers_on_rollover() {
+        let start = Instant::now();
+        let mut window = AdmissionWindow::default();
+        for _ in 0..MAX_ADMISSIONS_PER_SECOND {
+            assert!(window.admit(start));
+        }
+        for _ in 0..10_000 {
+            assert!(!window.admit(start));
+            assert_eq!(window.len(), MAX_ADMISSIONS_PER_SECOND);
+        }
+        assert!(!window.admit(start + Duration::from_millis(999)));
+        assert!(window.admit(start + Duration::from_secs(1)));
+        assert_eq!(window.len(), 1);
+
+        for tick in 1..=100 {
+            let now = start + Duration::from_secs(1) + Duration::from_millis(tick * 100);
+            let _ = window.admit(now);
+            assert!(window.len() <= MAX_ADMISSIONS_PER_SECOND);
+        }
+        assert!(window.admit(start + Duration::from_secs(20)));
+        assert_eq!(window.len(), 1);
+    }
+
+    #[test]
+    fn replay_capacity_and_active_connection_limiter_compose_deterministically() {
+        let start = Instant::now();
+        let mut replay = ReplayCache::default();
+        for value in 0..REPLAY_CAPACITY {
+            assert_eq!(
+                replay.check_and_insert(&format!("live-{value}"), start),
+                ReplayDecision::New
+            );
+        }
+        let mut admissions = AdmissionWindow::default();
+        for value in 0..MAX_ADMISSIONS_PER_SECOND {
+            assert!(admissions.admit(start));
+            assert_eq!(
+                replay.check_and_insert(&format!("full-{value}"), start),
+                ReplayDecision::Full
+            );
+        }
+        for _ in 0..10_000 {
+            assert!(!admissions.admit(start));
+            assert_eq!(admissions.len(), MAX_ADMISSIONS_PER_SECOND);
+            assert_eq!(replay.len(), REPLAY_CAPACITY);
+        }
+        let next_second = start + Duration::from_secs(1);
+        assert!(admissions.admit(next_second));
+        assert_eq!(
+            replay.check_and_insert("still-full", next_second),
+            ReplayDecision::Full
+        );
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(replay.len(), REPLAY_CAPACITY);
+    }
+
+    #[test]
+    fn cleanup_reports_unlink_and_rmdir_failures_and_is_idempotent() {
+        let (mut operations, directory, socket) = fake_cleanup_ops();
+        operations.fail_file = true;
+        assert!(
+            cleanup_owned(&mut operations, &directory, (7, 11), &socket, Some((7, 12)))
+                .unwrap_err()
+                .contains("remove owned socket")
+        );
+        operations.fail_file = false;
+        operations.fail_dir = true;
+        assert!(
+            cleanup_owned(&mut operations, &directory, (7, 11), &socket, Some((7, 12)))
+                .unwrap_err()
+                .contains("remove owned runtime directory")
+        );
+        operations.fail_dir = false;
+        assert!(
+            cleanup_owned(&mut operations, &directory, (7, 11), &socket, Some((7, 12))).is_ok()
+        );
+        assert!(
+            cleanup_owned(&mut operations, &directory, (7, 11), &socket, Some((7, 12))).is_ok()
+        );
+        assert_eq!(operations.removed_files, 1);
+        assert_eq!(operations.removed_dirs, 1);
+    }
+
+    #[test]
+    fn cleanup_refuses_substituted_socket_or_directory_identity() {
+        let (mut operations, directory, socket) = fake_cleanup_ops();
+        operations.entries.get_mut(&socket).expect("socket").inode = 99;
+        assert!(
+            cleanup_owned(&mut operations, &directory, (7, 11), &socket, Some((7, 12)))
+                .unwrap_err()
+                .contains("socket identity changed")
+        );
+        assert_eq!(operations.removed_files, 0);
+
+        operations.entries.get_mut(&socket).expect("socket").inode = 12;
+        operations
+            .entries
+            .get_mut(&directory)
+            .expect("directory")
+            .inode = 98;
+        assert!(
+            cleanup_owned(&mut operations, &directory, (7, 11), &socket, Some((7, 12)))
+                .unwrap_err()
+                .contains("runtime directory identity changed")
+        );
+        assert_eq!(operations.removed_files, 0);
+        assert_eq!(operations.removed_dirs, 0);
+    }
+
+    #[test]
+    fn expired_diagnostic_deadline_allows_only_an_immediate_nonblocking_attempt() {
+        let (writer, mut reader) = UnixStream::pair().expect("diagnostic socket pair");
+        let expired = Instant::now() - Duration::from_millis(1);
+        assert!(write_fd_before_or_once(&writer, b"cleanup unresolved\n", expired, true).is_ok());
+        let mut received = [0; 19];
+        reader
+            .read_exact(&mut received)
+            .expect("immediate diagnostic");
+        assert_eq!(&received, b"cleanup unresolved\n");
+        assert!(write_fd_before(&writer, b"startup", expired).is_err());
+        drop(reader);
+        assert!(write_fd_before_or_once(&writer, b"broken", expired, true).is_err());
+    }
+
+    #[test]
+    fn normal_lifetime_expiration_with_successful_cleanup_is_success() {
+        if unsafe_root() {
+            return;
+        }
+        let parent = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("project directory")
+            .join(format!("qt-{}", random_hex(4).expect("random test path")));
+        let mut builder = std::fs::DirBuilder::new();
+        builder
+            .mode(0o700)
+            .create(&parent)
+            .expect("private test parent");
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let inventory = fixture_inventory();
+        let settings = HarnessSettings {
+            inventory: &inventory,
+            allowed_uid: rustix::process::geteuid().as_raw(),
+            allowed_gid: rustix::process::getegid().as_raw(),
+            backend: Backend::Fixture,
+        };
+        let mut guard = owned_child_directory(&parent, deadline).expect("owned test directory");
+        let operation = run_in_directory(
+            &guard.socket,
+            &settings,
+            deadline,
+            &mut guard.socket_identity,
+        );
+        let result = finish_harness(operation, guard.cleanup());
+        let remaining_entries = std::fs::read_dir(&parent).expect("test parent").count();
+        std::fs::remove_dir(&parent).expect("remove empty test parent");
+        assert_eq!(result, Ok(()));
+        assert_eq!(remaining_entries, 0);
+    }
+
+    #[test]
     fn exact_peer_authorization_checks_pid_uid_and_gid() {
         assert!(check_peer(
             PeerCredentials {
@@ -1557,5 +2320,34 @@ mod tests {
             1,
         );
         assert!(Inventory::from_json(&duplicate_observation).is_err());
+        let duplicate_role_field = original.replacen(
+            "\"owner_uid\": 4242",
+            "\"owner_uid\": 4242, \"owner_uid\": 4242",
+            1,
+        );
+        assert!(Inventory::from_json(&duplicate_role_field).is_err());
+        let duplicate_observation_field =
+            original.replacen("\"mount_id\": 42", "\"mount_id\": 42, \"mount_id\": 42", 1);
+        assert!(Inventory::from_json(&duplicate_observation_field).is_err());
+    }
+
+    #[test]
+    fn duplicate_response_keys_are_rejected() {
+        let inventory = fixture_inventory();
+        let exchanges: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/quota_inspector_v1/exchanges.json"
+        ))
+        .expect("exchanges");
+        let request: Request =
+            serde_json::from_value(exchanges["request"].clone()).expect("request");
+        let duplicate = exchanges["response"].to_string().replace(
+            "\"observed_at\":1700000000,",
+            "\"observed_at\":1700000000,\"observed_at\":1700000000,",
+        );
+        assert_eq!(
+            parse_response(duplicate.as_bytes(), &request, &inventory, 1_700_000_000, 5,)
+                .unwrap_err(),
+            ResponseValidationError::Invalid
+        );
     }
 }

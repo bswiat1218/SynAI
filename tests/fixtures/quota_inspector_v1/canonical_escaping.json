@@ -1,0 +1,10 @@
+{
+  "label": "synthetic_offline_only",
+  "cases": [
+    {"suffix": "\u007f", "generation": "f1c159f76147ddcd83e6e155529f7b613ec88551e3cba4b8612977e2fcd1da9c"},
+    {"suffix": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f", "generation": "99e3f95b07e9081d9c102b81eabcafbc724c59ec99452fff1d4af961a83fc74e"},
+    {"suffix": " !\"#\\~", "generation": "9027fac8fe39978a2709972fbd83a1127b6c8cd41abe4e7c8473f4411f8738a7"},
+    {"suffix": "\u00e9\u4e2d\u6587", "generation": "b82718bb3413a7bf19f662468cef0b10989d63a41c0cbbbdc96cf297a1011169"},
+    {"suffix": "\ud83d\ude42\ud83d\ude00", "generation": "5e7609139ab5b885ccb7c1e62c64f1fde573ea2d4c7b32e351d6d1a6cee379e2"}
+  ]
+}

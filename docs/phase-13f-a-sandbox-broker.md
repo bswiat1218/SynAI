@@ -841,6 +841,39 @@ and 241,664 required available inodes. 24, 32, 64 and 128 GiB are planning
 candidates only; **128 GiB is the planning maximum**, not an authorization
 to provision or alter geometry, entitlements, reserves, mounts or quotas.
 
+#### Phase 13F-A.5.1b.2: offline R1-R6 remediation
+
+Response validation now distinguishes wire-field presence from an absent
+optional Rust value. Status-specific exact schemas reject extra null fields,
+missing keys and null mandatory values without changing Python v1. Shared
+golden vectors cover success, unavailable and inconsistent responses. Canonical
+generation uses Python's single encoding, including DEL, control characters,
+quotes/backslashes and supplementary Unicode.
+
+The fixture harness uses fixed-capacity rolling admission accounting rather
+than retaining every refused connection attempt. Ten admissions per rolling
+second include unauthorized/malformed connections; peer credentials are still
+checked before reading payloads. The single-active-connection/backlog-four
+boundary is unchanged.
+
+The lifecycle budget starts at executable entry, includes startup, and bounds
+nonblocking startup/diagnostic output and connection servicing. Ordinary errors
+reach identity-checked owned cleanup; cleanup failures are unresolved errors,
+not successful shutdown. Filesystem calls, scheduler stalls and SIGSTOP cannot
+be forcibly interrupted by a self-enforced timer. The Python test supervisor
+independently enforces monotonic incremental startup reads, bounded output
+capture, exact-child termination/reaping and explicit uncertainty on cleanup
+failure. A reaped child is not evidence of native quota or container acceptance.
+
+Same-UID pathname races remain outside this offline trust boundary; inode checks
+are not atomic check-and-unlink protection against a malicious same-UID process.
+RAII cannot clean up after SIGKILL, abort or power loss. Disposable parent
+cleanup is owned by the external tests, never an untrusted automatic sweep.
+Production endpoint configuration can technically select any trusted compatible
+helper, including a fixture socket; no fixture/genuine cryptographic distinction
+was added to v1. Independent local filesystem, VFS, bind-source and runtime
+acceptance gates remain active. No native backend or A.5.1c work is introduced.
+
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-
 collection contracts. Workspace file reads/mutations use no-follow

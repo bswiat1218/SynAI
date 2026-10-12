@@ -49,12 +49,31 @@ directory are removed on normal exit and handled errors, without recursively
 deleting anything. Parent ancestors must be protected, real directories owned
 by root or the current user; a root-owned sticky ancestor is allowed.
 
+The lifetime deadline starts at executable entry, before argument parsing and
+inventory loading, and is carried through initialization, startup output,
+serving, and the cleanup attempt. Startup and diagnostic output use bounded,
+nonblocking writes against a monotonic deadline; diagnostics are sanitized,
+capped at 1024 bytes, and get just one immediate nonblocking write attempt
+(including after deadline expiration). Normal serving-lifetime expiration is
+successful when cleanup succeeds. Cleanup is owned by an identity-checking RAII guard,
+rechecks the directory device/inode and socket identity, removes only the
+original socket and then the empty private directory, and returns an
+`cleanup unresolved` error rather than ignoring failed removals or substituted
+identities. Repeated cleanup tolerates already-absent original resources.
+Filesystem operations may still block in uninterruptible kernel or remote
+filesystem paths; this in-process deadline is best-effort there, so any
+harder process-lifetime bound must come from the independent external
+supervisor. Same-UID replacement between identity verification and path-based
+removal remains a TOCTOU limitation.
+
 The server handles one connection at a time, uses a backlog of four, checks
 Linux `SO_PEERCRED` PID/UID/GID before reading any request, and has no workers,
 queue, retry loop, TCP listener, or daemon mode. It accepts at most ten
 connections in any rolling one-second interval (including malformed and
-unauthorized peers), enforces a 500 ms total connection deadline capped by the
-process lifetime, and stops by its mandatory lifetime deadline. Wire frames
+unauthorized peers). The rolling window stores at most those ten admitted
+connections; excess accepts are rejected without growing history. It enforces
+a 500 ms total connection deadline capped by the process lifetime, and stops
+by its mandatory lifetime deadline. Wire frames
 are a four-byte big-endian size followed by 1..16384 bytes of UTF-8 JSON.
 Requests are strictly typed, reject duplicate/unknown/missing keys, have
 bounded nesting, and must bind to an allowlisted role and the immutable

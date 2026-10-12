@@ -8,6 +8,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -139,6 +140,31 @@ class GoldenProtocolTests(unittest.TestCase):
                     parse_constant=_reject_json_constant,
                 )
 
+    def test_shared_exact_response_presence_for_every_status(self):
+        vectors = fixture_document("exchanges.json")
+        request = vectors["request"]
+        with patch("synai.broker.storage_inspector.time.time", return_value=1700000000):
+            for case in vectors["response_presence_cases"]:
+                response = mutate(vectors[case["template"]], case)
+                with self.subTest(case=case["name"]):
+                    if not case["valid"]:
+                        with self.assertRaises(InspectorInvalid):
+                            client_for()._parse_response(response, "fixture-role", request["challenge"])
+                    elif response["status"] == "ok":
+                        client_for()._parse_response(response, "fixture-role", request["challenge"])
+                    else:
+                        error = InspectorUnavailable if response["status"] == "unavailable" else InspectorInconsistent
+                        with self.assertRaises(error):
+                            client_for()._parse_response(response, "fixture-role", request["challenge"])
+
+    def test_shared_canonical_escaping_boundary_digests(self):
+        for case in fixture_document("canonical_escaping.json")["cases"]:
+            role = replace(
+                fixture_roles()[0], path=Path("/synthetic/fixture-volume/task" + case["suffix"]),
+            )
+            with self.subTest(suffix=case["suffix"]):
+                self.assertEqual(inventory_generation((role,)), case["generation"])
+
     def test_success_does_not_authorize_real_local_filesystem(self):
         from tests.test_broker import config
 
@@ -158,12 +184,32 @@ class GoldenProtocolTests(unittest.TestCase):
             self.assertEqual(manager.verified_slot_ids, frozenset())
 
 
+class FixtureSupervisionError(AssertionError):
+    def __init__(self, message: str, supervisor: FixtureHarness):
+        super().__init__(message)
+        self.supervisor = supervisor
+
+
 class FixtureHarness:
+    MAX_STARTUP_BYTES = 4096
+    MAX_DIAGNOSTIC_BYTES = 4096
+
     def __init__(
         self, parent: Path, *, lifetime_ms: int = 1600,
         backend: str = "fixture", allowed_uid: int | None = None,
         allowed_gid: int | None = None, inventory: Path | None = None,
+        startup_seconds: float = 5, reap_seconds: float = 1,
     ):
+        if startup_seconds <= 0 or reap_seconds <= 0:
+            raise ValueError("Fixture supervision deadlines must be positive")
+        self.started = time.monotonic()
+        self.startup_deadline = self.started + startup_seconds
+        self.process_deadline = self.started + max(startup_seconds, lifetime_ms / 1000 + 0.5)
+        self.reap_seconds = reap_seconds
+        self.unresolved = False
+        self.closed = False
+        self.diagnostics = bytearray()
+        self.stdout_bytes = bytearray()
         self.process = subprocess.Popen(
             [
                 str(BINARY), "--parent", str(parent),
@@ -175,27 +221,134 @@ class FixtureHarness:
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
-            assert self.process.stdout is not None
+            if self.process.stdout is None or self.process.stderr is None:
+                raise AssertionError("Rust fixture harness pipes are unavailable")
+            os.set_blocking(self.process.stdout.fileno(), False)
+            os.set_blocking(self.process.stderr.fileno(), False)
             with selectors.DefaultSelector() as selector:
-                selector.register(self.process.stdout, selectors.EVENT_READ)
-                if not selector.select(timeout=5):
-                    raise AssertionError("Rust fixture harness startup timed out")
-            line = self.process.stdout.readline(4097)
-            if not line or len(line) > 4096:
-                raise AssertionError("Rust fixture harness returned no bounded startup frame")
-            self.startup = json.loads(line)
+                selector.register(self.process.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(self.process.stderr, selectors.EVENT_READ, "stderr")
+                while b"\n" not in self.stdout_bytes:
+                    remaining = self.startup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AssertionError("Rust fixture harness startup timed out")
+                    events = selector.select(remaining)
+                    if not events:
+                        raise AssertionError("Rust fixture harness startup timed out")
+                    for key, _ in events:
+                        data = os.read(key.fd, 1024)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                            if key.data == "stdout":
+                                raise AssertionError("Rust fixture harness exited before readiness")
+                        elif key.data == "stdout":
+                            self.stdout_bytes.extend(data)
+                            if len(self.stdout_bytes) > self.MAX_STARTUP_BYTES:
+                                raise AssertionError("Rust fixture harness startup frame exceeded its limit")
+                        else:
+                            self._diagnostic_bytes(data)
+            line, trailing = bytes(self.stdout_bytes).split(b"\n", 1)
+            if trailing.strip():
+                raise AssertionError("Rust fixture harness emitted unexpected startup output")
+            self.startup = json.loads(
+                line.decode("utf-8"), object_pairs_hook=_unique_json_object,
+                parse_constant=_reject_json_constant,
+            )
+            if (
+                not isinstance(self.startup, dict)
+                or set(self.startup) != {
+                    "socket_path", "inventory_generation", "helper_boot_epoch", "fixture_only",
+                }
+                or self.startup["fixture_only"] is not True
+                or not all(isinstance(self.startup[field], str) for field in (
+                    "socket_path", "inventory_generation", "helper_boot_epoch",
+                ))
+            ):
+                raise AssertionError("Rust fixture harness readiness schema is invalid")
             self.path = Path(self.startup["socket_path"])
-        except BaseException:
-            self.close()
+            if not self.path.is_absolute() or not self.path.is_relative_to(parent):
+                raise AssertionError("Rust fixture harness socket escaped the disposable parent")
+        except BaseException as error:
+            try:
+                self.close(terminate=True)
+            except (AssertionError, OSError) as cleanup_error:
+                error.add_note(f"Exact fixture child cleanup unresolved: {cleanup_error}")
+                if self.unresolved:
+                    raise FixtureSupervisionError(
+                        "Fixture startup failed with exact child lifetime unresolved", self,
+                    ) from error
             raise
 
-    def close(self):
+    def _diagnostic_bytes(self, data: bytes):
+        remaining = self.MAX_DIAGNOSTIC_BYTES - len(self.diagnostics)
+        if remaining > 0:
+            self.diagnostics.extend(data[:remaining])
+
+    def _wait_before(self, deadline: float):
+        with selectors.DefaultSelector() as selector:
+            for pipe in (self.process.stdout, self.process.stderr):
+                if pipe is not None and not pipe.closed:
+                    selector.register(pipe, selectors.EVENT_READ, pipe is self.process.stderr)
+            while self.process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(self.process.args, 0)
+                for key, _ in selector.select(min(remaining, 0.05)):
+                    data = os.read(key.fd, 1024)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                    elif key.data:
+                        self._diagnostic_bytes(data)
+            self.process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        for pipe in (self.process.stdout, self.process.stderr):
+            if pipe is not None and not pipe.closed:
+                for _ in range(4):
+                    try:
+                        data = os.read(pipe.fileno(), 1024)
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        break
+                    if pipe is self.process.stderr:
+                        self._diagnostic_bytes(data)
+
+    def close(self, *, terminate: bool = False):
+        if self.closed:
+            return
+        exceeded = False
         try:
-            self.process.communicate(timeout=6)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.communicate(timeout=2)
+            if terminate and self.process.poll() is None:
+                self.process.kill()
+            try:
+                self._wait_before(
+                    time.monotonic() + self.reap_seconds if terminate else self.process_deadline,
+                )
+            except subprocess.TimeoutExpired:
+                exceeded = True
+                if self.process.poll() is None:
+                    self.process.kill()
+                self._wait_before(time.monotonic() + self.reap_seconds)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self.unresolved = True
+            raise FixtureSupervisionError(
+                "Exact fixture child termination or reaping is unresolved", self,
+            ) from error
+        try:
+            for pipe in (self.process.stdout, self.process.stderr):
+                if pipe is not None:
+                    pipe.close()
+        except OSError as error:
+            self.unresolved = True
+            raise FixtureSupervisionError("Fixture pipe cleanup is unresolved", self) from error
+        self.closed = True
+        self.unresolved = False
+        if exceeded:
             raise AssertionError("Rust fixture harness failed its bounded lifetime")
+        if not terminate and self.process.returncode not in (0, -9):
+            raise AssertionError(
+                f"Rust fixture harness exited with {self.process.returncode}; "
+                f"bounded diagnostics: {bytes(self.diagnostics)!r}",
+            )
 
     def connect(self):
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -221,6 +374,200 @@ class FixtureHarness:
             return json.loads(receive_exact(connection, size))
 
 
+class SupervisorLifetimeTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="synai-supervisor-")
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name)
+        self.children = []
+        self.real_popen = subprocess.Popen
+        self.addCleanup(self.reap_children)
+
+    def reap_children(self):
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=2)
+
+    def child_factory(self, source):
+        def spawn(*args, **kwargs):
+            child = self.real_popen(
+                [sys.executable, "-c", source], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.children.append(child)
+            return child
+        return spawn
+
+    def rejected_child(self, source, error=AssertionError):
+        started = time.monotonic()
+        with patch(
+            "tests.test_quota_inspector_prototype.subprocess.Popen",
+            side_effect=self.child_factory(source),
+        ), self.assertRaises(error):
+            FixtureHarness(self.parent, startup_seconds=0.2, reap_seconds=0.5)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertIsNotNone(self.children[-1].poll())
+
+    def test_original_partial_startup_reproduction_is_deadline_bounded(self):
+        self.rejected_child("import os,time;os.write(1,b'{');time.sleep(30)")
+
+    def test_no_output_is_bounded_and_exact_child_is_reaped(self):
+        self.rejected_child("import time;time.sleep(30)")
+
+    def test_partial_utf8_and_invalid_json_are_rejected(self):
+        self.rejected_child("import os;os.write(1,b'\\xc3\\n')", UnicodeError)
+        self.rejected_child("import os;os.write(1,b'{\\n')", ValueError)
+
+    def test_oversized_output_is_rejected_without_unbounded_capture(self):
+        self.rejected_child("import os,time;os.write(1,b'x'*8192);time.sleep(30)")
+
+    def test_stderr_backpressure_is_drained_with_bounded_capture(self):
+        self.rejected_child(
+            "import os,time;os.write(2,b'x'*262144);os.write(1,b'{');time.sleep(30)",
+        )
+
+    def test_successful_startup_after_stderr_flood_retains_only_bounded_diagnostics(self):
+        source = "import os;os.write(2,b'x'*262144);" + self.ready_source()
+        with patch(
+            "tests.test_quota_inspector_prototype.subprocess.Popen",
+            side_effect=self.child_factory(source),
+        ):
+            harness = FixtureHarness(self.parent, startup_seconds=1)
+        self.assertEqual(len(harness.diagnostics), harness.MAX_DIAGNOSTIC_BYTES)
+        harness.close(terminate=True)
+
+    def test_child_exit_and_broken_stdout_before_readiness(self):
+        self.rejected_child("pass")
+        self.rejected_child("import os,time;os.close(1);time.sleep(30)")
+
+    def test_spawn_failure_does_not_guess_child_identity(self):
+        with patch(
+            "tests.test_quota_inspector_prototype.subprocess.Popen",
+            side_effect=OSError("injected spawn failure"),
+        ), self.assertRaises(OSError):
+            FixtureHarness(self.parent, startup_seconds=0.2)
+        self.assertEqual(self.children, [])
+
+    def ready_source(self, *, crash=False):
+        startup = json.dumps({
+            "socket_path": str(self.parent / "fixture.sock"),
+            "inventory_generation": inventory_generation(fixture_roles()),
+            "helper_boot_epoch": "a" * 32, "fixture_only": True,
+        })
+        return (
+            f"import os,time;os.write(1,{(startup + chr(10)).encode()!r});"
+            + ("time.sleep(0.05);os._exit(3)" if crash else "time.sleep(30)")
+        )
+
+    def ready_child(self, **options):
+        with patch(
+            "tests.test_quota_inspector_prototype.subprocess.Popen",
+            side_effect=self.child_factory(self.ready_source(**options)),
+        ):
+            return FixtureHarness(self.parent, startup_seconds=0.2, reap_seconds=0.3)
+
+    def test_repeated_close_is_idempotent_after_exact_child_termination(self):
+        harness = self.ready_child()
+        harness.close(terminate=True)
+        harness.close()
+        self.assertTrue(harness.closed)
+        self.assertFalse(harness.unresolved)
+
+    def test_fragmented_utf8_valid_startup_is_read_incrementally(self):
+        payload = json.dumps({
+            "socket_path": str(self.parent / "caf\u00e9.sock"),
+            "inventory_generation": inventory_generation(fixture_roles()),
+            "helper_boot_epoch": "a" * 32, "fixture_only": True,
+        }, ensure_ascii=False).encode() + b"\n"
+        split = payload.index(b"\xc3") + 1
+        source = (
+            f"import os,time;os.write(1,{payload[:split]!r});"
+            f"time.sleep(0.02);os.write(1,{payload[split:]!r});time.sleep(30)"
+        )
+        with patch(
+            "tests.test_quota_inspector_prototype.subprocess.Popen",
+            side_effect=self.child_factory(source),
+        ):
+            harness = FixtureHarness(self.parent, startup_seconds=0.3)
+        harness.close(terminate=True)
+        self.assertEqual(harness.path.name, "caf\u00e9.sock")
+
+    def test_child_crash_after_readiness_is_not_clean_shutdown(self):
+        harness = self.ready_child(crash=True)
+        with self.assertRaisesRegex(AssertionError, "exited with 3"):
+            harness.close()
+        self.assertTrue(harness.closed)
+
+    def test_kill_failure_remains_unresolved_and_close_can_retry(self):
+        harness = self.ready_child()
+        with patch.object(harness.process, "kill", side_effect=OSError("injected kill failure")):
+            with self.assertRaisesRegex(AssertionError, "unresolved"):
+                harness.close(terminate=True)
+        self.assertTrue(harness.unresolved)
+        self.assertFalse(harness.closed)
+        harness.close(terminate=True)
+        self.assertFalse(harness.unresolved)
+
+    def test_reap_uncertainty_is_not_reported_as_clean(self):
+        harness = self.ready_child()
+        with patch.object(
+            harness, "_wait_before", side_effect=subprocess.TimeoutExpired("exact child", 0),
+        ), self.assertRaisesRegex(AssertionError, "unresolved"):
+            harness.close(terminate=True)
+        self.assertTrue(harness.unresolved)
+        harness.close(terminate=True)
+
+    def test_pipe_cleanup_failure_is_explicit_and_retryable(self):
+        harness = self.ready_child()
+        with patch.object(harness.process.stdout, "close", side_effect=OSError("injected close")):
+            with self.assertRaisesRegex(FixtureSupervisionError, "pipe cleanup"):
+                harness.close(terminate=True)
+        self.assertTrue(harness.unresolved)
+        self.assertFalse(harness.closed)
+        self.assertIsNotNone(harness.process.poll())
+        harness.close(terminate=True)
+        self.assertTrue(harness.closed)
+
+    def test_constructor_cleanup_error_is_visible_on_original_timeout(self):
+        real_close = FixtureHarness.close
+
+        def failing_close(harness, **kwargs):
+            real_close(harness, **kwargs)
+            raise AssertionError("injected unresolved resource cleanup")
+
+        with patch(
+            "tests.test_quota_inspector_prototype.subprocess.Popen",
+            side_effect=self.child_factory("import os,time;os.write(1,b'{');time.sleep(30)"),
+        ), patch.object(FixtureHarness, "close", failing_close):
+            with self.assertRaises(AssertionError) as error:
+                FixtureHarness(self.parent, startup_seconds=0.2)
+        self.assertIn("cleanup unresolved", " ".join(error.exception.__notes__))
+        self.assertIsNotNone(self.children[-1].poll())
+
+    def test_constructor_unresolved_child_ownership_is_retained_for_retry(self):
+        real_factory = self.child_factory("import os,time;os.write(1,b'{');time.sleep(30)")
+        injected = []
+
+        def spawn(*args, **kwargs):
+            child = real_factory(*args, **kwargs)
+            injected.append(patch.object(child, "kill", side_effect=OSError("injected failure")))
+            injected[-1].start()
+            return child
+
+        try:
+            with patch(
+                "tests.test_quota_inspector_prototype.subprocess.Popen", side_effect=spawn,
+            ), self.assertRaises(FixtureSupervisionError) as error:
+                FixtureHarness(self.parent, startup_seconds=0.1, reap_seconds=0.2)
+            self.assertTrue(error.exception.supervisor.unresolved)
+            self.assertIs(error.exception.supervisor.process, self.children[-1])
+        finally:
+            for injection in injected:
+                injection.stop()
+        error.exception.supervisor.close(terminate=True)
+        self.assertFalse(error.exception.supervisor.unresolved)
+
+
 @unittest.skipUnless(
     BINARY.is_file() and hasattr(socket, "SO_PEERCRED") and os.geteuid() != 0,
     "Build the offline fixture-harness with cargo first; ordinary Linux user required",
@@ -237,6 +584,116 @@ class RustUnixCompatibilityTests(unittest.TestCase):
         self.addCleanup(harness.close)
         return harness
 
+    def raw_arguments(self, lifetime_ms=150):
+        return [
+            str(BINARY), "--parent", str(self.parent),
+            "--inventory", str(FIXTURES / "inventory.json"),
+            "--allowed-uid", str(os.geteuid()), "--allowed-gid", str(os.getegid()),
+            "--lifetime-ms", str(lifetime_ms),
+        ]
+
+    def test_original_blocked_stdout_lifetime_and_cleanup_are_corrected(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(write_fd, False)
+            while True:
+                try:
+                    os.write(write_fd, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(write_fd, True)
+            started = time.monotonic()
+            child = subprocess.Popen(self.raw_arguments(), stdout=write_fd, stderr=subprocess.PIPE)
+            try:
+                child.wait(timeout=1.5)
+                self.assertLess(time.monotonic() - started, 1)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertEqual(list(self.parent.iterdir()), [])
+                self.assertNotIn(b"panicked", child.stderr.read(4096))
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=1)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_original_broken_stdout_panic_cleanup_is_corrected(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        try:
+            child = subprocess.Popen(self.raw_arguments(), stdout=write_fd, stderr=subprocess.PIPE)
+            try:
+                _, error = child.communicate(timeout=1.5)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertNotEqual(child.returncode, 101)
+                self.assertNotIn(b"panicked", error)
+                self.assertLess(len(error), 1024)
+                self.assertEqual(list(self.parent.iterdir()), [])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=1)
+        finally:
+            os.close(write_fd)
+
+    def test_blocked_stderr_cannot_trap_error_reporting(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(write_fd, False)
+            while True:
+                try:
+                    os.write(write_fd, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(write_fd, True)
+            child = subprocess.Popen(
+                [str(BINARY), "--invalid", "argument"], stdout=subprocess.PIPE, stderr=write_fd,
+            )
+            try:
+                child.wait(timeout=1.5)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertEqual(list(self.parent.iterdir()), [])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=1)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_startup_deadline_with_rust_directory_cleanup_failure_is_explicit(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.set_blocking(write_fd, False)
+            while True:
+                try:
+                    os.write(write_fd, b"x" * 4096)
+                except BlockingIOError:
+                    break
+            os.set_blocking(write_fd, True)
+            child = subprocess.Popen(self.raw_arguments(500), stdout=write_fd, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 0.3
+                directories = []
+                while not directories and time.monotonic() < deadline:
+                    directories = list(self.parent.glob("quota-inspector-*"))
+                    time.sleep(0.005)
+                self.assertEqual(len(directories), 1)
+                sentinel = directories[0] / "foreign-content"
+                sentinel.write_text("do not remove")
+                _, error = child.communicate(timeout=1.5)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn(b"cleanup", error.lower())
+                self.assertNotIn(b"panicked", error)
+                self.assertTrue(sentinel.exists())
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=1)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
     def request(self, challenge: str | None = None) -> dict:
         request = StorageInspectionRequest.issue(
             "fixture-role", inventory_generation(fixture_roles()),
@@ -486,6 +943,18 @@ class RustUnixCompatibilityTests(unittest.TestCase):
         self.assertGreater(refused, 0)
         self.assertIsNone(harness.process.poll())
 
+    def test_rejected_flood_near_lifetime_does_not_extend_process_budget(self):
+        harness = self.start(lifetime_ms=250)
+        for _ in range(100):
+            try:
+                with harness.connect():
+                    pass
+            except OSError:
+                break
+        harness.close()
+        self.assertFalse(harness.path.exists())
+        self.assertTrue(harness.closed)
+
     def test_clean_lifetime_removes_only_owned_paths(self):
         sentinel = self.parent / "unrelated"
         sentinel.write_text("keep")
@@ -506,6 +975,23 @@ class RustUnixCompatibilityTests(unittest.TestCase):
         harness.close()
         self.assertLess(time.monotonic() - started, 1)
         self.assertFalse(harness.path.exists())
+
+    def test_supervisor_close_while_child_has_active_partial_connection(self):
+        harness = self.start(lifetime_ms=1500)
+        with harness.connect() as connection:
+            connection.sendall(b"\x00")
+            harness.close(terminate=True)
+        self.assertTrue(harness.closed)
+        self.assertIsNotNone(harness.process.poll())
+
+    def test_restart_does_not_inherit_replay_entries(self):
+        payload = json.dumps(self.request("d" * 64)).encode()
+        first = self.start(lifetime_ms=200)
+        self.assertEqual(first.exchange(payload)["status"], "ok")
+        first.close()
+        second = self.start(lifetime_ms=200)
+        self.assertEqual(second.exchange(payload)["status"], "ok")
+        self.assertNotEqual(first.startup["helper_boot_epoch"], second.startup["helper_boot_epoch"])
 
     def test_crash_restart_changes_epoch_and_old_client_refuses_it(self):
         first = self.start()

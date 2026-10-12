@@ -59,6 +59,21 @@
     {"name": "command-authority", "changes": {"command": "runtime"}},
     {"name": "missing-challenge", "remove": "challenge"}
   ],
+  "response_presence_cases": [
+    {"name": "ok-error-null", "template": "response", "changes": {"error_code": null}, "valid": false},
+    {"name": "unavailable-observation-null", "template": "unavailable", "changes": {"observed_at": null}, "valid": false},
+    {"name": "ok-extra-null", "template": "response", "changes": {"extra": null}, "valid": false},
+    {"name": "unavailable-extra-null", "template": "unavailable", "changes": {"extra": null}, "valid": false},
+    {"name": "inconsistent-extra-null", "template": "unavailable", "changes": {"status": "inconsistent", "extra": null}, "valid": false},
+    {"name": "ok-required-null", "template": "response", "changes": {"owner_uid": null}, "valid": false},
+    {"name": "unavailable-required-null", "template": "unavailable", "changes": {"error_code": null}, "valid": false},
+    {"name": "inconsistent-required-null", "template": "unavailable", "changes": {"status": "inconsistent", "challenge": null}, "valid": false},
+    {"name": "ok-required-missing", "template": "response", "remove": "owner_gid", "valid": false},
+    {"name": "unavailable-required-missing", "template": "unavailable", "remove": "error_code", "valid": false},
+    {"name": "ok-valid", "template": "response", "valid": true},
+    {"name": "unavailable-valid", "template": "unavailable", "valid": true},
+    {"name": "inconsistent-valid", "template": "unavailable", "changes": {"status": "inconsistent"}, "valid": true}
+  ],
   "invalid_responses": [
     {"name": "challenge-mismatch", "changes": {"challenge": "0000000000000000000000000000000000000000000000000000000000000000"}, "error": "invalid"},
     {"name": "generation-mismatch", "changes": {"inventory_generation": "0000000000000000000000000000000000000000000000000000000000000000"}, "error": "invalid"},

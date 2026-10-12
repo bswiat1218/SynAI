@@ -1,18 +1,20 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use quota_inspector::{Backend, Inventory, run_harness};
+use quota_inspector::{Backend, Inventory, MAX_LIFETIME, run_harness_before, write_stderr_before};
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("fixture-harness: {error}");
+    let started = Instant::now();
+    let mut diagnostic_deadline = started + MAX_LIFETIME;
+    if let Err(error) = run(started, &mut diagnostic_deadline) {
+        write_stderr_before(&error, diagnostic_deadline);
         std::process::exit(2);
     }
 }
 
-fn run() -> Result<(), String> {
+fn run(started: Instant, diagnostic_deadline: &mut Instant) -> Result<(), String> {
     let mut parent = None;
     let mut inventory_path = None;
     let mut allowed_uid = None;
@@ -63,13 +65,17 @@ fn run() -> Result<(), String> {
     if lifetime_ms == 0 || lifetime_ms > 30_000 {
         return Err("--lifetime-ms must be in 1..=30000".to_owned());
     }
+    let deadline = started
+        .checked_add(Duration::from_millis(lifetime_ms))
+        .ok_or_else(|| "harness deadline is out of range".to_owned())?;
+    *diagnostic_deadline = deadline;
     let inventory = Inventory::load(&inventory_path)?;
-    run_harness(
+    run_harness_before(
         &parent,
         &inventory,
         allowed_uid,
         allowed_gid,
-        Duration::from_millis(lifetime_ms),
+        deadline,
         backend,
     )
 }
