@@ -907,6 +907,19 @@ unchanged. Privileged VM setup, kernel experiments, installation, runtime accept
 SQLite native VFS, external bind-source acceptance and Phase 13F-B remain gated.
 **Production Broker execution is still unavailable.**
 
+#### Phase 13F-A.5.1c.2: minimal offline quota ABI contract
+
+The separate [ABI library](../prototypes/quota-inspector-abi/README.md) models only
+x86_64 Linux GNU LP64 project GETQUOTA/GETINFO commands, initialized fixed layouts,
+checked units, validity masks, errno classes and decoded **untrusted candidates**.
+It is dependency-free and forbids unsafe code. There is no FFI, syscall invocation,
+real transport, service, runtime activation switch or native-backend registration.
+Compile-only local C header checks and test-only deterministic fake transports do
+not establish kernel support or enforcement. The native library and Python v1
+contract are unchanged; native inspection and Broker execution remain unavailable.
+Blocked-call supervision, trusted acquisition, namespace/descriptor qualification,
+separately approved VM testing and all existing readiness gates remain prerequisites.
+
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-
 collection contracts. Workspace file reads/mutations use no-follow

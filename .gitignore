@@ -5,6 +5,7 @@ web/node_modules/
 prototypes/quota-inspector/target/
 prototypes/quota-inspector-native/target/
 prototypes/quota-inspector-protocol/target/
+prototypes/quota-inspector-abi/target/
 *.egg-info/
 build/
 dist/
