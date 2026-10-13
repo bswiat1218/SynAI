@@ -15,28 +15,35 @@ Current integration baseline: `91aed9174347ced528afb1e8088ac02e571f6a15`
 Category 1 (integration code A1-A6) is authorized; VM preparation and all live
 kernel/runtime/destructive operations remain separately gated.
 
+Category 1 continuation baseline: `fe6842caeb745fce54ef8dcb4dd6088e8ca2faee`
+("Phase 13F-A.5: Real Integration and Acceptance Campaign"), clean worktree and
+index. The earlier eight-file transport change set is already incorporated in
+this history; it was not present as unstaged work at continuation start.
+
 Category 1 A1 feasibility status (read-only inspection, no Podman invocation):
-installed docs and package state confirm pathname bind sources and descriptor
-passthrough to the workload, but do not establish a descriptor-authoritative
-mount-source handoff with independent mounted-target identity proof. The current
-runtime branch remains blocked/unqualified; no identity requirement was weakened
-and no runtime redesign was introduced under this blocker.
+installed Podman 5.7.0 documentation describes `--mount` `src`/`source` as a
+bind mount source spec and `--preserve-fd`/`--preserve-fds` as descriptors passed
+to the container process (the numbered-FD form is documented for `crun`). These
+are not an interface for the runtime to consume an already-open FD as mount
+source authority. No installed source or authoritative interface establishes
+that handoff or independent destination-object verification before workload
+start. The runtime branch remains blocked and fail-closed.
 
 ## Matrix
 
 | Requirement | Existing implementation reused | Offline status / remaining work | Independently required live evidence | Production blocker |
 |---|---|---|---|---|
 | Native quota / ABI | [ABI](../../prototypes/quota-inspector-abi/README.md), sealed native read-only adapter | CATEGORY1_CODE: isolated callable typed x86_64 `quotactl_fd` wrapper; deterministic dispatch tests and non-invoking link test; no production wiring | Separately approved GETQUOTA/GETINFO against qualified descriptors/kernel and independently trusted evidence | Native backend unavailable |
-| Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | OFFLINE_IMPLEMENTED: current-request sealed attestation freshness; MODEL_ONLY source identity/digest/time check | Protected authenticated source and independently approved identity; hash is not trust | Acquisition unavailable |
-| Descriptor/mount/namespace/UUID | Native owned descriptors/pre-post checks; Broker Directory/openat2 | Existing validation reused; MODEL_ONLY source replacement and same-namespace mounted-FD checks | Qualified FD/namespace correspondence and protected ancestry | Identity acquisition/handoff unaccepted |
+| Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | Candidate validation and freshness are implemented; the authenticated operator-source selector/loader and native descriptor acquisition are missing, not merely awaiting kernel evidence | Protected authenticated source, independently approved identity, and separately acquired filesystem/project evidence; hash is not trust | Native inspection unavailable; source acquisition contract absent |
+| Descriptor/mount/namespace/UUID | Native owned descriptors/pre/post checks; Broker Directory/openat2 | Broker path-resolution checks exist; no native acquisition backend binds the protected root, ancestry, filesystem UUID/mount and namespace or independently queries project attributes | Qualified FD/namespace correspondence, protected ancestry, project identity and replacement/remount detection | Native identity acquisition unavailable |
 | Existing-file charging | Native listed-file checks; Broker bounded recursive per-file verification | Existing tests reused; acquisition/traversal contract below; no redundant native enumerator | Actual project attributes/charging of all existing files | Kernel charging not accepted |
 | Configuration / write denial | Checked counters, explicit configuration state, exact caps | Decoder reused; acceptance-test campaign specified below, not executed | Independent active enforcement and separately approved destructive sparse/concurrent byte/inode exhaustion | No empirical enforcement evidence |
-| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | IMPLEMENTATION_BLOCKED: engine identity/API inventory confirmed, but full callback/WAL/SHM/lock/sync VFS and adapter parity cannot yet be established safely; registry unchanged | Actual identity-preserving native VFS, lock/fsync/crash behavior and ledger transaction/durability parity | external_filesystem_resolution_unaccepted; sqlite_file_quota_vfs_unaccepted |
-| Runtime bind source | Descriptor/allocation checks and unconditional refusal | IMPLEMENTATION_BLOCKED: installed interface evidence does not establish descriptor-authoritative mount handoff; refusal unchanged | Mounted-source inode/filesystem/namespace correspondence before workload, not source-path text | bind_source_resolution_unaccepted |
+| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | No prototype: current Python `sqlite3` API does not expose VFS registration, and no pinned same-engine native adapter/VFS exists. A new C boundary would have to implement and test the complete VFS callback, WAL/SHM/locking/sync, URI restriction, and Python transaction/cursor/error contract before any adapter change. No production registry changes made | Disposable DB/WAL/SHM/journal concurrency, failure, restart and process-crash tests; separately, real filesystem identity, quota charging and power-loss acceptance | Code blocker: no reviewed same-engine VFS/adapter boundary. Live filesystem/durability acceptance remains separate |
+| Runtime bind source | Descriptor/allocation checks and unconditional refusal | Podman 5.7.0 docs show path-valued mount source and workload-only FD passing; no supported descriptor-authoritative mount-source handoff or independent target-object proof was found. No runtime change made | Mounted-source inode/filesystem/namespace correspondence before workload, not source-path text | bind_source_resolution_unaccepted |
 | Podman storage | Strict TOML/digests/environment/report/layer/path policy | Existing parsers/rejections reused; new all-lifecycle-launch-refusal regression | Version-qualified graph/run/overlay/layer/scratch/tmpfs/log/config observer | runtime_storage_acceptance_pending |
 | Aggregate storage | Unique domain accounting, remaining entitlement, watchdog reserves | Existing exact-threshold/domain/remaining-entitlement tests reused unchanged | Continuous observed capacity under complete workload and metadata pressure | Trusted live capacity/enforcement missing |
 | Exact containment | Exact record/ID/image/labels; inspect/stop/kill/inspect/absence; single-flight | Existing event-order/failed persistence/single-flight/recovery tests reused unchanged | Independently verified exact-ID stop/absence and preserved state on failure | Runtime unavailable; unresolved is not stopped |
-| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | MODEL_ONLY: test-only exact PID/start/generation/boot/namespace exit/reap/cleanup lease model wired into Inspection; standalone child-owner prototype rejected and removed after review | Independent supervisor, exact process identity, physical completion/reaping/cleanup/restart and retained ownership across Broker failure | Adapter completion promise not yet qualified |
+| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | Broker child cleanup now refuses handles not in its exact owned-child set. Deterministic tests include a real unprivileged child timeout/kill/reap. Native `WorkerLease` remains a test-only model; no separate supervisor or restart-durable ownership exists | Independent supervisor, exact process identity across restart, physical completion/reaping/cleanup and retained ownership across Broker failure; ordinary child reaping does not prove uninterruptible-work completion | Adapter completion promise and crash-surviving ownership not qualified |
 | Privilege/confinement | Broker zero-effective-capability/identity checks, restricted arguments | MODEL_ONLY: untrusted effective-capability/identity/groups/no-new-privileges/seccomp/LSM requirements and negative checks | Dedicated identities; reviewed helper permissions, seccomp/LSM and deployed effective state | Helper/deployment confinement unaccepted |
 | Broker authorization/readiness | Claims/leases/fencing/replay, registry/seals/quarantine/watchdog | Existing F1-F5/R1-R6/C1-1 reused; no production Broker code or gate changes | All preceding gates plus independent security acceptance | All existing refusals preserved |
 
@@ -101,6 +108,68 @@ complete filesystem/project identity acquisition, physical supervisor across
 Broker/supervisor death, VFS implementation, and runtime storage/mount evidence
 remain blocked. A compiled low-level syscall transport alone grants no observation
 authority. All 13 acceptance rows and production refusals remain intact.
+
+## Category 1 continuation results
+
+This continuation made only the directly safe process-ownership correction:
+`ChildProcesses.cleanup` now rejects a foreign `asyncio.subprocess.Process`
+handle before signalling or waiting on it and makes the unresolved state sticky.
+Its tests prove both that an unowned live process is left running and that a real
+unprivileged child spawned by the owner is killed and reaped on timeout. These
+results cover ordinary child processes only; they do not establish PID/start-time
+acquisition for an external worker, descriptor-lease survival after Broker death,
+or completion of uninterruptible kernel work.
+
+Newly executed continuation checks: the focused `ProcessDeadlineTests` suite
+passed (18 tests); full Python discovery passed (749 tests, 4 skipped); Python
+compilation and `git diff --check` passed. The focused independent review found
+no significant issue in the ownership guard or real-child tests. Rust ABI/native/
+fixture builds, tests, formatting and Clippy were not rerun because neither
+`cargo` nor `rustc` is installed in this checkout environment; no toolchain or
+dependency was installed. Previous Rust results remain historical.
+
+The SQLite branch stopped before implementation. The registry uses CPython's
+`sqlite3.Connection`/`sqlite3.Row`, implicit connection context transactions,
+explicit `BEGIN IMMEDIATE`/commit/rollback, `executescript` schema creation and
+migrations, `rowcount`, `fetchone`, cursor iteration/tuple conversion, WAL,
+`synchronous=FULL`, `wal_checkpoint(TRUNCATE)`, foreign-key/integrity checks,
+and DB/WAL/SHM/journal identity/seal/dirty-marker handling. The public Python
+module provides no VFS registration function. A prototype would therefore need
+a same-engine native registration/adapter boundary plus a complete VFS: short
+I/O/error propagation, file-control and locking semantics, shared-memory
+mapping/locking, deletion/access, sync and checkpoint behavior, restricted
+temporary/URI/extension/attachment handling, and parity with the registry's
+Python API. Implementing only file-open callbacks or routing the existing
+registry through a second SQLite engine would violate the requirement. No adapter,
+schema, ledger, or production activation was changed. Process-crash tests, if
+later added, cannot establish power-loss durability.
+
+Trusted acquisition is not solely a VM blocker. The native crate currently has
+untrusted inventory and identity candidates plus a sealed acquisition interface,
+but its only non-test backend refuses to attest, acquire a root, or return native
+filesystem evidence. No authenticated fixed source/root identity or production
+loader is selected. Broker `Directory` path checks do not automatically supply
+the native helper with the same authority, and promoting its candidate values
+would create a competing trust source. A safe offline implementation first needs
+the protected source contract and a native descriptor-relative acquisition
+adapter; actual project attributes, quota state, UUID/mount correspondence and
+live replacement/remount acceptance remain additional kernel/VM evidence.
+
+The mounted-source feasibility decision remains **NO-GO for the present Podman
+interface**: `--preserve-fd` hands descriptors to a process in the container;
+`--mount type=bind,src=...` accepts a source specification. Passing an FD to
+Podman, or to `crun`, does not show that the runtime uses that FD as mount-source
+authority. No independently inspectable post-mount destination identity
+mechanism was established. Alternatives requiring a new decision are a reviewed
+OCI-runtime/helper extension that consumes an already-pinned descriptor and
+proves the mounted object, or avoiding a host project bind and staging bounded
+data through a separate runtime-owned channel with independently accepted
+storage accounting. Neither alternative is implemented or authorized here.
+
+Rust revalidation was unavailable in this continuation: `cargo` and `rustc` are
+not installed in the current environment. No toolchain or dependency was
+installed. This does not alter prior Rust results, but those historical results
+are not newly executed results for this continuation.
 
 ## Remaining separately approved categories
 

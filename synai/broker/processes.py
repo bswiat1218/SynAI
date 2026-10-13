@@ -47,6 +47,9 @@ class ChildProcesses:
         return reap
 
     async def cleanup(self, process: asyncio.subprocess.Process, deadline: float) -> bool:
+        if process not in self.children:
+            self._failed()
+            return False
         loop = asyncio.get_running_loop()
         if process.returncode is None:
             try:

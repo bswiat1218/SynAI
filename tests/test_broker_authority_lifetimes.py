@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -570,6 +571,40 @@ class ProcessDeadlineTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BrokerError):
             await self.run_process()
         self.assertTrue(self.supervisor.unresolved)
+
+    async def test_cleanup_refuses_unowned_process_handle(self):
+        foreign = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(30)",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            result = await self.supervisor.cleanup(
+                foreign, asyncio.get_running_loop().time() + 0.1,
+            )
+            self.assertFalse(result)
+            self.assertIsNone(foreign.returncode)
+            self.assertNotIn(foreign, self.supervisor.children)
+            self.assertTrue(self.supervisor.unresolved)
+        finally:
+            if foreign.returncode is None:
+                foreign.kill()
+            await asyncio.wait_for(foreign.wait(), timeout=1)
+
+    async def test_real_child_timeout_is_killed_and_reaped(self):
+        spawned = []
+        from synai.broker.runtime import _read_bounded
+
+        with self.assertRaises(TimeoutError):
+            await self.supervisor.run(
+                sys.executable, ("-c", "import time; time.sleep(30)"),
+                os.environ.copy(), 0.5, 1024, 1024, _read_bounded,
+                on_spawn=spawned.append,
+            )
+
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+        self.assertNotIn(spawned[0], self.supervisor.children)
+        self.assertFalse(self.supervisor.unresolved)
 
     async def test_repeated_cancellation_during_cleanup_keeps_child_owned(self):
         self.process.kill_exits = False
