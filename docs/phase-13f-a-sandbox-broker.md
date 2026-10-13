@@ -896,8 +896,9 @@ to unchanged v1 generation. Descriptor-owned resolution contracts, namespace-loc
 mount/UUID/device identity, pre/post validation and separate DB/WAL/SHM/log
 project checks cannot be replaced by pathname or parent-inheritance assumptions.
 The sealed quota adapter permits only reviewed read-only observations of a pinned
-filesystem and inventory-bound project. No `quotactl_fd()` or alternative query
-is executed or implemented; the default backend and acquisition remain unavailable.
+filesystem and inventory-bound project. A separate low-level ABI transport is
+implemented but is not called or registered by this native library; the default
+backend and trusted acquisition remain unavailable.
 
 Deterministic tests cover unknown/missing/malformed evidence, accounting-only
 state, identity drift, checked quota units/overflow, freshness, bounded resources
@@ -917,13 +918,16 @@ SQLite native VFS, external bind-source acceptance and Phase 13F-B remain gated.
 The separate [ABI library](../prototypes/quota-inspector-abi/README.md) models only
 x86_64 Linux GNU LP64 project GETQUOTA/GETINFO commands, initialized fixed layouts,
 checked units, validity masks, errno classes and decoded **untrusted candidates**.
-It is dependency-free and forbids unsafe code. There is no FFI, syscall invocation,
-real transport, service, runtime activation switch or native-backend registration.
-Compile-only local C header checks and test-only deterministic fake transports do
-not establish kernel support or enforcement. The native library and Python v1
-contract are unchanged; native inspection and Broker execution remain unavailable.
-Blocked-call supervision, trusted acquisition, namespace/descriptor qualification,
-separately approved VM testing and all existing readiness gates remain prerequisites.
+It is dependency-free and now includes an intentionally narrow callable
+`quotactl_fd` transport helper for `GETQUOTA`/`GETINFO` only. The helper compiles
+and links but is not wired to normal native inspection or Broker readiness paths.
+Deterministic injected-dispatch tests verify status/output binding and fail-closed
+behavior without executing real quota queries. Compile-only local C header checks
+and these deterministic tests still do not establish kernel support or enforcement.
+The native library and Python v1 contract are unchanged; native inspection and
+Broker execution remain unavailable. Blocked-call supervision, trusted acquisition,
+namespace/descriptor qualification, separately approved VM testing and all existing
+readiness gates remain prerequisites.
 
 The Broker operation validator supports bounded workspace-relative read,
 list, write, exact patch, delete, command, verification, and artifact-

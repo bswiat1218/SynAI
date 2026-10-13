@@ -7,24 +7,36 @@ query alone, requested termination or review opinion.
 
 Baseline: `1e929aa0aedef6520f0d56d89f120593b7b7bdae`, clean before this program.
 Architecture and existing corrections are documented in
-[Phase 13F-A](../phase-13f-a-sandbox-broker.md). No live quota, runtime, service,
-privilege, VM or storage operation is authorized by this document.
+[Phase 13F-A](../phase-13f-a-sandbox-broker.md). This document does not authorize
+live quota, runtime, service, privilege, VM or storage operations.
+
+Current integration baseline: `91aed9174347ced528afb1e8088ac02e571f6a15`
+("Phase 13F-A.5 Autopilot"), clean worktree/index at campaign start.
+Category 1 (integration code A1-A6) is authorized; VM preparation and all live
+kernel/runtime/destructive operations remain separately gated.
+
+Category 1 A1 feasibility status (read-only inspection, no Podman invocation):
+installed docs and package state confirm pathname bind sources and descriptor
+passthrough to the workload, but do not establish a descriptor-authoritative
+mount-source handoff with independent mounted-target identity proof. The current
+runtime branch remains blocked/unqualified; no identity requirement was weakened
+and no runtime redesign was introduced under this blocker.
 
 ## Matrix
 
 | Requirement | Existing implementation reused | Offline status / remaining work | Independently required live evidence | Production blocker |
 |---|---|---|---|---|
-| Native quota / ABI | [ABI](../../prototypes/quota-inspector-abi/README.md), sealed native read-only adapter | OFFLINE_IMPLEMENTED: borrowed-FD, command/output-kind and raw-kernel/libc-result contracts; tests below | Real separately approved GETQUOTA/GETINFO backend, supported descriptor/ID/masks/errors | Native backend unavailable |
+| Native quota / ABI | [ABI](../../prototypes/quota-inspector-abi/README.md), sealed native read-only adapter | CATEGORY1_CODE: isolated callable typed x86_64 `quotactl_fd` wrapper; deterministic dispatch tests and non-invoking link test; no production wiring | Separately approved GETQUOTA/GETINFO against qualified descriptors/kernel and independently trusted evidence | Native backend unavailable |
 | Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | OFFLINE_IMPLEMENTED: current-request sealed attestation freshness; MODEL_ONLY source identity/digest/time check | Protected authenticated source and independently approved identity; hash is not trust | Acquisition unavailable |
 | Descriptor/mount/namespace/UUID | Native owned descriptors/pre-post checks; Broker Directory/openat2 | Existing validation reused; MODEL_ONLY source replacement and same-namespace mounted-FD checks | Qualified FD/namespace correspondence and protected ancestry | Identity acquisition/handoff unaccepted |
 | Existing-file charging | Native listed-file checks; Broker bounded recursive per-file verification | Existing tests reused; acquisition/traversal contract below; no redundant native enumerator | Actual project attributes/charging of all existing files | Kernel charging not accepted |
 | Configuration / write denial | Checked counters, explicit configuration state, exact caps | Decoder reused; acceptance-test campaign specified below, not executed | Independent active enforcement and separately approved destructive sparse/concurrent byte/inode exhaustion | No empirical enforcement evidence |
-| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | MODEL_ONLY: file-kind/operation-bound before/after FD contract; existing checkpoint/crash/absence tests reused | Actual identity-preserving native VFS, lock/fsync/crash behavior | external_filesystem_resolution_unaccepted; sqlite_file_quota_vfs_unaccepted |
-| Runtime bind source | Descriptor/allocation checks and unconditional refusal | MODEL_ONLY: mounted-source inode/filesystem/same-namespace correspondence; cross-namespace unavailable | Mounted-source inode/filesystem/namespace correspondence, not source-path text | bind_source_resolution_unaccepted |
+| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | IMPLEMENTATION_BLOCKED: engine identity/API inventory confirmed, but full callback/WAL/SHM/lock/sync VFS and adapter parity cannot yet be established safely; registry unchanged | Actual identity-preserving native VFS, lock/fsync/crash behavior and ledger transaction/durability parity | external_filesystem_resolution_unaccepted; sqlite_file_quota_vfs_unaccepted |
+| Runtime bind source | Descriptor/allocation checks and unconditional refusal | IMPLEMENTATION_BLOCKED: installed interface evidence does not establish descriptor-authoritative mount handoff; refusal unchanged | Mounted-source inode/filesystem/namespace correspondence before workload, not source-path text | bind_source_resolution_unaccepted |
 | Podman storage | Strict TOML/digests/environment/report/layer/path policy | Existing parsers/rejections reused; new all-lifecycle-launch-refusal regression | Version-qualified graph/run/overlay/layer/scratch/tmpfs/log/config observer | runtime_storage_acceptance_pending |
 | Aggregate storage | Unique domain accounting, remaining entitlement, watchdog reserves | Existing exact-threshold/domain/remaining-entitlement tests reused unchanged | Continuous observed capacity under complete workload and metadata pressure | Trusted live capacity/enforcement missing |
 | Exact containment | Exact record/ID/image/labels; inspect/stop/kill/inspect/absence; single-flight | Existing event-order/failed persistence/single-flight/recovery tests reused unchanged | Independently verified exact-ID stop/absence and preserved state on failure | Runtime unavailable; unresolved is not stopped |
-| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | MODEL_ONLY: test-only exact PID/start/generation/boot/namespace exit/reap/cleanup lease model wired into actual Inspection tests | Exact process identity, physical completion/reaping/cleanup/restart | Adapter completion promise not yet qualified |
+| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | MODEL_ONLY: test-only exact PID/start/generation/boot/namespace exit/reap/cleanup lease model wired into Inspection; standalone child-owner prototype rejected and removed after review | Independent supervisor, exact process identity, physical completion/reaping/cleanup/restart and retained ownership across Broker failure | Adapter completion promise not yet qualified |
 | Privilege/confinement | Broker zero-effective-capability/identity checks, restricted arguments | MODEL_ONLY: untrusted effective-capability/identity/groups/no-new-privileges/seccomp/LSM requirements and negative checks | Dedicated identities; reviewed helper permissions, seccomp/LSM and deployed effective state | Helper/deployment confinement unaccepted |
 | Broker authorization/readiness | Claims/leases/fencing/replay, registry/seals/quarantine/watchdog | Existing F1-F5/R1-R6/C1-1 reused; no production Broker code or gate changes | All preceding gates plus independent security acceptance | All existing refusals preserved |
 
@@ -32,6 +44,85 @@ Each live requirement is `INTEGRATION_PENDING` and, when provisioning, privilege
 quota writes or runtime execution are needed, `PRIVILEGED_APPROVAL_REQUIRED`.
 Tests of candidate validators/lifecycle models are `MODEL_ONLY`, even when passing.
 An implementation is `OFFLINE_VERIFIED` only for its explicitly tested semantics.
+
+## Category 1 implementation record
+
+Category 1 was the only live authorization used in this campaign. The following
+implementation and validations occurred; they are not real kernel/runtime
+acceptance:
+
+- Added a minimal libc `syscall()` transport in the separate ABI crate for only
+  `GETQUOTA` and `GETINFO`, with fixed syscall number 443, unsigned arguments,
+  fixed GETINFO ID zero, initialized 8-byte-aligned output and immediate errno
+  capture. Unsafe declarations/calls are confined to the ABI transport module;
+  the native validator still forbids unsafe and does not depend on or call it.
+- Added deterministic internal dispatcher tests for exact fd/command/id/size,
+  raw status, malformed size and invalid decoded evidence. Unit-test calls to the
+  public real entrypoint panic before dispatch. The integration link smoke test
+  takes the function address only; it does not call it. No test or command issued
+  a quota syscall.
+- Focused independent ABI boundary review found no significant remaining issue.
+  Its initial documentation finding was corrected. No independent kernel/privilege
+  acceptance was performed.
+- Mount handoff feasibility checked from installed Podman 5.7.0 documentation and
+  package state only. The docs describe pathname bind sources and FD passthrough
+  into the workload; `crun` is absent. This does not establish descriptor-bound
+  mount source resolution, so the runtime branch remains blocked, fail-closed.
+- SQLite evidence: CPython 3.12.11 reports SQLite 3.46.1; `_sqlite3` has ELF NEEDED
+  `libsqlite3.so.0`. The resolved system library is 3.46.1-9ubuntu0.3, SHA-256
+  `4633a4be13fdf05cb0f859e04fb06077a1fe30a90e405721a23873bd1f3d88a8`; current
+  `_sqlite3` extension SHA-256 is
+  `8a8ac76ba4d4a8652ccd316ec77fb778756d9f45fea6ea8fb8b88239d0e8f76a`.
+  The installed header exposes 18 `sqlite3_io_methods` callbacks and 16 VFS
+  callbacks. Python registry source depends on Connection execute/executescript,
+  row factory, transaction state/context, commit/rollback/close; Cursor iteration,
+  fetchone/fetchall, rowcount; `sqlite3.Row` name/index behavior; and sqlite3
+  exception subclasses. Existing durability uses WAL, synchronous=FULL,
+  `wal_checkpoint(TRUNCATE)`, sidecar identity checks, sealing and a dirty marker.
+  No VFS implementation exists to demonstrate that the complete callback set,
+  WAL/SHM locking/mapping, Python API, transaction or crash-durability semantics
+  are preserved. Therefore the Python registry adapter was **not changed**.
+- An attempted standalone direct-child owner prototype was removed after review
+  identified abandonment and stale-identity weaknesses. The existing tested
+  sticky terminal latch and test-only ownership model remain; no unsafe or
+  inadequately owned process supervisor was retained.
+- Newly executed ABI checks: 25 unit tests, 1 installed-header C integration,
+  1 non-invoking transport link integration, 15 compile-fail doctests; locked
+  offline debug/release builds, formatting, warnings-denied Clippy all pass.
+- Newly executed native checks after removal of the rejected prototype: 51 unit
+  tests, 1 non-test unavailable integration, 8 compile-fail doctests; locked
+  offline debug/release builds, formatting and warnings-denied Clippy pass.
+- The existing Python/Broker suites were not rerun because no Python registry,
+  Broker/runtime source or behavior was changed. Historical suite results above
+  remain historical.
+
+Category 1 has not achieved full Stage A: real trusted inventory acquisition,
+complete filesystem/project identity acquisition, physical supervisor across
+Broker/supervisor death, VFS implementation, and runtime storage/mount evidence
+remain blocked. A compiled low-level syscall transport alone grants no observation
+authority. All 13 acceptance rows and production refusals remain intact.
+
+## Remaining separately approved categories
+
+Only Category 1 has been authorized. The following boundaries remain distinct:
+
+| Category | Exact scope still requiring explicit approval |
+|---|---|
+| 2 - VM preparation | Operator-selected hypervisor and exact VM UUID; pinned guest image/kernel/toolchain/snapshot; 4-vCPU/8-GiB-RAM planning default; bounded 16-GiB OS disk; exact newly attached 32-GiB scratch-device serial; destructive format/mount/quota/project/inheritance setup; guest-only identities, subordinate IDs, cgroup/seccomp/LSM/service configuration; pinned artifacts/media and no implicit downloads; independent host/hypervisor supervision; exact cleanup/revert and evidence manifest. No lab/host target. |
+| 3 - Read-only kernel qualification | Exact prepared VM/boot/device/inventory manifest; only fixed descriptor-bound GETINFO(id=0), GETQUOTA(registered project IDs), and enumerated read-only identity/configuration reads; helper UID/capability allowlist, deadlines and outputs; no quota writes, filesystem formatting/mount setup, exhaustion or container execution. |
+| 4 - Destructive enforcement | Exact C-qualified scratch project domains; bounded byte/inode/concurrent/existing-file writers, explicit quota/configuration mutations, drift/failure scenarios, independent evidence and VM snapshot restore. Scratch-only destruction; no host/OS/lab files. |
+| 5 - Real runtime/VFS acceptance | Exact approved VM, kernel, one rootless runtime and pinned image; SQLite/VFS transactions, WAL/SHM/checkpoint/crash, source-identity handoff, all writable runtime domains, exact task-owned lifecycle/containment and bounded failure tests. Requires successful prerequisites and new approval; no runtime-wide cleanup, network dependency installs, model commands or 13F-B. |
+| 6 - Production deployment | Future exact host, package/configuration/enablement operations, privileges, backup/rollback, external supervision, independent full-row A.5 review and separate enablement decision. No production target or command is currently selected or authorized. |
+
+Category 2 cannot be approved against unresolved placeholders. Its manifest must
+name the exact VM UUID, snapshot and guest boot, source-image digest, scratch
+block serial, package/artifact digests, mount and filesystem parameters,
+identities/capabilities, configuration changes, resource/output/deadline caps,
+independent supervisor and recovery destination. The prepared filesystem must
+demonstrate at least 15.75 GiB and 241,664 free inodes while preserving the
+7.5-GiB entitlement ceiling, 8-GiB continuous reserve and 256-MiB allowance;
+128 GiB remains the absolute future allocation ceiling. Nominal disk size is not
+usable-capacity evidence. Preparation approval does not authorize Categories 3-6.
 
 ## Executed baseline (not final evidence)
 

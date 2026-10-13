@@ -1,6 +1,8 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
-//! Pure, untrusted Linux quota ABI decoding. No transport or syscall invoker exists.
+//! Untrusted Linux quota ABI decoding plus a narrow callable `quotactl_fd`
+//! transport helper (`invoke_quotactl_fd`) for `GETQUOTA`/`GETINFO` only.
+//! Successful transport/decode output is never trusted authority evidence.
 //!
 //! Unsupported commands and synthetic transports are not public APIs:
 //! ```compile_fail
@@ -13,9 +15,6 @@
 //! ```
 //! ```compile_fail
 //! use quota_inspector_abi::tests::FakeTransport;
-//! ```
-//! ```compile_fail
-//! use quota_inspector_abi::invoke_quotactl_fd;
 //! ```
 //! ```compile_fail
 //! use quota_inspector_abi::ProjectId;
@@ -51,6 +50,9 @@
 //! ```compile_fail
 //! use quota_inspector_abi::ioctl;
 //! ```
+//! ```compile_fail
+//! use quota_inspector_abi::KernelDispatcher;
+//! ```
 //! An acquisition cannot outlive its descriptor owner:
 //! ```compile_fail
 //! use std::os::fd::AsFd;
@@ -81,6 +83,7 @@ mod decode;
 mod error;
 mod layout;
 mod target;
+mod transport;
 
 pub use acquisition::{
     Acquisition, AcquisitionError, DecodedCandidate, KernelSignature, OutputBuffer, ReportedStatus,
@@ -90,6 +93,7 @@ pub use decode::{ByteLimit, InfoCandidate, InodeLimit, QuotaCandidate};
 pub use error::{AbiError, ErrnoClass, classify_errno};
 pub use layout::{InfoRecord, QuotaRecord};
 pub use target::{SUPPORTED_TARGET, SYSCALL_NUMBER};
+pub use transport::invoke_quotactl_fd;
 
 #[cfg(test)]
 mod tests;

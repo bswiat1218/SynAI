@@ -5,7 +5,8 @@ use crate::{
     classify_errno,
 };
 
-/// Calling-convention shape only: no FFI declaration or function with this body exists.
+/// Compile-time C calling-convention shape only; this is not used by the
+/// `syscall`-based transport entrypoint.
 pub type KernelSignature = extern "C" fn(u32, u32, u32, *mut std::ffi::c_void) -> std::ffi::c_long;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

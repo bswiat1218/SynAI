@@ -3,6 +3,7 @@ use std::os::fd::OwnedFd;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::{Arc, Weak};
 
+use crate::transport::{KernelDispatcher, invoke_quotactl_fd_with};
 use crate::*;
 
 fn quota_bytes() -> [u8; 72] {
@@ -594,4 +595,115 @@ fn acquisition_kind_and_reported_failure_gate_untrusted_decoding() {
             Err(AcquisitionError::OutputKind)
         );
     }
+}
+
+struct DispatcherReply {
+    status: Result<ReportedStatus, AcquisitionError>,
+    output: Vec<u8>,
+}
+
+struct RecordingDispatcher {
+    replies: Vec<DispatcherReply>,
+    calls: Vec<(u32, u32, u32, usize)>,
+}
+
+impl RecordingDispatcher {
+    fn new(replies: Vec<DispatcherReply>) -> Self {
+        Self {
+            replies,
+            calls: Vec::new(),
+        }
+    }
+}
+
+impl KernelDispatcher for RecordingDispatcher {
+    fn invoke(
+        &mut self,
+        fd: u32,
+        command: u32,
+        id: u32,
+        output: &mut [u8],
+    ) -> Result<ReportedStatus, AcquisitionError> {
+        self.calls.push((fd, command, id, output.len()));
+        let reply = self.replies.remove(0);
+        if output.len() != reply.output.len() {
+            return Err(AcquisitionError::OutputKind);
+        }
+        output.copy_from_slice(&reply.output);
+        reply.status
+    }
+}
+
+#[test]
+fn invoke_transport_binds_exact_fd_command_id_and_output_size() {
+    let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let project = ProjectId::new(4242).unwrap();
+    let quota = Acquisition::new(file.as_fd(), ReadCommand::GetQuota(project));
+    let mut dispatcher = RecordingDispatcher::new(vec![DispatcherReply {
+        status: ReportedStatus::from_libc(0, 0),
+        output: quota_bytes().to_vec(),
+    }]);
+    let quota_candidate = invoke_quotactl_fd_with(&quota, &mut dispatcher).unwrap();
+    assert!(matches!(quota_candidate, DecodedCandidate::Quota(_)));
+    let expected_fd = u32::try_from(file.as_raw_fd()).unwrap();
+    assert_eq!(
+        dispatcher.calls,
+        vec![(expected_fd, 0x80000702, project.value(), 72)]
+    );
+
+    let info = Acquisition::new(file.as_fd(), ReadCommand::GetInfo);
+    let mut dispatcher = RecordingDispatcher::new(vec![DispatcherReply {
+        status: ReportedStatus::from_libc(0, 0),
+        output: info_bytes().to_vec(),
+    }]);
+    let info_candidate = invoke_quotactl_fd_with(&info, &mut dispatcher).unwrap();
+    assert!(matches!(info_candidate, DecodedCandidate::Info(_)));
+    assert_eq!(dispatcher.calls, vec![(expected_fd, 0x80000502, 0, 24)]);
+}
+
+#[test]
+fn invoke_transport_fails_closed_on_status_output_and_decode_errors() {
+    let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let acquisition = Acquisition::new(
+        file.as_fd(),
+        ReadCommand::GetQuota(ProjectId::new(4242).unwrap()),
+    );
+
+    let mut dispatcher = RecordingDispatcher::new(vec![DispatcherReply {
+        status: ReportedStatus::from_libc(-1, 38),
+        output: quota_bytes().to_vec(),
+    }]);
+    assert_eq!(
+        invoke_quotactl_fd_with(&acquisition, &mut dispatcher),
+        Err(AcquisitionError::Errno(ErrnoClass::UnsupportedInterface))
+    );
+
+    let mut dispatcher = RecordingDispatcher::new(vec![DispatcherReply {
+        status: ReportedStatus::from_libc(0, 0),
+        output: vec![0; 71],
+    }]);
+    assert_eq!(
+        invoke_quotactl_fd_with(&acquisition, &mut dispatcher),
+        Err(AcquisitionError::OutputKind)
+    );
+
+    let mut dispatcher = RecordingDispatcher::new(vec![DispatcherReply {
+        status: ReportedStatus::from_libc(0, 0),
+        output: vec![0; 72],
+    }]);
+    assert_eq!(
+        invoke_quotactl_fd_with(&acquisition, &mut dispatcher),
+        Err(AcquisitionError::Decode(AbiError::MissingValidity))
+    );
+}
+
+#[test]
+#[should_panic(expected = "real quotactl_fd transport is disabled in tests")]
+fn real_transport_entrypoint_never_dispatches_from_unit_tests() {
+    let file = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
+    let acquisition = Acquisition::new(
+        file.as_fd(),
+        ReadCommand::GetQuota(ProjectId::new(4242).unwrap()),
+    );
+    let _ = invoke_quotactl_fd(&acquisition);
 }

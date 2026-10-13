@@ -1,19 +1,26 @@
 # Offline Linux project-quota ABI contract
 
-Phase 13F-A.5.1c.2 is a **library-only, dependency-free, pure transformation**
-prototype. Both this crate and the [native validator](../quota-inspector-native/README.md)
-forbid unsafe code. There is no FFI declaration, syscall wrapper, transport API,
-feature, environment switch, executable, daemon, listener or production wiring.
-The native validator does not depend on this crate and still returns unavailable.
-No successful decode is a storage observation or authorization.
+Phase 13F-A.5 category-1 integration now includes a minimal callable
+`quotactl_fd` transport boundary in this crate. The transport is intentionally
+narrow (`GETQUOTA`/`GETINFO` only), target-locked and isolated from the safe
+validator library. It is **not wired** into normal native inspection or Broker
+readiness paths. The [native validator](../quota-inspector-native/README.md)
+still returns unavailable in non-test flows. No successful decode is a storage
+observation or authorization.
+
+`invoke_quotactl_fd` executes a real query when called by a non-test build; it
+must not be used by ordinary tests or production readiness until later gates
+pass. Unit tests deliberately panic before dispatch if that entry point is
+called. An integration smoke test takes its function address to force linking
+but never invokes it. All result values remain untrusted candidates.
 
 The [acquisition contract](src/acquisition.rs) borrows an owned descriptor and
 binds the typed command to a fixed initialized output kind. It does not qualify
-the FD, its project assignment or its owner. Its signature alias is a compile-only
-type shape, not an FFI declaration, symbol or callable real wrapper; kernel entry
-register conventions are not established by an `extern "C"` function type.
-There is no address-taking or registration path. Future invocation still requires
-separate authorization and ABI review.
+the FD, its project assignment or its owner. The callable transport
+([transport.rs](src/transport.rs)) uses the exact syscall number/type contract
+and returns only untrusted decoded candidates. It does not register a service,
+create a daemon, expose arbitrary commands or bypass separate authorization for
+real kernel/runtime qualification.
 
 Caller-reported status distinguishes Linux raw negative errno (-1 through -4095)
 from GNU libc's -1/positive errno convention. Only zero is success; malformed
@@ -59,8 +66,8 @@ never a signed shift or truncating cast. `ProjectId` accepts 1 through
 `u32::MAX - 1`: zero is deliberately excluded by this prototype's positive-project
 contract, and all-ones is the kernel invalid-project sentinel. Representability
 does not establish namespace mapping or approved inventory assignment.
-No raw-command constructor/transport exists. Setters, quota on/off, sync,
-enumeration, GETFMT, ioctl, legacy quotactl, paths/devices and shell fallback are
+No raw-command constructor exists. Setters, quota on/off, sync, enumeration,
+GETFMT, ioctl, legacy quotactl fallback, paths/devices and shell fallback are
 unrepresentable as commands in this API.
 
 The `repr(C)` records have private fields, safe initialized defaults and fixed,
@@ -113,12 +120,13 @@ including invalid zero/negative inputs; they do not become success.
 
 ## Future descriptor and physical-completion contract
 
-There is **no production adapter** in this crate. A future separately approved
-adapter must accept only an already-approved owned filesystem descriptor, never
-a path or block device. Descriptor kind, flags, identity and namespace/project
-mapping must be qualified independently before and after acquisition.
-The existing native validator's sealed inventory-bound adapter contract remains
-the authority boundary; candidates cannot construct its private successful result.
+The callable transport is a low-level ABI helper, not a production adapter.
+Any separately approved adapter must accept only an already-approved owned
+filesystem descriptor, never a path or block device. Descriptor kind, flags,
+identity and namespace/project mapping must be qualified independently before
+and after acquisition. The existing native validator's sealed inventory-bound
+adapter contract remains the authority boundary; candidates cannot construct
+its private successful result.
 
 Authority outcome, physical work and descriptor ownership must stay separate:
 
