@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -138,6 +138,38 @@ fn binding(policy: &CandidateInventory, role: &str) -> BoundRequest {
         .unwrap(),
     )
     .unwrap()
+}
+
+fn acquired_inventory(policy: &CandidateInventory) -> (AcquiredInventory, PathBuf) {
+    let directory = std::env::temp_dir().join(format!(
+        "synai-acquired-policy-{}-{}",
+        std::process::id(),
+        NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("inventory.json"))
+        .unwrap();
+    std::io::Write::write_all(&mut file, &serde_json::to_vec(&document()).unwrap()).unwrap();
+    drop(file);
+    let metadata = std::fs::metadata(&directory).unwrap();
+    let acquired = AcquiredInventory::load_test_root(
+        &directory,
+        metadata.uid(),
+        metadata.gid(),
+        0o700,
+        0o600,
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    assert_eq!(acquired.policy().policy_digest(), policy.policy_digest());
+    (acquired, directory)
 }
 
 type JobLease = Arc<Mutex<Option<Arc<DescriptorSet>>>>;
@@ -1180,6 +1212,62 @@ fn blocked_query_cancellation_retains_owned_descriptors_until_confirmed_completi
 }
 
 #[test]
+fn acquired_inventory_descriptor_is_retained_by_the_worker_lease_until_reaped() {
+    let policy = policy();
+    let request = binding(&policy, "state");
+    let (acquired, source_directory) = acquired_inventory(&policy);
+    let source_fd = acquired.source_fd().as_raw_fd();
+    let worker_job = Arc::new(Mutex::new(None));
+    let mut backend = FakeBackend::new(&policy, "state");
+    backend.pending = true;
+    backend.job = Arc::clone(&worker_job);
+    let mut controller = crate::observation::Controller { active: None };
+    let budget = ObservationBudget::new(MAX_OPERATION_TIME).unwrap();
+
+    let first = controller.inspect_acquired(acquired, &request, budget, backend);
+    assert!(matches!(
+        first.outcome(),
+        Outcome::Failed(Failure::Unavailable(Unavailable::Blocked))
+    ));
+    let lease = worker_job.lock().unwrap().as_ref().unwrap().clone();
+    assert!(lease._source_inventory.is_some());
+    assert!(std::fs::metadata(format!("/proc/self/fd/{source_fd}")).is_ok());
+    std::fs::remove_file(source_directory.join("inventory.json")).unwrap();
+    std::fs::remove_dir(&source_directory).unwrap();
+
+    controller.cancel();
+    let pending = controller.poll().unwrap();
+    assert!(matches!(
+        pending.outcome(),
+        Outcome::Failed(Failure::Unavailable(Unavailable::Cancelled))
+    ));
+    drop(controller);
+    assert!(std::fs::metadata(format!("/proc/self/fd/{source_fd}")).is_ok());
+
+    worker_job.lock().unwrap().take();
+    drop(lease);
+    assert!(std::fs::metadata(format!("/proc/self/fd/{source_fd}")).is_err());
+}
+
+#[test]
+fn acquired_inventory_handoff_rejects_a_policy_digest_mismatch() {
+    let policy = policy();
+    let (acquired, source_directory) = acquired_inventory(&policy);
+    let mut changed = document();
+    changed["root"]["mode"] = json!(0o700);
+    let changed_policy = candidate(&changed).unwrap();
+    assert_eq!(changed_policy.generation(), policy.generation());
+    assert_ne!(changed_policy.policy_digest(), policy.policy_digest());
+    assert_eq!(
+        acquired.validate_binding(&changed_policy),
+        Err(Failure::Inconsistent(Inconsistent::InventoryBinding)),
+    );
+    drop(acquired);
+    std::fs::remove_file(source_directory.join("inventory.json")).unwrap();
+    std::fs::remove_dir(&source_directory).unwrap();
+}
+
+#[test]
 fn blocked_query_expiry_and_unresolved_ownership_do_not_claim_completion() {
     let policy = policy();
     let mut backend = FakeBackend::new(&policy, "state");
@@ -1522,6 +1610,7 @@ fn unavailable_adapter_refuses_even_with_test_attested_policy_and_owned_descript
         nodes: vec![],
         role_index: 0,
         file_indices: vec![],
+        _source_inventory: None,
     });
     assert!(matches!(
         unavailable.read_project_quota(fake.disposable.file.as_fd(), fake.project, lease),

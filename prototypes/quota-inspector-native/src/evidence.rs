@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::inventory::{CandidateInventory, FilesystemIdentity, NamespaceId};
+use crate::source::AcquiredInventory;
 use crate::{Failure, Unavailable};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +183,7 @@ pub(crate) struct DescriptorSet {
     pub nodes: Vec<PinnedDescriptor>,
     pub role_index: usize,
     pub file_indices: Vec<usize>,
+    pub(crate) _source_inventory: Option<AcquiredInventory>,
 }
 
 #[cfg_attr(

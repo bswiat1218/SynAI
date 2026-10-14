@@ -72,6 +72,17 @@ The sample [test policy](../../tests/fixtures/quota_inspector_native/inventory.j
 contains synthetic paths and metadata, **not observations or trusted authority**.
 It is included only in test binaries, never the native library.
 
+The configured loader now transfers the acquired inventory into the sealed
+inspection. Its pinned source descriptor is retained inside the shared
+`DescriptorSet` lease passed to asynchronous quota work, so cancelling or
+dropping the request-side inspection cannot close that source while a worker
+still owns the lease. Handoff rechecks the parsed policy digest, generation and
+pinned file identity. The disposable test demonstrates retention through
+cancellation and releases the descriptor only when the worker lease is
+released. This is a lifetime guarantee, not source authentication against an
+actor with the same trusted owner identity. The non-test backend remains
+unavailable and cannot issue a trusted observation.
+
 ## Descriptor-backed pipeline
 
 [Evidence types](./src/evidence.rs) model owned `OwnedFd` handles, namespace-local

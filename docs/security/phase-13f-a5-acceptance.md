@@ -51,16 +51,16 @@ NO-GO/acceptance requirements. See the
 | Requirement | Existing implementation reused | Offline status / remaining work | Independently required live evidence | Production blocker |
 |---|---|---|---|---|
 | Native quota / ABI | [ABI](../../prototypes/quota-inspector-abi/README.md), sealed native read-only adapter | CATEGORY1_CODE: isolated callable typed x86_64 `quotactl_fd` wrapper; deterministic dispatch tests and non-invoking link test; no production wiring | Separately approved GETQUOTA/GETINFO against qualified descriptors/kernel and independently trusted evidence | Native backend unavailable |
-| Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | Implemented fixed-path `/etc/synai/quota-inspector/inventory.json` loader using safe `openat2` descriptor-relative access; requires root-owned, non-writable ancestry, fixed owner/group/mode, single-link bounded regular file, before/after/reopen identity match, bounded parse, per-call freshness. Returns only candidate plus pinned source FD; disposable-root test seam is cfg(test) only | Operator-protected installation, actual path/ancestry ownership, deployment source lifecycle; separately acquired filesystem UUID/mount/namespace and project evidence | Native inspection and trusted attestation remain unavailable |
+| Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | OFFLINE_VERIFIED loader-to-validator handoff: fixed-path `/etc/synai/quota-inspector/inventory.json` acquisition uses safe `openat2`, validates root-owned non-writable ancestry, exact source owner/mode, bounded single-link regular file, pre/post/reopen identity and per-request freshness. Handoff binds full policy digest and generation; source `OwnedFd` moves into the shared worker descriptor lease and is retained through cancellation until confirmed worker completion/reap. Disposable-root seam is cfg(test) only. This does not authenticate against a same-owner adversary. | Operator-protected installation, actual path/ancestry ownership and deployment source lifecycle; independently acquired filesystem UUID/mount/namespace and project evidence | Native inspection and trusted attestation remain unavailable; source loader only yields a candidate |
 | Descriptor/mount/namespace/UUID | Native owned descriptors/pre/post checks; Broker Directory/openat2 | Broker path-resolution checks exist; source loader pins only the fixed policy file. It does not acquire storage-root descriptors or assert filesystem UUID/mount/namespace/project identity | Qualified storage FD/namespace correspondence, project identity, replacement/remount detection | Native filesystem identity acquisition unavailable |
 | Existing-file charging | Native listed-file checks; Broker bounded recursive per-file verification | Existing tests reused; acquisition/traversal contract below; no redundant native enumerator | Actual project attributes/charging of all existing files | Kernel charging not accepted |
 | Configuration / write denial | Checked counters, explicit configuration state, exact caps | Decoder reused; acceptance-test campaign specified below, not executed | Independent active enforcement and separately approved destructive sparse/concurrent byte/inode exhaustion | No empirical enforcement evidence |
-| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | OFFLINE_PROTOTYPE: same-engine CPython registration; descriptor-relative DB/journal/WAL/SHM, OFD locks, multiple connections/processes, transactions, checkpoints, replacement refusal and process-crash recovery pass 19 tests. Independent review confirms unresolved check/use and same-UID mutation race risks, including mapped-SHM truncation/SIGBUS. No Python registry adapter or production activation | Full registry callback/transaction compatibility, independently protected custody, live filesystem identity/quota charging, power-loss durability and broader failure injection | Prototype is custody-dependent only; production-grade hostile-mutation containment and registry compatibility remain unaccepted |
+| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | OFFLINE_PROTOTYPE only: same-engine CPython registration; descriptor-relative DB/journal/WAL/SHM, OFD locks, multiple connections/processes, transactions, checkpoints and process-crash recovery. Independent review confirms a HIGH-severity authority-boundary defect under hostile same-UID access: name replacement races and direct DB/SHM mutation/truncation (including possible SIGBUS) are not blocked by inode checks or OFD locks. No VFS code check can constrain a process with the same filesystem authority. Prototype remains disconnected; no production adapter. Smallest target is the same pinned SQLite/VFS inside an independently protected registry-owner process, with domain-specific authenticated Broker IPC and exclusive owner access; the actual owner UID/MAC boundary must be independently enforced before any use. | OS-enforced distinct non-login owner identity and protected ancestry/ACL/mount custody; complete owner-side registry RPC preserving schema/transaction/replay/recovery behavior; hostile Broker/task cannot write/open/truncate DB/WAL/SHM; power-loss, callback/concurrency, filesystem identity and quota evidence | NO-GO until identity separation is actually provisioned and independently verified; ordinary SQLite or extra VFS checks under a shared UID do not remediate |
 | Runtime workspace source and rootfs identity | Descriptor/allocation checks and unconditional refusal | OFFLINE_VERIFIED for tested importer/exporter semantics: exact snapshot/project/task/snapshot-digest/lease-generation provenance; bounded descriptor-relative import into separate immutable and writable trees; private publication only after verification; partial imports remain unpublished; bounded provenance-bearing changed-file artifacts; collection requires durable completion, exact recorded container ownership and verified termination. Fake lifecycle model permits only ordered evidence and never authorizes execution. A distinct live project-generation claim is not supplied by the current snapshot contract. Podman 5.7.0 manuals leave created-state `cp` and pre-start rootfs continuity unproven. See [workspace design](phase-13f-a5-workspace-architecture-decision.md) | Authenticated source snapshot and generation freshness at real authority boundary; created-but-never-started copy semantics; independently observed container-rootfs identity, upper/work and all writable-domain quota attribution; identity continuity through start; real termination and bounded export | Runtime launch refusal remains; fake adapter evidence is never sufficient; any identity/storage uncertainty is NO-GO |
 | Podman storage | Strict TOML/digests/environment/report/layer/path policy | Existing parsers/rejections reused; offline design requires per-task graph/run roots or equivalently proved isolation, project quota ID/inheritance, and accounting for every writable path. No runtime invocation or storage reconfiguration authorized | Version-qualified graph/run/overlay/layer/scratch/tmpfs/log/config observer; actual filesystem UUID/mount/project-ID/inheritance and byte/inode quota enforcement | runtime_storage_acceptance_pending; shared/unattributed writable storage is NO-GO |
 | Aggregate storage | Unique domain accounting, remaining entitlement, watchdog reserves | Existing exact-threshold/domain/remaining-entitlement tests reused unchanged | Continuous observed capacity under complete workload and metadata pressure | Trusted live capacity/enforcement missing |
 | Exact containment | Exact record/ID/image/labels; inspect/stop/kill/inspect/absence; single-flight | Existing event-order/failed persistence/single-flight/recovery tests reused unchanged | Independently verified exact-ID stop/absence and preserved state on failure | Runtime unavailable; unresolved is not stopped |
-| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | Broker child cleanup refuses handles outside its owned-child set; ordinary child kill/reap, foreign handle and same-PID/different-instance refusal, unknown child after supervisor-instance restart, late spawn and interrupted cleanup are exercised. Native `WorkerLease` remains a test-only model; no restart-durable ownership exists | Independent supervisor, exact process identity across restart/reboot, physical completion/reaping/cleanup and retained ownership across Broker failure; ordinary child reaping does not prove uninterruptible-work completion | Adapter completion promise and crash-surviving ownership not qualified |
+| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | Broker child cleanup refuses handles outside its owned-child set; ordinary child kill/reap, foreign handle and same-PID/different-instance refusal, unknown child after supervisor-instance restart, late spawn and interrupted cleanup are exercised. Native `WorkerLease` remains a test-only model. Inventory source `OwnedFd` now follows the descriptor-set lease retained by async worker ownership through request cancellation; a new test verifies it remains open until the worker lease releases it. No restart-durable ownership exists. | Independent supervisor, exact process identity across restart/reboot, physical completion/reaping/cleanup and retained ownership across Broker failure; ordinary child reaping does not prove uninterruptible-work completion | Adapter completion promise and crash-surviving ownership not qualified |
 | Privilege/confinement | Broker zero-effective-capability/identity checks, restricted arguments | MODEL_ONLY: untrusted effective-capability/identity/groups/no-new-privileges/seccomp/LSM requirements and negative checks | Dedicated identities; reviewed helper permissions, seccomp/LSM and deployed effective state | Helper/deployment confinement unaccepted |
 | Broker authorization/readiness | Claims/leases/fencing/replay, registry/seals/quarantine/watchdog | Existing F1-F5/R1-R6/C1-1 reused; no production Broker code or gate changes | All preceding gates plus independent security acceptance | All existing refusals preserved |
 
@@ -157,14 +157,39 @@ established by loading the extension through CPython and then opening separate
 CPython connections with the registered VFS—not by matching version strings.
 The Python registry adapter, schema and durable ledger remain unchanged.
 
-This does **not** establish race-free containment against malicious same-UID
-mutation. Name checks and descriptor-relative `openat`/`unlinkat` are not atomic;
-a same-UID process can replace entries between checks or directly truncate a
-mapped SHM file (including causing `SIGBUS`). The prototype is custody-dependent
-test evidence, not production-grade authority. Readonly WAL, disk temporary
-files, multi-database super-journals, full Python registry compatibility,
-power-loss durability and exhaustive failure injection remain unqualified.
-See the prototype README for exact boundaries.
+Independent security review confirmed a **HIGH** authority-boundary defect
+against a hostile same-UID process. The C code checks inode identities between
+operations, but those checks cannot prevent concurrent namespace replacement,
+same-inode writes, or direct SHM truncation. Because SQLite later dereferences
+its `MAP_SHARED` SHM pointers without VFS callbacks, external truncation can
+cause `SIGBUS`; additional callback checks or a different C/Rust implementation
+cannot make that asynchronous mutation safe. The existing tests demonstrate
+between-operation detection, not atomic prevention.
+
+The narrowest architecture preserving this prototype is: keep one pinned
+CPython SQLite engine and its registered dirfd VFS in an exclusive registry
+owner process; place all registry files and sidecars beneath an owner-only,
+operator-protected directory; ensure Broker, Core and tasks have no write/open-
+for-write/truncate authority; and expose only bounded domain RPCs over an
+authenticated Unix socket. Keep schema, one durable ledger, transaction
+boundaries, replay checks, seals, WAL/SHM locking, checkpoint and recovery inside
+that owner. Do not expose SQL, connection objects, or writable descriptors.
+The existing storage-inspector socket framing/peer-credential code is protocol
+prior art, not an existing registry service.
+
+**Current status is NO-GO, not remediated.** No code-level VFS patch can secure
+the database while a hostile same-UID writer remains. A second process sharing
+that UID is not separation. Implementing a local socket model now would not
+prove the required OS identity boundary and would add a competing partial
+registry authority; therefore no such service or production adapter was
+created. Actual non-login owner identity, protected ancestry/ACL/mounts and
+Broker/task denial must be provisioned and independently verified inside the
+approved VM before any owner RPC or VFS can be used. If that separation cannot
+be enforced, the minimum alternative is a separately protected storage-owner
+service with the same narrow domain API, not a weaker VFS check. Full Python
+registry compatibility, callback/concurrency, power-loss durability and
+exhaustive failure injection remain acceptance requirements. See the prototype
+README for exact VFS behavior.
 
 ### Protected inventory acquisition
 
@@ -174,12 +199,18 @@ non-writable ancestry and exact configured root/file ownership and modes, checks
 regular-file/single-link/size bounds, reads via the pinned FD, compares
 before/after and path-reopened identity, checks request freshness, and parses
 the immutable policy candidate. A descriptor remains retained in the result.
-Only the unit-test build accepts a disposable root. `NativeInspector` now has a
-configured-source entry point but still routes through the existing sealed
-validator; the non-test backend remains unavailable, so the loader cannot
-produce a `TrustedInventory`, query quotas, or publish success. The source
-loader authenticates the inventory file only; it does not establish storage
-filesystem identity, namespace/mount correspondence or project attributes.
+Only the unit-test build accepts a disposable root. `inspect_configured` now
+transfers the acquired candidate into the existing sealed validator, which
+rechecks policy digest, inventory generation and pinned source identity. The
+source `OwnedFd` is then part of the shared `DescriptorSet` lease passed to
+pending quota work; a request cancellation or owner drop does not release it
+until the worker releases that lease after completion/reap. A new unprivileged
+test unlinks the source after handoff and verifies the descriptor stays open
+through cancellation and closes only after the worker lease is dropped. The
+non-test backend remains unavailable, so the loader cannot produce a trusted
+observation, query quotas, or publish success. Source acquisition does not
+establish storage filesystem identity, namespace/mount correspondence or
+project attributes.
 
 ### Physical supervision
 
@@ -362,6 +393,42 @@ through start remain NO-GO. Fake adapters and offline tests do not satisfy those
 acceptance gates. SQLite VFS same-UID replacement and SHM-truncation risks also
 remain unresolved and the prototype remains disconnected from the registry.
 
+### Current offline blocker closure and verification
+
+Baseline for this continuation: HEAD
+`901579cb6fc5710ff0e406209f77d854fe1bf37b`, clean worktree and index. The
+earlier Option B changes were already in this HEAD; they were not rebuilt or
+modified here.
+
+Native handoff change: `inspect_configured` now passes the acquired candidate
+through the existing sealed validation pipeline, checks source/policy
+digest-generation-identity binding, and transfers the source descriptor into
+the shared descriptor lease used by asynchronous query work. Cancellation or
+request-owner drop no longer releases this authority while an owned worker
+retains the lease. The unprivileged regression test confirms the fd survives
+source unlink and cancellation, then closes when the worker lease is released.
+This does not authenticate storage identity or enable the refusal-only native
+backend.
+
+The VFS defect was independently reviewed. No VFS source change can enforce
+same-UID access separation: descriptor checks and OFD locks cannot stop
+non-cooperating writes/truncation or make path check plus `unlinkat` atomic.
+The smallest acceptable VFS-preserving target remains the pinned SQLite engine
+and registered VFS inside an exclusive, independently protected registry owner,
+with narrow domain IPC and all schema/transaction/replay/recovery operations
+kept in that owner. This requires an actual OS identity/MAC boundary and a
+complete Broker-facing registry interface; neither is installed or integrated.
+No same-UID IPC mock was added because it cannot demonstrate that boundary.
+Registry production integration remains NO-GO.
+
+New checks: native Cargo tests 58 unit + 1 production-refusal integration + 8
+compile-fail doctests passed in both debug and release; locked/offline Clippy
+with `-D warnings` and `cargo fmt --check` passed. SQLite VFS `make test`
+rebuilt with GCC `-Wall -Wextra -Werror` and passed all 19 CPython/SQLite tests.
+No C/Python code was changed; native Rust and documentation were updated. No
+Podman, quota syscall, mount, VM or privileged operation was run. Exact VM
+prerequisites and separately approvable campaigns are below.
+
 ## Storage invariants
 
 Hard entitlements7.5GiB /221,184 inodes; continuous reserve8GiB /16,384 inodes;
@@ -416,16 +483,35 @@ No fresh request or restart may release unresolved leases, infer absent work fro
 missing history or accept a recycled PID. The fake model's observations are not
 kernel completion proof. A real supervisor and durable recovery remain separate.
 
-## Consolidated future isolated-VM approval package — NOT AUTHORIZED
+## Consolidated disposable-VM qualification package — NOT AUTHORIZED
 
 ### Prerequisites and target identity
 
-Target VM identity, image digest, kernel/filesystem/runtime versions and storage
-device are **UNSELECTED**. No host or existing quota-lab path is a default target.
-The proposed campaign is non-executable until those exact identities, affected
-paths/resources, backup/disposal procedure and operator approvals are recorded.
-Nominal candidate storage is24/32/64/128GiB, never above128GiB; actual formatted
-usable capacity must satisfy all totals/reserves. No allocation is authorized.
+Planning defaults (not authorization): operator-supplied isolated x86_64 Linux
+guest; 4 vCPUs; 8 GiB RAM; a bounded 16 GiB OS disk; and a separately attached
+32 GiB disposable scratch disk. The two disks total 48 GiB and remain below the
+existing 128 GiB future-allocation ceiling. The scratch filesystem must
+independently demonstrate at least 15.75 GiB usable/free and 241,664 free inodes
+before workload setup, while preserving the 7.5 GiB/221,184-inode project
+entitlement ceiling, continuous 8 GiB/16,384-inode reserve, and 256 MiB/4,096
+inode operational allowance. Raw disk size is not usable-capacity evidence.
+
+Still unselected: host and hypervisor, exact VM UUID, guest OS image and digest,
+kernel/build, boot image, scratch device serial/UUID, filesystem image, package
+and OCI image digests, guest UID/GID assignments, privilege/capability
+requirements, confinement profile, and recovery destination. Do not select the
+host workspace, production state or existing quota lab. No allocation is
+authorized until the operator supplies those exact values and approves Campaign
+1's named operations.
+
+The immutable preflight manifest must bind the VM UUID, host/hypervisor identity,
+guest image and kernel digests, boot ID, vCPU/RAM/disk sizes, scratch device
+serial and device major/minor, filesystem UUID/mount ID, UID/GID map, package
+and image digests, active LSM/seccomp configuration, exact operation plan,
+external supervisor and disposal/revert procedure. The evidence bundle is
+written outside the guest to an operator-selected protected destination and
+hashed after every campaign. Network is disabled by default; no package/image
+pull, build, dependency install, or fallback download is implicit.
 
 A separately approved real read-only quota backend (with independently reviewed
 minimal unsafe invocation if necessary), trusted inventory loader, exact-worker
@@ -433,6 +519,21 @@ supervisor, native VFS and runtime identity/storage observer must exist before
 their corresponding experiments. Current offline contracts are not substitutes.
 Do not remove production gates to perform tests; use the explicitly approved
 isolated qualification harness and retain fail-closed Broker behavior.
+
+### Staged campaigns and explicit boundaries
+
+Each campaign is a separate approval. Approval of VM setup does not authorize
+quota changes, Podman execution, database destruction, or later campaigns.
+
+| Campaign | Prerequisites and permitted operations | Bounded tests and resource limits | Required evidence and GO / NO-GO |
+|---|---|---|---|
+| 1. Provision and confine guest | Operator names exact host/hypervisor/VM UUID, guest image digest, kernel/boot digest, OS/scratch disk identities and revert target. Provision only the isolated guest with 4 vCPU, 8 GiB RAM, 16 GiB OS disk and newly attached 32 GiB scratch disk. Explicitly list any guest-only UID/GID creation, subordinate IDs, package installation, filesystem formatting/mounting, seccomp/LSM/system configuration and image import; none is automatic. | One VM; fixed disks only; no network; pinned local media; no host mounts, shared folders, host sockets, GPU, secrets or production data. No workload container start in this campaign. | Signed target manifest; hypervisor-observed VM/device identities; guest boot/kernel/package digests; effective capabilities, UID maps, cgroups, seccomp/LSM and mounts; external stop/revert proof. NO-GO on any identity mismatch, unpinned media, host-shared writable path, missing external supervision, or actual scratch capacity below policy. |
+| 2. Read-only quota and filesystem identity | Campaign 1 passed; approved storage mounted and inventory installed; separately reviewed x86_64 syscall ABI and minimum privilege. Allow only descriptor-bound `quotactl_fd()` GETINFO(id=0) and GETQUOTA for explicitly listed project IDs, plus enumerated read-only mount/namespace/UUID/device/project-attribute observations. | Inventory <=16 KiB, <=32 roles, <=4 listed existing files per role; one request at a time; <=500 ms native observation budget and <=16 KiB request/response. No quota mutation, enumeration, path fallback, mount setup, or workload. | Raw request/response, errno, validity masks, unit conversions, FD flags/type, FS UUID/device/mount/namespace/project ID/inheritance, inventory digest/generation and privilege trace. Unsupported ABI, missing or stale evidence, unexpected privilege, wrong identity, or incomplete roles = NO-GO. |
+| 3. Quota enforcement and exhaustion | Campaign 2 accepted; exact scratch FS/device, project IDs, ceilings, reserve and revert snapshot are bound; explicit approval for quota enablement/configuration, project attributes, write denial, and disposable data destruction. | Scratch only. Test byte and inode exact-boundary/over-limit, sparse allocation (logical and allocated), existing-file charging, concurrent writers, directory/inode exhaustion, WAL/SHM/log/metadata and reserve pressure. Keep project entitlements <=7.5 GiB/221,184 inodes; reserve >=8 GiB/16,384; allowance 256 MiB/4,096; all aggregate future allocations <=128 GiB. Every writer has a fixed deadline, byte/inode cap and externally recorded PID/start identity; stop at first bound. | Before/after kernel quota, inode, block, free-capacity and project/inheritance evidence; observed denial errno/point; concurrent writer and FD identity traces; snapshot/revert evidence. Any bypass, reserve breach, unexplained accounting, wrong project/domain, unbounded writer, or irreproducible denial = NO-GO. |
+| 4. Podman 5.7.0 created-copy and rootfs continuity | Campaigns 1-3 passed; exact Podman 5.7.0 package/source and storage config digests, rootless identity/subordinate map, pinned local image digest, no-network plan, observer and external supervisor approved. Explicitly authorize container create/copy/start/stop/remove in this isolated VM. | One-at-a-time disposable containers; fixed approved resource profile (1 CPU, 1 GiB RAM, 128 PIDs, 128 MiB task workspace, 300 s wall-clock, 1 MiB output); no network/capabilities/devices/host mounts. Test `podman cp` to a container proven to be created and never started, then independently inspect exact rootfs/workspace object and storage before start; prove object identity remains continuous into actual execution and export. Repeat copy/import, failed copy, interrupted create/start, mount/unmount and restart cases within fixed operation counts. | Podman source/docs trace, exact state transitions, full container ID, before/after FD/fstatfs/mountinfo/overlay upper/work identity, project quota attribution, rootfs content manifest and evidence linking the verified object to the object actually used after start. A successful `podman cp`, CLI status, label, pathname or pre-start `stat` alone is not evidence. If created-state copy is unsupported/ambiguous or continuity cannot be independently proved, stop NO-GO; retain launch refusal. |
+| 5. Writable-domain accounting and rootless isolation | Campaign 4's created/copy/rootfs continuity accepted; complete storage observer and project-quota attribution implemented. | Enumerate every write domain: overlay upper/work, graph/run roots, image-copy scratch, tmpfs, `/tmp`, logs, database state, task/export staging and metadata. Verify rootless/non-root task UID, no added caps, no-new-privileges, seccomp/LSM, no network/host PID/IPC, no sockets or host/Core mounts. Exercise CPU/RAM/PID/time/output/storage ceiling and multi-task pressure. No unapproved dependency installs. | Kernel-observed writable mount table, device/mount/FS UUID/project IDs/inheritance and quota counters tied to exact allocation; cgroup and confinement state; full byte/inode accounting before/during/after; teardown/recovery evidence. Any writable unaccounted path, shared unattributed domain, limit bypass or weak identity = NO-GO. |
+| 6. Registry VFS and WAL/SHM durability | Campaigns 1-3 passed; distinct non-login registry-owner identity and private ancestry independently verified; complete narrow owner-side Broker RPC preserves existing schema, transaction, replay, seal, checkpoint and recovery semantics; VFS memory-safety/concurrency review passed. Keep the same pinned CPython SQLite engine and registered dirfd VFS. | Disposable registry only. Exercise transaction/cursor/row/exception/rollback compatibility, WAL/SHM growth/locks/checkpoints, multiple connections, owner-only writes, denied Broker/task rename/write/truncate/unlink attempts, process crash and VM power-loss/restart recovery, partial fsync and storage exhaustion. A hostile same-UID mutation demonstration is limited to a separate disposable VFS fixture, never the registry; if Broker/task shares the owner UID, stop before database tests. | Owner/Broker UID and peer-credential evidence; proof DB/WAL/SHM cannot be opened for write/truncated by Broker/task; SQLite engine/VFS registration identity; callback, lock, fsync, checkpoint and crash/power-loss traces; ledger/schema digest and recovery review. Any shared write authority, callback uncertainty, corruption, lost commit boundary, missing sidecar evidence or response ambiguity = NO-GO; no registry integration. |
+| 7. Physical worker supervision and restart recovery | Prior applicable campaigns passed; external hypervisor/host supervisor owns the guest; exact worker identity acquisition, bounded monitor, restart log and retained task/descriptor leases reviewed. | One exact worker/task at a time; strict deadline/output/queue cap; ordinary exits, cancellation, injected blocked work, supervisor crash/restart, late spawn, PID reuse, unresolved cleanup and container termination uncertainty. No broad process kill or runtime prune. External supervisor may stop/revert the exact VM if guest work cannot be confirmed. | PID + start ticks + boot/PID namespace/generation, exact cgroup/container IDs, wait/reap/cleanup observations, durable ledger before/after, held lease evidence and external VM stop/revert record. Signal sent, request cancelled, absent PID or mock completion is not completion. Unknown ownership/blocked work/partial cleanup retains quarantine and is NO-GO. |
 
 ### Campaign R — read-only qualification
 
@@ -494,3 +595,37 @@ VFS callback/locking/fsync/crash traces, runtime effective storage/mounted-sourc
 evidence, cleanup/reconciliation results and independent review. Any required
 missing row is NO-GO. Actual-host deployment, Broker enablement and Phase13F-B
 remain separate later approvals even if the isolated campaign succeeds.
+
+### Exact next operator decision
+
+To begin qualification, the operator must first choose and supply the exact
+isolated VM target: host/hypervisor identity and VM UUID (or explicit authority
+to create a new one), guest image/kernel/boot digests, scratch-disk serial,
+capacity and disposal target, evidence destination, and host-side independent
+supervisor. The operator must then explicitly approve **Campaign 1 only**,
+enumerating guest creation, disk attachment, any guest package/media import,
+filesystem formatting/mounting, guest-only identities and confinement changes.
+Until those values and operations are recorded, no provisioning command is
+authorized. Campaigns 2-7 require separate approvals after the preceding
+campaign's evidence is independently reviewed; in particular Campaign 3
+authorizes quota writes/destructive exhaustion, Campaign 4 authorizes rootless
+Podman lifecycle execution, and Campaign 6 authorizes disposable registry
+crash/power-loss tests. No campaign approval implies production Broker
+readiness, Phase 13G application or Phase 13F-B.
+
+### Exact next operator decision
+
+To begin qualification, the operator must first choose and supply the exact
+isolated VM target: host/hypervisor identity and VM UUID (or explicit authority
+to create a new one), guest image/kernel/boot digests, scratch-disk serial,
+capacity and disposal target, evidence destination, and host-side independent
+supervisor. The operator must then explicitly approve **Campaign 1 only**,
+enumerating guest creation, disk attachment, any guest package/media import,
+filesystem formatting/mounting, guest-only identities and confinement changes.
+Until those values and operations are recorded, no provisioning command is
+authorized. Campaigns 2-7 require separate approvals after the preceding
+campaign's evidence is independently reviewed; in particular Campaign 3
+authorizes quota writes/destructive exhaustion, Campaign 4 authorizes rootless
+Podman lifecycle execution, and Campaign 6 authorizes disposable registry
+crash/power-loss tests. No campaign approval implies production Broker
+readiness, Phase 13G application or Phase 13F-B.

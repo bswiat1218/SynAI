@@ -265,13 +265,38 @@ unsupported file classes, and failure `pMethods == NULL`.
   is rejected on extension reinitialization rather than overwriting its dispatch
   pointer. The initial engine's thread-safe configuration is assumed.
 
+## Required authority boundary before registry use
+
+No C-side check can stop an untrusted same-UID writer from mutating the
+database inode, replacing a directory entry between check and `unlinkat`, or
+truncating a live mapped SHM file. The smallest VFS-preserving target is to run
+the one pinned CPython SQLite engine and this registered VFS inside an exclusive
+registry-owner process whose non-login UID and private directory ancestry are
+independently enforced. Broker, Core and task identities must not be able to
+open registry files for write, rename/unlink sidecars, or truncate SHM.
+
+That owner must keep the complete existing registry transaction and recovery
+logic (including schema, replay protection, seals, WAL/checkpoint and durable
+completion) and expose only bounded, authenticated domain operations over a
+protected Unix socket. It must not expose SQL, SQLite connection/cursor objects,
+or writable DB/sidecar descriptors. Socket peer credentials alone are not
+sufficient if another untrusted process can share the Broker UID. The owner
+identity, directory custody, Broker/task denial, and restart recovery must be
+independently verified before any registry integration. If those conditions
+cannot be enforced, stop and use a separately protected storage-owner service;
+do not weaken the same-UID threat model or treat more inode checks as a fix.
+
+No such owner, IPC service, service identity, or production adapter is installed
+or implemented here. The prototype remains disconnected from the production
+registry.
+
 ## Closeout findings relevant to acceptance (matrix unchanged)
 
 Final focused rerun: `make -C prototypes/sqlite-dirfd-vfs test` passed all
-**19 tests**; the implementation translation unit also passed a fresh GCC
-`-fanalyzer` compilation without diagnostics. The previously recorded full
-ASan/UBSan run passed the same 19 tests. No further security implementation is
-planned as part of this offline prototype.
+**19 tests** in the previous implementation milestone; no VFS C code changed
+in the current continuation. The implementation translation unit also passed
+a fresh GCC `-fanalyzer` compilation without diagnostics. The previously
+recorded full ASan/UBSan run passed the same 19 tests.
 
 * **Executable evidence:** shared-engine registration, retained integer-dirfd
   handoff, descriptor-relative DB/journal/WAL/SHM lifecycle, OFD locking, SHM

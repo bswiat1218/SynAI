@@ -8,6 +8,7 @@ use crate::evidence::{
     UnavailableBackend,
 };
 use crate::inventory::{RoleDefinition, hex};
+use crate::source::AcquiredInventory;
 use crate::{
     CandidateInventory, Failure, HardLimits, Inconsistent, MAX_COMPONENTS, MAX_EXISTING_FILES,
     NodeEvidence, NodeType, PinnedDescriptor, ProjectId, QuotaEvidence, QuotaState, SampleTime,
@@ -288,8 +289,8 @@ impl NativeInspector {
             .checked_sub(elapsed)
             .filter(|duration| !duration.is_zero())
             .ok_or(Failure::Unavailable(Unavailable::DeadlineExceeded))?;
-        Ok(self.controller.inspect(
-            acquired.policy(),
+        Ok(self.controller.inspect_acquired(
+            acquired,
             &binding,
             ObservationBudget(remaining),
             UnavailableBackend,
@@ -317,10 +318,37 @@ impl<B: ReadOnlyBackend> Controller<B> {
         budget: ObservationBudget,
         backend: B,
     ) -> InspectionResult {
+        self.inspect_inner(policy, binding, budget, backend, None)
+    }
+
+    pub(crate) fn inspect_acquired(
+        &mut self,
+        acquired: AcquiredInventory,
+        binding: &BoundRequest,
+        budget: ObservationBudget,
+        backend: B,
+    ) -> InspectionResult {
+        let policy = acquired.policy().clone();
+        self.inspect_inner(&policy, binding, budget, backend, Some(acquired))
+    }
+
+    fn inspect_inner(
+        &mut self,
+        policy: &CandidateInventory,
+        binding: &BoundRequest,
+        budget: ObservationBudget,
+        backend: B,
+        acquired: Option<AcquiredInventory>,
+    ) -> InspectionResult {
         if self.active.is_some() {
             return result(binding, Err(Failure::Unavailable(Unavailable::Busy)));
         }
-        let operation = Inspection::begin(policy, binding, budget, backend);
+        let operation = match acquired {
+            Some(source) => {
+                Inspection::begin_with_source(policy, binding, budget, backend, Some(source))
+            }
+            None => Inspection::begin(policy, binding, budget, backend),
+        };
         let mut operation = match operation {
             Ok(operation) => operation,
             Err(error) => return result(binding, Err(error)),
@@ -378,6 +406,7 @@ pub(crate) struct Inspection<B: ReadOnlyBackend> {
     descriptors: Option<Arc<DescriptorSet>>,
     work: AdapterWork,
     terminal_failure: Option<Failure>,
+    source_inventory: Option<AcquiredInventory>,
 }
 
 impl<B: ReadOnlyBackend> Inspection<B> {
@@ -385,12 +414,26 @@ impl<B: ReadOnlyBackend> Inspection<B> {
         policy: &CandidateInventory,
         binding: &BoundRequest,
         budget: ObservationBudget,
-        mut backend: B,
+        backend: B,
+    ) -> Result<Self, Failure> {
+        Self::begin_with_source(policy, binding, budget, backend, None)
+    }
+
+    fn begin_with_source(
+        policy: &CandidateInventory,
+        binding: &BoundRequest,
+        budget: ObservationBudget,
+        backend: B,
+        source_inventory: Option<AcquiredInventory>,
     ) -> Result<Self, Failure> {
         if binding.0.inventory_generation != policy.generation() {
             return Err(Failure::Inconsistent(Inconsistent::InventoryBinding));
         }
+        if let Some(source) = &source_inventory {
+            source.validate_binding(policy)?;
+        }
         policy.role(&binding.0.role_id)?;
+        let mut backend = backend;
         let started = backend.clock();
         let deadline = started
             .monotonic
@@ -416,6 +459,7 @@ impl<B: ReadOnlyBackend> Inspection<B> {
             descriptors: None,
             work: AdapterWork::NotStarted,
             terminal_failure: None,
+            source_inventory,
         };
         operation.check_deadline()?;
         operation.pin()?;
@@ -514,6 +558,7 @@ impl<B: ReadOnlyBackend> Inspection<B> {
             nodes,
             role_index,
             file_indices,
+            _source_inventory: self.source_inventory.take(),
         }));
         self.revalidate()
     }

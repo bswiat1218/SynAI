@@ -233,6 +233,9 @@ pub struct AcquiredInventory {
     policy: CandidateInventory,
     descriptor: OwnedFd,
     source_identity: SourceIdentity,
+    source_uid: u32,
+    source_gid: u32,
+    source_file_mode: u32,
     acquired_at: Duration,
     acquired_unix_seconds: u64,
 }
@@ -298,6 +301,9 @@ impl AcquiredInventory {
             policy,
             descriptor,
             source_identity,
+            source_uid: expected_uid,
+            source_gid: expected_gid,
+            source_file_mode: expected_file_mode,
             acquired_at,
             acquired_unix_seconds: unix_seconds,
         })
@@ -319,6 +325,21 @@ impl AcquiredInventory {
         &self.policy
     }
 
+    pub(crate) fn validate_binding(&self, policy: &CandidateInventory) -> Result<(), Failure> {
+        if self.policy.policy_digest() != policy.policy_digest()
+            || self.policy.generation() != policy.generation()
+            || check_source_file(
+                &self.descriptor,
+                self.source_uid,
+                self.source_gid,
+                self.source_file_mode,
+            )? != self.source_identity
+        {
+            return Err(Failure::Inconsistent(crate::Inconsistent::InventoryBinding));
+        }
+        Ok(())
+    }
+
     pub fn source_identity(&self) -> SourceIdentity {
         self.source_identity
     }
@@ -336,7 +357,7 @@ impl AcquiredInventory {
     }
 
     #[cfg(test)]
-    fn load_test_root(
+    pub(crate) fn load_test_root(
         root: &Path,
         expected_uid: u32,
         expected_gid: u32,
