@@ -17,12 +17,12 @@ from synai.broker.app import _persist_artifact_evidence
 from synai.broker.cli import _PinnedLogHandler
 from synai.broker.filesystem import Directory, mount_identity, open_beneath, read_file, remove_tree, write_new
 from synai.broker.operations import execute_file_operation
-from synai.broker.protocol import BrokerError, sign_claim
+from synai.broker.protocol import BrokerError, canonical_json, sign_claim
 from synai.broker.quota_slots import QuotaSlotManager
 from synai.broker.registry import BrokerRegistry, RegistryTrust
 from synai.broker.runtime import RootlessPodmanRuntime
 from synai.broker.config import BrokerReadiness
-from synai.broker.snapshots import changed_files, stage_snapshot
+from synai.broker.snapshots import SnapshotProvenance, changed_files, stage_snapshot
 from synai.broker.storage_inspector import InspectorInvalid, UnixStorageInspectorClient
 from tests.test_broker import CLAIM_PRIVATE, config, claim
 
@@ -116,14 +116,31 @@ class DescriptorFilesystemTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_partial_snapshot_failure_preserves_evidence_and_never_cleans_foreign_content(self) -> None:
-        manifest = {"files": [{"path": "x", "size_bytes": 1}]}
+        content = b"x"
+        manifest = {
+            "schema_version": 1, "project_id": "2" * 32,
+            "source_device_id": "8" * 32, "workspace_binding_id": "9" * 32,
+            "snapshot_id": "3" * 32, "created_at": 1,
+            "files": [{
+                "path": "x", "file_type": "regular", "size_bytes": 1,
+                "sha256": hashlib.sha256(content).hexdigest(),
+            }],
+            "total_bytes": 1,
+            "source": {"kind": "paired_device", "key_fingerprint": "a" * 64, "protocol_version": 1},
+        }
+        digest = hashlib.sha256(canonical_json(manifest)).hexdigest()
+        provenance = SnapshotProvenance(
+            task_id="1" * 32, project_id=manifest["project_id"],
+            snapshot_id=manifest["snapshot_id"], snapshot_digest=digest,
+            lease_generation=1, import_operation_id="4" * 32,
+        )
         with Directory(self.root) as root, patch(
             "synai.broker.snapshots._stage_file", side_effect=OSError("injected interruption"),
         ):
             with self.assertRaises(OSError):
-                stage_snapshot(root, manifest, {"x": b"x"})
-        self.assertTrue((self.root / "manifest.json").exists())
-        self.assertTrue((self.root / "snapshot").is_dir())
+                stage_snapshot(root, manifest, {"x": content}, provenance)
+        self.assertFalse((self.root / "workspace").exists())
+        self.assertTrue((self.root / f".importing-{provenance.import_operation_id}" / "provenance.json").exists())
 
     def test_cleanup_preflight_preserves_files_if_symlink_is_present(self) -> None:
         (self.root / "owned").write_bytes(b"evidence")

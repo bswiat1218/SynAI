@@ -33,13 +33,17 @@ source authority. No installed source or authoritative interface establishes
 that handoff or independent destination-object verification before workload
 start. The runtime branch remains blocked and fail-closed.
 
-Workspace decision status: the user approved Option B for **offline design
-only**. The design candidate uses Podman copy-in/copy-out with no host-project
-bind mount or Podman-managed workspace volume, and requires independent
-pre-start verification of the actual task rootfs plus complete project-quota
-accounting. It is not implemented or runtime-accepted. The exact Podman
-copy/rootfs lifecycle, mount continuity through start, storage-root isolation,
-and quota attribution remain mandatory GO/NO-GO questions. See the
+Workspace decision status: the user approved Option B as the target for offline
+implementation. Bounded descriptor-backed snapshot import, provenance-bearing
+staging, bounded artifact export, and a fake-only ordered lifecycle model are
+implemented and tested below. No Podman runtime adapter or production
+execution authorization was added. The installed Podman 5.7.0 `cp` manual
+describes running or stopped containers but does not establish support for
+created-but-never-started containers; its `mount` manual returns a path but
+does not establish pre-start-to-start identity continuity or quota attribution.
+No Podman command or container was invoked. Exact copy/rootfs lifecycle,
+storage-root isolation, mount continuity, and quota attribution remain
+NO-GO/acceptance requirements. See the
 [implementation-ready workspace design](phase-13f-a5-workspace-architecture-decision.md).
 
 ## Matrix
@@ -52,7 +56,7 @@ and quota attribution remain mandatory GO/NO-GO questions. See the
 | Existing-file charging | Native listed-file checks; Broker bounded recursive per-file verification | Existing tests reused; acquisition/traversal contract below; no redundant native enumerator | Actual project attributes/charging of all existing files | Kernel charging not accepted |
 | Configuration / write denial | Checked counters, explicit configuration state, exact caps | Decoder reused; acceptance-test campaign specified below, not executed | Independent active enforcement and separately approved destructive sparse/concurrent byte/inode exhaustion | No empirical enforcement evidence |
 | SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | OFFLINE_PROTOTYPE: same-engine CPython registration; descriptor-relative DB/journal/WAL/SHM, OFD locks, multiple connections/processes, transactions, checkpoints, replacement refusal and process-crash recovery pass 19 tests. Independent review confirms unresolved check/use and same-UID mutation race risks, including mapped-SHM truncation/SIGBUS. No Python registry adapter or production activation | Full registry callback/transaction compatibility, independently protected custody, live filesystem identity/quota charging, power-loss durability and broader failure injection | Prototype is custody-dependent only; production-grade hostile-mutation containment and registry compatibility remain unaccepted |
-| Runtime workspace source and rootfs identity | Descriptor/allocation checks and unconditional refusal | Option B approved for offline design only. Candidate: Podman copy-in to a non-running container's fixed `/workspace`, no host project bind or managed workspace volume, followed by descriptor-pinned verification of the actual rootfs/workspace before start; copy-out only after exact termination. Podman copy semantics, runtime pre-start hook/order, and rootfs identity continuity through start are not yet source-verified or implemented. See [workspace design](phase-13f-a5-workspace-architecture-decision.md) | Exact pinned-version import/exposure lifecycle; independent rootfs/workspace mount identity before execution and continuity through start; complete upper/work and writable-domain attribution | Existing launch refusal remains; any unverified mount/path handoff is NO-GO |
+| Runtime workspace source and rootfs identity | Descriptor/allocation checks and unconditional refusal | OFFLINE_VERIFIED for tested importer/exporter semantics: exact snapshot/project/task/snapshot-digest/lease-generation provenance; bounded descriptor-relative import into separate immutable and writable trees; private publication only after verification; partial imports remain unpublished; bounded provenance-bearing changed-file artifacts; collection requires durable completion, exact recorded container ownership and verified termination. Fake lifecycle model permits only ordered evidence and never authorizes execution. A distinct live project-generation claim is not supplied by the current snapshot contract. Podman 5.7.0 manuals leave created-state `cp` and pre-start rootfs continuity unproven. See [workspace design](phase-13f-a5-workspace-architecture-decision.md) | Authenticated source snapshot and generation freshness at real authority boundary; created-but-never-started copy semantics; independently observed container-rootfs identity, upper/work and all writable-domain quota attribution; identity continuity through start; real termination and bounded export | Runtime launch refusal remains; fake adapter evidence is never sufficient; any identity/storage uncertainty is NO-GO |
 | Podman storage | Strict TOML/digests/environment/report/layer/path policy | Existing parsers/rejections reused; offline design requires per-task graph/run roots or equivalently proved isolation, project quota ID/inheritance, and accounting for every writable path. No runtime invocation or storage reconfiguration authorized | Version-qualified graph/run/overlay/layer/scratch/tmpfs/log/config observer; actual filesystem UUID/mount/project-ID/inheritance and byte/inode quota enforcement | runtime_storage_acceptance_pending; shared/unattributed writable storage is NO-GO |
 | Aggregate storage | Unique domain accounting, remaining entitlement, watchdog reserves | Existing exact-threshold/domain/remaining-entitlement tests reused unchanged | Continuous observed capacity under complete workload and metadata pressure | Trusted live capacity/enforcement missing |
 | Exact containment | Exact record/ID/image/labels; inspect/stop/kill/inspect/absence; single-flight | Existing event-order/failed persistence/single-flight/recovery tests reused unchanged | Independently verified exact-ID stop/absence and preserved state on failure | Runtime unavailable; unresolved is not stopped |
@@ -304,6 +308,59 @@ capacity thresholds, file inventory and containment tests were reused, not repla
 All matrix rows with implemented offline validation are now OFFLINE_VERIFIED for
 their stated semantics. Rows explicitly MODEL_ONLY remain models. Every live
 acceptance row remains INTEGRATION_PENDING / PRODUCTION_BLOCKED.
+
+### Option B bounded staging continuation
+
+Offline implementation in `synai/broker/snapshots.py` consumes only the exact
+snapshot returned by the existing authenticated Core retrieval interface. It
+binds task, project, immutable snapshot ID/digest, lease generation and import
+operation; validates the manifest; applies file/byte/path/depth/deadline/inode
+and allocated-block limits; uses descriptor-relative creation and verification;
+and publishes the workspace last. A failed or partial import remains
+unpublished and quarantined. The immutable source copy and writable task copy
+are separate. Current claims do not include a separate live project-generation
+value; source freshness is bounded by the immutable snapshot identity and lease
+generation, not asserted against mutable project state.
+
+Collection in `synai/broker/app.py` requires completed durable task state,
+recorded exact container ownership and verified termination. It rejects unsafe
+tree entries and emits bounded changed-file content with preimage/postimage
+digests, provenance and a manifest envelope; artifacts are persisted under the
+task slot and are never applied to the original project. The result's
+`artifact_manifest_sha256` is the digest of canonical changed-file entries for
+Core compatibility; `envelope_sha256` separately binds the stored envelope.
+The exact final result envelope is size-checked before artifact persistence.
+
+The offline lifecycle model exercises fixed ordered fake-evidence transitions
+and assurance loss only. It permanently reports production execution as
+unauthorized; no production adapter consumes its fake evidence.
+
+The focused independent security review found and prompted correction of two
+collection defects before final verification: the changed-file digest had been
+computed over the wrapper rather than the Core-validated change list, and the
+result duplicated the complete artifact payload. The full artifact is now
+persisted once; the Core result carries the bounded change list once. Review
+also confirmed that incomplete staging and uncertain cleanup must retain
+quarantine; failed snapshot retrieval and interrupted copy tests assert that
+state.
+
+New verification for this continuation: 117 Broker, filesystem and Core result
+authority tests passed; full Python discovery ran 761 tests (757 passed, 4
+skipped); the final focused staging/import/quarantine set ran 33 tests and
+passed; modified Python files compiled with `py_compile`; `git diff --check`
+passed. No repository Python formatter/linter is configured and `ruff` is not
+installed. Python emitted the existing Starlette/httpx deprecation and asyncio
+slow-task diagnostics. No Rust source changed, so no Rust suite was rerun in
+this continuation; the installed absolute-path Cargo toolchain is available.
+Podman 5.7.0 manual pages were inspected only. No Podman command, container,
+quota syscall, mount, VM, privileged setup, production registry activation or
+project application was performed.
+
+The exact Podman `cp` behavior for a created-but-never-started container,
+rootfs/overlay writable-domain accounting, and independent identity continuity
+through start remain NO-GO. Fake adapters and offline tests do not satisfy those
+acceptance gates. SQLite VFS same-UID replacement and SHM-truncation risks also
+remain unresolved and the prototype remains disconnected from the registry.
 
 ## Storage invariants
 

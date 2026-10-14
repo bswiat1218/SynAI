@@ -226,13 +226,43 @@ NO-GO.
 
 ### 5. Use Podman rootfs staging, not a mounted host workspace
 
-**Candidate supported interface:** pinned-version rootless Podman CLI/API:
-create a non-running container from the approved image digest in an isolated
+**Candidate interface under investigation:** pinned-version rootless Podman
+CLI/API: create a container from the approved image digest in an isolated
 per-task graph/run root; transfer only validated entries with Podman's
 container-copy operation (`podman cp`/equivalent documented API) into the
 fixed `/workspace`; ask Podman to expose that exact container root filesystem
 for trusted inspection; then start the same recorded container. Export uses a
-separate, verified rootfs inspection after exact workload termination.
+separate rootfs inspection after exact workload termination.
+
+**Installed 5.7.0 evidence and current verdict:** the installed `podman-cp(1)`
+manual says containers can be “running or stopped,” but does not explicitly
+define whether a never-started `created` container is accepted by the copy
+path. It documents path-valued operands and tar-stream input/output; local
+symlink sources are followed by default, and rootless copy from a running
+container may ignore permission errors. The staged importer must therefore
+provide only private, validated ordinary files and must not treat copy success
+as verification. No Podman source package is installed here; only the packaged
+5.7.0 man pages were inspected, without invoking Podman.
+
+The installed `podman-mount(1)` describes mounting a working container's
+rootfs and says rootless mounting works only from inside the user namespace.
+It prints a path; the manual does not claim the path is an authenticated
+descriptor, establish project-quota identity for overlay upper/work, or
+guarantee that a mount verified before start is the exact mounted object used
+by the workload. `podman-unmount(1)` documents a mount counter and warns that
+forced unmount can disrupt other processes. These interfaces provide no
+documented pre-start lifecycle barrier or identity-continuity guarantee.
+Kernel inspection of a pinned returned path could identify the currently
+mounted object, but cannot alone prove its binding to the container storage
+record, charged upper/work domain, or the mount actually consumed after a
+separate start operation.
+
+**Consequent status: NO-GO for modeled runtime start pending source/VM
+acceptance.** The fake lifecycle below can exercise ordering and refusal
+contracts only. Podman copy to a created-but-never-started container, exact
+rootfs exposure, upper/work attribution, and identity continuity through start
+remain unproven. Do not implement a real adapter or change the runtime launch
+refusal on this evidence.
 
 This is a staging/copy boundary, **not descriptor-authoritative input**.
 Podman's copy command receives path-valued operands. The Broker therefore gives
@@ -284,13 +314,15 @@ accounting.
    restart ambiguity, or failed observation aborts and quarantines; it never
    falls back to a pathname bind.
 
-The Podman copy/rootfs sequence above is the only design candidate. Its precise
-CLI semantics, mount lifetime, and pre-start identity continuity have not yet
-been proven for a pinned Podman/OCI implementation. They are mandatory offline
-source/documentation questions before coding and mandatory isolated-VM
-acceptance before execution. If any answer is unavailable, mark the runtime
-workspace NO-GO and request a new decision. A named volume is not an alternate
-path unless it independently meets the same proof.
+The Podman copy/rootfs sequence above remains the only design candidate, not an
+accepted implementation interface. Its created-container copy semantics,
+mount lifetime, quota attribution, and pre-start identity continuity have not
+been proven for a pinned Podman/OCI implementation. They are mandatory
+source/documentation questions before any real adapter and mandatory
+isolated-VM acceptance before execution. If any answer is unavailable, retain
+the runtime workspace NO-GO and launch refusal; request a new decision rather
+than implementing a weaker path. A named volume is not an alternate path unless
+it independently meets the same proof.
 
 ### 6. Separate trusted identities and defeat same-UID substitution
 

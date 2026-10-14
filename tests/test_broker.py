@@ -31,6 +31,7 @@ from synai.broker.protocol import (
 from synai.broker.registry import BrokerRegistry
 from synai.broker.filesystem import Directory, remove_tree
 from synai.broker import runtime as runtime_module
+from synai.broker import snapshots as snapshots_module
 from synai.broker.runtime import RootlessPodmanRuntime
 from synai.broker.quota_slots import QuotaUsage, aggregate_storage_reasons
 from synai.broker import quota_slots as quota_slots_module
@@ -45,11 +46,17 @@ from synai.broker.storage_inspector import (
     inventory_generation,
 )
 from synai.broker.snapshots import (
+    OfflineLifecycleState,
+    OfflineWorkspaceLifecycle,
+    SnapshotProvenance,
+    build_artifact_manifest,
     changed_files,
     load_staged_manifest,
+    load_staged_provenance,
     stage_snapshot,
     validate_relative_path,
     validate_snapshot,
+    verify_staged_snapshot,
 )
 
 
@@ -1053,6 +1060,11 @@ class SnapshotStagingTests(unittest.TestCase):
             },
         }
         self.digest = hashlib.sha256(canonical_json(self.manifest)).hexdigest()
+        self.provenance = SnapshotProvenance(
+            task_id="1" * 32, project_id=self.manifest["project_id"],
+            snapshot_id=self.manifest["snapshot_id"], snapshot_digest=self.digest,
+            lease_generation=1, import_operation_id="4" * 32,
+        )
 
     def test_integrity_validation_and_writable_copy_preserve_snapshot(self) -> None:
         validate_snapshot(self.manifest, "3" * 32, self.digest, {"src/module.py": self.content})
@@ -1062,14 +1074,218 @@ class SnapshotStagingTests(unittest.TestCase):
             task_root = root / "slot" / ("1" * 32)
             task_root.parent.mkdir(mode=0o700, parents=True)
             task_root.mkdir(mode=0o700)
-            workspace = stage_snapshot(task_root, self.manifest, {"src/module.py": self.content})
+            with Directory(task_root) as task_authority:
+                workspace = stage_snapshot(
+                    task_authority, self.manifest, {"src/module.py": self.content},
+                    self.provenance,
+                )
             self.assertEqual((workspace / "src/module.py").read_bytes(), self.content)
             (workspace / "src/module.py").write_bytes(b"changed\n")
+            os.chmod(workspace / "src/module.py", 0o600)
             self.assertEqual((task_root / "snapshot" / "src/module.py").read_bytes(), self.content)
             staged = load_staged_manifest(task_root, self.digest)
+            with Directory(task_root) as task_authority, task_authority.child_directory("snapshot") as snapshot:
+                verify_staged_snapshot(snapshot, staged)
+            with Directory(task_root) as task_authority:
+                self.assertEqual(
+                    load_staged_provenance(task_authority, self.provenance),
+                    self.provenance.to_dict(),
+                )
             changes = changed_files(workspace, staged)
             self.assertEqual(changes[0]["preimage_sha256"], hashlib.sha256(self.content).hexdigest())
             self.assertEqual(changes[0]["postimage_sha256"], hashlib.sha256(b"changed\n").hexdigest())
+
+    def test_provenance_binds_task_project_snapshot_and_generation(self) -> None:
+        for wrong in (
+            replace(self.provenance, task_id="2" * 32),
+            replace(self.provenance, project_id="3" * 32),
+            replace(self.provenance, snapshot_id="4" * 32),
+            replace(self.provenance, snapshot_digest="5" * 64),
+            replace(self.provenance, lease_generation=2),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                task_root_path = Path(directory) / "task"
+                task_root_path.mkdir(mode=0o700)
+                with Directory(task_root_path) as task_root:
+                    stage_snapshot(task_root, self.manifest, {"src/module.py": self.content}, self.provenance)
+                    with self.assertRaises(BrokerError):
+                        load_staged_provenance(task_root, wrong)
+
+    def test_import_is_bounded_and_preserves_partial_tree_without_publishing_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task_root_path = Path(directory) / "task"
+            task_root_path.mkdir(mode=0o700)
+            with Directory(task_root_path) as task_root, patch(
+                "synai.broker.snapshots._stage_file", side_effect=OSError("injected interrupted copy"),
+            ):
+                with self.assertRaises(OSError):
+                    stage_snapshot(task_root, self.manifest, {"src/module.py": self.content}, self.provenance)
+            self.assertFalse((task_root_path / "workspace").exists())
+            partial = task_root_path / f".importing-{self.provenance.import_operation_id}"
+            self.assertTrue(partial.is_dir())
+            self.assertTrue((partial / "provenance.json").is_file())
+
+    def test_expired_import_and_file_parent_collision_fail_closed(self) -> None:
+        with self.assertRaises(BrokerError):
+            validate_snapshot(
+                self.manifest, self.provenance.snapshot_id, self.digest,
+                {"src/module.py": self.content}, deadline=time.monotonic() - 1,
+            )
+        conflict = {**self.manifest, "files": [
+            *self.manifest["files"],
+            {
+                "path": "src", "file_type": "regular", "size_bytes": 0,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+            },
+        ]}
+        conflict["total_bytes"] += 0
+        conflict_digest = hashlib.sha256(canonical_json(conflict)).hexdigest()
+        with self.assertRaises(BrokerError):
+            validate_snapshot(
+                conflict, self.provenance.snapshot_id, conflict_digest,
+                {"src/module.py": self.content, "src": b""},
+            )
+
+    def test_export_manifest_binds_provenance_and_detects_sparse_oversize(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir(mode=0o700)
+            (workspace / "src").mkdir(mode=0o700)
+            (workspace / "src/module.py").write_bytes(b"changed\n")
+            os.chmod(workspace / "src/module.py", 0o600)
+            artifact = build_artifact_manifest(
+                workspace, self.manifest, self.provenance,
+                maximum=65536, output_limit=8192,
+            )
+            self.assertEqual(artifact["provenance"], self.provenance.to_dict())
+            self.assertEqual(artifact["source_manifest_sha256"], self.digest)
+            self.assertEqual(
+                artifact["changed_files"][0]["postimage_sha256"],
+                hashlib.sha256(b"changed\n").hexdigest(),
+            )
+            with (workspace / "sparse.bin").open("wb") as sparse:
+                sparse.truncate(1024 * 1024 + 1)
+            os.chmod(workspace / "sparse.bin", 0o600)
+            with self.assertRaises(BrokerError):
+                build_artifact_manifest(
+                    workspace, self.manifest, self.provenance,
+                    maximum=2 * 1024 * 1024, output_limit=8192,
+                )
+
+    def test_export_rejects_hardlinks_special_files_and_name_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir(mode=0o700)
+            (workspace / "file").write_bytes(b"owned")
+            os.chmod(workspace / "file", 0o600)
+            os.link(workspace / "file", workspace / "hardlink")
+            with self.assertRaises(BrokerError):
+                changed_files(workspace, {"files": []})
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir(mode=0o700)
+            os.mkfifo(workspace / "pipe")
+            with self.assertRaises(BrokerError):
+                changed_files(workspace, {"files": []})
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir(mode=0o700)
+            target = workspace / "file"
+            target.write_bytes(b"original")
+            os.chmod(target, 0o600)
+            with Directory(workspace) as root:
+                real_stat = os.stat
+                replaced = False
+
+                def replace_after_stat(name: object, *args: object, **kwargs: object) -> os.stat_result:
+                    nonlocal replaced
+                    result = real_stat(name, *args, **kwargs)
+                    if name == "file" and kwargs.get("dir_fd") == root.fd and not replaced:
+                        replaced = True
+                        os.rename(target, workspace / "saved")
+                        target.write_bytes(b"replacement")
+                        os.chmod(target, 0o600)
+                    return result
+
+                with patch.object(snapshots_module.os, "stat", side_effect=replace_after_stat):
+                    with self.assertRaises(BrokerError):
+                        changed_files(root, {"files": []})
+            self.assertEqual((workspace / "saved").read_bytes(), b"original")
+            self.assertEqual(target.read_bytes(), b"replacement")
+
+    def test_storage_exhaustion_does_not_publish_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            task_root_path = Path(directory) / "task"
+            task_root_path.mkdir(mode=0o700)
+            with Directory(task_root_path) as task_root, patch.object(
+                snapshots_module.os, "fstatvfs",
+                return_value=type("StatVFS", (), {"f_bavail": 0, "f_frsize": 4096})(),
+            ):
+                with self.assertRaises(BrokerError):
+                    stage_snapshot(task_root, self.manifest, {"src/module.py": self.content}, self.provenance)
+            self.assertEqual(list(task_root_path.iterdir()), [])
+
+    def test_offline_lifecycle_requires_ordered_evidence_and_never_authorizes_execution(self) -> None:
+        lifecycle = OfflineWorkspaceLifecycle(self.provenance)
+        steps = (
+            (OfflineLifecycleState.EMPTY, OfflineLifecycleState.SNAPSHOT_PREPARED, self.digest),
+            (OfflineLifecycleState.SNAPSHOT_PREPARED, OfflineLifecycleState.STORAGE_ALLOCATED, "slot-1"),
+            (OfflineLifecycleState.STORAGE_ALLOCATED, OfflineLifecycleState.CONTAINER_CREATED, "a" * 64),
+            (OfflineLifecycleState.CONTAINER_CREATED, OfflineLifecycleState.INPUT_COPIED, self.digest),
+            (OfflineLifecycleState.INPUT_COPIED, OfflineLifecycleState.DESTINATION_VERIFIED, "dev:ino:mnt"),
+            (OfflineLifecycleState.DESTINATION_VERIFIED, OfflineLifecycleState.STARTED_IN_MODEL, "a" * 64),
+            (OfflineLifecycleState.STARTED_IN_MODEL, OfflineLifecycleState.TERMINATED_VERIFIED, "termination-proof"),
+            (OfflineLifecycleState.TERMINATED_VERIFIED, OfflineLifecycleState.OUTPUT_EXPORTED, "b" * 64),
+            (OfflineLifecycleState.OUTPUT_EXPORTED, OfflineLifecycleState.RELEASED, "cleanup-proof"),
+        )
+        for expected, target, evidence in steps:
+            lifecycle.advance(expected, target, evidence=evidence)
+            self.assertFalse(lifecycle.production_execution_authorized)
+        self.assertEqual(lifecycle.state, OfflineLifecycleState.RELEASED)
+
+    def test_offline_lifecycle_assurance_loss_quarantines_and_rejects_late_results(self) -> None:
+        for state in OfflineLifecycleState:
+            if state in {OfflineLifecycleState.QUARANTINED, OfflineLifecycleState.RELEASED}:
+                continue
+            lifecycle = OfflineWorkspaceLifecycle(self.provenance)
+            lifecycle.state = state
+            lifecycle.lose_assurance()
+            self.assertEqual(lifecycle.state, OfflineLifecycleState.QUARANTINED)
+            self.assertFalse(lifecycle.production_execution_authorized)
+            with self.assertRaises(BrokerError):
+                lifecycle.advance(
+                    OfflineLifecycleState.DESTINATION_VERIFIED,
+                    OfflineLifecycleState.STARTED_IN_MODEL,
+                    evidence="late-container-result",
+                )
+
+    def test_fake_container_adapter_contract_has_fixed_order_and_no_production_authority(self) -> None:
+        class FakeAdapter:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def invoke(self, operation: str, result: str) -> str:
+                self.calls.append(operation)
+                return result
+
+        fake = FakeAdapter()
+        lifecycle = OfflineWorkspaceLifecycle(self.provenance)
+        sequence = (
+            (OfflineLifecycleState.EMPTY, OfflineLifecycleState.SNAPSHOT_PREPARED, "prepare", self.digest),
+            (OfflineLifecycleState.SNAPSHOT_PREPARED, OfflineLifecycleState.STORAGE_ALLOCATED, "allocate", "slot-proof"),
+            (OfflineLifecycleState.STORAGE_ALLOCATED, OfflineLifecycleState.CONTAINER_CREATED, "create", "c" * 64),
+            (OfflineLifecycleState.CONTAINER_CREATED, OfflineLifecycleState.INPUT_COPIED, "copy_in", self.digest),
+            (OfflineLifecycleState.INPUT_COPIED, OfflineLifecycleState.DESTINATION_VERIFIED, "verify", "rootfs:mnt:inode"),
+            (OfflineLifecycleState.DESTINATION_VERIFIED, OfflineLifecycleState.STARTED_IN_MODEL, "start_model", "c" * 64),
+            (OfflineLifecycleState.STARTED_IN_MODEL, OfflineLifecycleState.TERMINATED_VERIFIED, "stop_verify", "exit-proof"),
+            (OfflineLifecycleState.TERMINATED_VERIFIED, OfflineLifecycleState.OUTPUT_EXPORTED, "export", "d" * 64),
+            (OfflineLifecycleState.OUTPUT_EXPORTED, OfflineLifecycleState.RELEASED, "release", "cleanup-proof"),
+        )
+        for expected, target, operation, result in sequence:
+            evidence = fake.invoke(operation, result)
+            lifecycle.advance(expected, target, evidence=evidence)
+        self.assertEqual(fake.calls, [step[2] for step in sequence])
+        self.assertFalse(lifecycle.production_execution_authorized)
 
     def test_manifest_tampering_and_identity_mismatch_are_rejected(self) -> None:
         with self.assertRaises(BrokerError):
@@ -1829,7 +2045,7 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         digest = self.snapshots.prepare_manifest(original.snapshot_id)
         request = replace(original, snapshot_digest=digest)
 
-        def interrupt(task_root: Directory, *_: object) -> Path:
+        def interrupt(task_root: Directory, *_: object, **__: object) -> Path:
             partial = task_root.path / "snapshot"
             partial.mkdir(mode=0o700)
             (partial / "partial").write_text("incomplete")
@@ -1841,8 +2057,9 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             kind="prepare", arguments={},
         )
         with patch("synai.broker.app.stage_snapshot", side_effect=interrupt):
-            with self.assertRaises(OSError):
+            with self.assertRaises(BrokerError) as interrupted:
                 await self.service.dispatch(payload)
+        self.assertEqual(interrupted.exception.code, "snapshot_import_failed")
         self.assertEqual(self.service.registry.task(request.task_id)["state"], "uncertain")
         restarted = BrokerRegistry(self.selected)
         restarted.initialize(storage_verified=True, provision=True, adopt_legacy=True)
@@ -1878,6 +2095,13 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             claim_signature=sign_claim(write, CLAIM_PRIVATE),
             kind="write_file", arguments=write_args,
         ))
+        self.service.registry.reserve_container(prepared.task_id, prepared.allocation_id)
+        self.service.registry.bind_container(prepared.task_id, prepared.allocation_id, "f" * 64)
+        self.service.registry.transition(prepared.task_id, "running")
+        self.service.registry.mark_container(
+            prepared.task_id, "terminated", termination=hashlib.sha256(b"test termination").hexdigest(),
+        )
+        self.service.registry.transition(prepared.task_id, "completed")
         collect = replace(
             prepared,
             operation_id="b" * 32,
@@ -1895,10 +2119,21 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             / "artifacts" / f"{collect.operation_id}.json"
         )
         self.assertTrue(artifact_path.is_file())
+        stored_artifact = json.loads(artifact_path.read_text())
+        self.assertEqual(stored_artifact["changed_files"], response["result"]["changed_files"])
         self.assertEqual(
-            json.loads(artifact_path.read_text())[0]["artifact_base64"],
-            response["result"]["changed_files"][0]["artifact_base64"],
+            response["result"]["artifact_manifest_sha256"],
+            hashlib.sha256(canonical_json(response["result"]["changed_files"])).hexdigest(),
         )
+        self.assertNotIn("artifact_manifest", response["result"])
+        self.assertEqual(
+            stored_artifact["provenance"]["snapshot_digest"], prepared.snapshot_digest,
+        )
+        self.assertEqual(
+            stored_artifact["artifact_manifest_sha256"],
+            hashlib.sha256(canonical_json(stored_artifact["changed_files"])).hexdigest(),
+        )
+        self.assertIn("envelope_sha256", stored_artifact)
         with self.service.registry.connect() as connection:
             audit = connection.execute(
                 "SELECT result_json FROM broker_operations WHERE operation_id = ?",
@@ -1907,7 +2142,35 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(audit)["artifact_manifest_path"], f"artifacts/{collect.operation_id}.json")
         self.assertNotIn("artifact_base64", audit)
 
-    async def test_failed_snapshot_retrieval_leaves_task_cleanable(self) -> None:
+    async def test_collect_refuses_unterminated_or_unknown_container_and_preserves_quarantine(self) -> None:
+        initial = claim("prepare", {})
+        digest = self.snapshots.prepare_manifest(initial.snapshot_id)
+        prepared = replace(initial, snapshot_digest=digest)
+        await self.service.dispatch(OperationRequest(
+            schema_version=1, claim=prepared.to_dict(),
+            claim_signature=sign_claim(prepared, CLAIM_PRIVATE),
+            kind="prepare", arguments={},
+        ))
+        collect = replace(
+            prepared,
+            operation_id="c" * 32,
+            tool_kind="collect",
+            arguments_digest=hashlib.sha256(canonical_json({})).hexdigest(),
+            claim_id="d" * 32, replay_nonce="e" * 32, request_id="f" * 32,
+        )
+        with self.assertRaises(BrokerError) as refused:
+            await self.service.dispatch(OperationRequest(
+                schema_version=1, claim=collect.to_dict(),
+                claim_signature=sign_claim(collect, CLAIM_PRIVATE),
+                kind="collect", arguments={},
+            ))
+        self.assertEqual(refused.exception.code, "artifact_termination_unverified")
+        slot = self.service.registry.task_slot(
+            prepared.task_id, allow_quarantined=True,
+        )
+        self.assertEqual(slot["state"], "quarantined")
+
+    async def test_failed_snapshot_retrieval_retains_quarantined_task_slot(self) -> None:
         class MissingSnapshot:
             async def fetch_exact(self, **_: object) -> tuple[dict[str, object], dict[str, bytes]]:
                 raise BrokerError("snapshot_not_found", "Exact snapshot unavailable.", 404)
@@ -1931,18 +2194,10 @@ class BrokerServiceTests(unittest.IsolatedAsyncioTestCase):
             await service.dispatch(payload)
         self.assertEqual(service.registry.task(request.task_id)["state"], "failed")
 
-        remove = replace(
-            request,
-            operation_id="c" * 32,
-            tool_kind="remove",
-            arguments_digest=hashlib.sha256(canonical_json({})).hexdigest(),
-            claim_id="4" * 32, replay_nonce="5" * 32, request_id="6" * 32,
+        self.assertEqual(
+            service.registry.task_slot(request.task_id, allow_quarantined=True)["state"],
+            "quarantined",
         )
-        result = await service.dispatch(OperationRequest(
-            schema_version=1, claim=remove.to_dict(),
-            claim_signature=sign_claim(remove, CLAIM_PRIVATE), kind="remove", arguments={},
-        ))
-        self.assertEqual(result["result"]["state"], "removed")
 
     async def test_cancel_before_start_removes_only_its_prepared_workspace(self) -> None:
         first = claim("prepare", {})

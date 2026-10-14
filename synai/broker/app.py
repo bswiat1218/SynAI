@@ -35,10 +35,13 @@ from synai.broker.filesystem import Directory, directory_access, remove_tree, wr
 from synai.broker.runtime import ContainmentResult, RootlessPodmanRuntime
 from synai.broker.workers import AuthorityWorkers
 from synai.broker.snapshots import (
-    changed_files,
+    SnapshotProvenance,
+    build_artifact_manifest,
     load_staged_manifest,
+    load_staged_provenance,
     stage_snapshot,
     validate_snapshot,
+    verify_staged_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -1003,6 +1006,8 @@ class BrokerService:
             if exc.code.startswith(("filesystem_", "openat2_", "workspace_path_", "bind_source_")):
                 self._invalidate_storage_readiness("filesystem_authority_lost")
                 self.registry.quarantine_slot(claim.task_id)
+            elif exc.code.startswith(("snapshot_", "artifact_")):
+                self.registry.quarantine_slot(claim.task_id)
             raise
         except OSError as exc:
             if exc.errno in {18, 20, 40}:
@@ -1024,16 +1029,33 @@ class BrokerService:
                 raise BrokerError("snapshot_source_unavailable", "Exact Core snapshot retrieval is not configured.", 503)
             if self.core_client is not None and snapshot_grant is None:
                 raise BrokerError("snapshot_grant_missing", "Exact Core snapshot retrieval grant is required.", 403)
+            import_deadline = time.monotonic() + min(
+                60, max(0, claim.deadline - int(time.time())),
+            )
             manifest, files = await self.snapshot_retriever.fetch_exact(
                 claim=claim, signature=signature,
                 grant_token=snapshot_grant or "",
             )
-            validate_snapshot(manifest, claim.snapshot_id, claim.snapshot_digest, files)
-            if manifest["project_id"] != claim.project_id:
-                raise BrokerError("snapshot_project_mismatch", "Snapshot belongs to another logical project.", 403)
+            if time.monotonic() >= import_deadline:
+                raise BrokerError("snapshot_deadline", "Snapshot retrieval left no time for bounded staging.", 503)
+            validate_snapshot(
+                manifest, claim.snapshot_id, claim.snapshot_digest, files,
+                expected_project=claim.project_id, deadline=import_deadline,
+            )
+            provenance = SnapshotProvenance.from_claim(claim)
             mark_side_effect()
-            with self.quota_manager.create_task_root(claim.task_id) as task_root:
-                stage_snapshot(task_root, manifest, files)
+            try:
+                with self.quota_manager.create_task_root(claim.task_id) as task_root:
+                    stage_snapshot(
+                        task_root, manifest, files, provenance,
+                        deadline=import_deadline,
+                    )
+            except OSError as exc:
+                raise BrokerError(
+                    "snapshot_import_failed",
+                    "Authenticated snapshot staging did not complete.",
+                    507 if exc.errno == 28 else 503,
+                ) from exc
             self.registry.transition(claim.task_id, "ready")
             return {
                 "state": "ready", "snapshot_id": claim.snapshot_id,
@@ -1104,22 +1126,64 @@ class BrokerService:
             return result
         if kind == "collect":
             task = self.registry.task(claim.task_id)
+            container = self.registry.container_record(claim.task_id)
+            if (
+                task["state"] != "completed" or container is None
+                or container["lifecycle_state"] != "terminated"
+                or not container["container_id"]
+                or not container["termination_evidence"]
+                or container["allocation_id"] != claim.allocation_id
+                or container["snapshot_digest"] != claim.snapshot_digest
+                or container["project_id"] != claim.project_id
+                or container["task_state"] != "completed"
+            ):
+                self.registry.quarantine_slot(claim.task_id)
+                raise BrokerError(
+                    "artifact_termination_unverified",
+                    "Task output is unavailable until exact container termination is durably verified.",
+                    409,
+                )
             with self.quota_manager.open_task_root(claim.task_id) as root:
                 manifest = load_staged_manifest(root, task["snapshot_digest"])
+                provenance = load_staged_provenance(
+                    root, SnapshotProvenance.from_claim(claim),
+                )
+                with root.child_directory("snapshot") as snapshot:
+                    verify_staged_snapshot(snapshot, manifest, deadline=time.monotonic() + 60)
                 with root.child_directory("workspace") as workspace:
-                    changes = changed_files(
-                        workspace, manifest, self.config.profile.workspace_bytes,
-                        self.config.profile.output_bytes,
+                    artifact_manifest = build_artifact_manifest(
+                        workspace, manifest,
+                        SnapshotProvenance.from_dict(provenance),
+                        maximum=self.config.profile.workspace_bytes,
+                        output_limit=self.config.profile.output_bytes,
+                        deadline=time.monotonic() + 60,
                     )
-                artifact_bytes = canonical_json(changes)
-                artifact_digest = hashlib.sha256(artifact_bytes).hexdigest()
+                result = {
+                    "input_snapshot_digest": task["snapshot_digest"],
+                    "provenance": provenance,
+                    "changed_files": artifact_manifest["changed_files"],
+                    "artifact_manifest_sha256": artifact_manifest["artifact_manifest_sha256"],
+                    "collection_complete": True,
+                }
+                response_envelope = {
+                    "schema_version": 1, "claim_id": claim.claim_id,
+                    "operation_id": claim.operation_id, "task_id": claim.task_id,
+                    "project_id": claim.project_id, "snapshot_id": claim.snapshot_id,
+                    "snapshot_digest": claim.snapshot_digest,
+                    "allocation_id": claim.allocation_id,
+                    "lease_generation": claim.lease_generation,
+                    "status": "completed", "result": result,
+                }
+                if len(canonical_json(response_envelope)) > self.config.profile.output_bytes:
+                    raise BrokerError(
+                        "artifact_output_limit",
+                        "Task artifact result exceeds its configured bound.",
+                        413,
+                    )
+                artifact_bytes = canonical_json(artifact_manifest)
                 mark_side_effect()
                 _persist_artifact_evidence(root, claim.operation_id, artifact_bytes)
-            return {
-                "input_snapshot_digest": task["snapshot_digest"],
-                "changed_files": changes, "artifact_manifest_sha256": artifact_digest,
-                "collection_complete": True,
-            }
+            return result
         if kind == "complete":
             task = self.registry.task(claim.task_id)
             if task["state"] != "running":
