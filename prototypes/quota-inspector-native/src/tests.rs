@@ -55,7 +55,7 @@ impl Drop for Disposable {
     }
 }
 
-fn document() -> Value {
+pub(crate) fn document() -> Value {
     let purposes = [
         ("task-slot-00", "task_slot", 256 * 1024 * 1024, 4096),
         ("task-slot-01", "task_slot", 256 * 1024 * 1024, 4096),

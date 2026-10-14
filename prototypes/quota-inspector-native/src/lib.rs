@@ -21,6 +21,7 @@ mod contracts;
 mod evidence;
 mod inventory;
 mod observation;
+pub mod source;
 #[cfg(test)]
 mod supervision;
 
@@ -44,6 +45,7 @@ pub use observation::{
     BoundRequest, InspectionResult, MAX_DESCRIPTORS, MAX_OPERATION_TIME, NativeInspector,
     ObservationBudget, Outcome, ValidatedObservation,
 };
+pub use source::{AcquiredInventory, SourceIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unavailable {

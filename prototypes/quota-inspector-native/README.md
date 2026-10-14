@@ -204,11 +204,20 @@ These checks return no authority token. Expected metadata supplied by a caller
 is NOT authenticated acquisition, and matching values cannot create
 TrustedInventory or ValidatedObservation. Non-test inspection remains unavailable.
 
-The sealed inventory attestation now additionally requires a sample acquired
-during the current request, within the same monotonic clock domain and not from
-the future or stale wall-clock window. The trusted backend remains responsible
-for independently acquiring/authenticating that sample and source. No loader,
-FS ioctl, kernel quota query, VFS or mounted-source handoff is enabled.
+The native package now has a protected-source loader for the fixed
+`/etc/synai/quota-inspector/inventory.json` path. It opens each ancestry
+component without symlinks, requires root-owned non-writable ancestors and an
+exact root-owned `0755` source directory, then reads a single-link `0644`
+regular file through a retained FD with a strict size bound and pre/post/reopen
+identity comparison. It checks freshness against the request's `Instant` and
+parses only after acquisition. `AcquiredInventory` exposes the parsed candidate
+and pinned source descriptor; it is **not** a `TrustedInventory` and cannot
+attest filesystem UUID/mount/namespace or project attributes. The disposable
+root injection exists only in unit-test configuration and is not a production
+trust anchor. `NativeInspector::inspect_configured` routes the candidate through
+the existing sealed validator, whose production backend still refuses authority.
+No real storage-root acquisition, FS ioctl, kernel quota query, VFS registration,
+or mounted-source handoff is activated.
 
 The [test-only supervisor contract](src/supervision.rs) models an exact worker
 instance using PID, start ticks, generation, boot epoch and PID namespace.

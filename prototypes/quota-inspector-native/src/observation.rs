@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -263,6 +263,37 @@ impl NativeInspector {
     ) -> InspectionResult {
         self.controller
             .inspect(policy, binding, budget, UnavailableBackend)
+    }
+
+    /// Loads the fixed protected inventory before entering the sealed validator.
+    ///
+    /// The current non-test backend still refuses authority; loading a protected
+    /// candidate does not enable filesystem inspection or quota queries.
+    pub fn inspect_configured(
+        &mut self,
+        payload: &[u8],
+        budget: ObservationBudget,
+    ) -> Result<InspectionResult, Failure> {
+        if self.controller.active.is_some() {
+            return Err(Failure::Unavailable(Unavailable::Busy));
+        }
+        let request_started = Instant::now();
+        let acquired = crate::AcquiredInventory::load_configured(request_started)?;
+        let binding = BoundRequest::parse(acquired.policy(), payload)?;
+        let elapsed = Instant::now()
+            .checked_duration_since(request_started)
+            .ok_or(Failure::Unavailable(Unavailable::StaleEvidence))?;
+        let remaining = budget
+            .0
+            .checked_sub(elapsed)
+            .filter(|duration| !duration.is_zero())
+            .ok_or(Failure::Unavailable(Unavailable::DeadlineExceeded))?;
+        Ok(self.controller.inspect(
+            acquired.policy(),
+            &binding,
+            ObservationBudget(remaining),
+            UnavailableBackend,
+        ))
     }
 
     pub fn cancel(&mut self) {

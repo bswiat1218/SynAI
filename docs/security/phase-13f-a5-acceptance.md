@@ -20,6 +20,10 @@ Category 1 continuation baseline: `fe6842caeb745fce54ef8dcb4dd6088e8ca2faee`
 index. The earlier eight-file transport change set is already incorporated in
 this history; it was not present as unstaged work at continuation start.
 
+Category 1 offline-implementation baseline: `cbe4cfb2c9578466edb5ccbb061d32146a38029d`
+("Phase 13F-A.5 Category 1 Continuation: Unblock Real Integration"), clean
+worktree and index before this task.
+
 Category 1 A1 feasibility status (read-only inspection, no Podman invocation):
 installed Podman 5.7.0 documentation describes `--mount` `src`/`source` as a
 bind mount source spec and `--preserve-fd`/`--preserve-fds` as descriptors passed
@@ -29,21 +33,30 @@ source authority. No installed source or authoritative interface establishes
 that handoff or independent destination-object verification before workload
 start. The runtime branch remains blocked and fail-closed.
 
+Workspace decision status: the user approved Option B for **offline design
+only**. The design candidate uses Podman copy-in/copy-out with no host-project
+bind mount or Podman-managed workspace volume, and requires independent
+pre-start verification of the actual task rootfs plus complete project-quota
+accounting. It is not implemented or runtime-accepted. The exact Podman
+copy/rootfs lifecycle, mount continuity through start, storage-root isolation,
+and quota attribution remain mandatory GO/NO-GO questions. See the
+[implementation-ready workspace design](phase-13f-a5-workspace-architecture-decision.md).
+
 ## Matrix
 
 | Requirement | Existing implementation reused | Offline status / remaining work | Independently required live evidence | Production blocker |
 |---|---|---|---|---|
 | Native quota / ABI | [ABI](../../prototypes/quota-inspector-abi/README.md), sealed native read-only adapter | CATEGORY1_CODE: isolated callable typed x86_64 `quotactl_fd` wrapper; deterministic dispatch tests and non-invoking link test; no production wiring | Separately approved GETQUOTA/GETINFO against qualified descriptors/kernel and independently trusted evidence | Native backend unavailable |
-| Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | Candidate validation and freshness are implemented; the authenticated operator-source selector/loader and native descriptor acquisition are missing, not merely awaiting kernel evidence | Protected authenticated source, independently approved identity, and separately acquired filesystem/project evidence; hash is not trust | Native inspection unavailable; source acquisition contract absent |
-| Descriptor/mount/namespace/UUID | Native owned descriptors/pre/post checks; Broker Directory/openat2 | Broker path-resolution checks exist; no native acquisition backend binds the protected root, ancestry, filesystem UUID/mount and namespace or independently queries project attributes | Qualified FD/namespace correspondence, protected ancestry, project identity and replacement/remount detection | Native identity acquisition unavailable |
+| Trusted inventory | Bounded CandidateInventory, complete-policy digest, sealed attestation | Implemented fixed-path `/etc/synai/quota-inspector/inventory.json` loader using safe `openat2` descriptor-relative access; requires root-owned, non-writable ancestry, fixed owner/group/mode, single-link bounded regular file, before/after/reopen identity match, bounded parse, per-call freshness. Returns only candidate plus pinned source FD; disposable-root test seam is cfg(test) only | Operator-protected installation, actual path/ancestry ownership, deployment source lifecycle; separately acquired filesystem UUID/mount/namespace and project evidence | Native inspection and trusted attestation remain unavailable |
+| Descriptor/mount/namespace/UUID | Native owned descriptors/pre/post checks; Broker Directory/openat2 | Broker path-resolution checks exist; source loader pins only the fixed policy file. It does not acquire storage-root descriptors or assert filesystem UUID/mount/namespace/project identity | Qualified storage FD/namespace correspondence, project identity, replacement/remount detection | Native filesystem identity acquisition unavailable |
 | Existing-file charging | Native listed-file checks; Broker bounded recursive per-file verification | Existing tests reused; acquisition/traversal contract below; no redundant native enumerator | Actual project attributes/charging of all existing files | Kernel charging not accepted |
 | Configuration / write denial | Checked counters, explicit configuration state, exact caps | Decoder reused; acceptance-test campaign specified below, not executed | Independent active enforcement and separately approved destructive sparse/concurrent byte/inode exhaustion | No empirical enforcement evidence |
-| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | No prototype: current Python `sqlite3` API does not expose VFS registration, and no pinned same-engine native adapter/VFS exists. A new C boundary would have to implement and test the complete VFS callback, WAL/SHM/locking/sync, URI restriction, and Python transaction/cursor/error contract before any adapter change. No production registry changes made | Disposable DB/WAL/SHM/journal concurrency, failure, restart and process-crash tests; separately, real filesystem identity, quota charging and power-loss acceptance | Code blocker: no reviewed same-engine VFS/adapter boundary. Live filesystem/durability acceptance remains separate |
-| Runtime bind source | Descriptor/allocation checks and unconditional refusal | Podman 5.7.0 docs show path-valued mount source and workload-only FD passing; no supported descriptor-authoritative mount-source handoff or independent target-object proof was found. No runtime change made | Mounted-source inode/filesystem/namespace correspondence before workload, not source-path text | bind_source_resolution_unaccepted |
-| Podman storage | Strict TOML/digests/environment/report/layer/path policy | Existing parsers/rejections reused; new all-lifecycle-launch-refusal regression | Version-qualified graph/run/overlay/layer/scratch/tmpfs/log/config observer | runtime_storage_acceptance_pending |
+| SQLite VFS | Single registry ledger, DB/sidecar/seal/marker pins and lifecycle checks | OFFLINE_PROTOTYPE: same-engine CPython registration; descriptor-relative DB/journal/WAL/SHM, OFD locks, multiple connections/processes, transactions, checkpoints, replacement refusal and process-crash recovery pass 19 tests. Independent review confirms unresolved check/use and same-UID mutation race risks, including mapped-SHM truncation/SIGBUS. No Python registry adapter or production activation | Full registry callback/transaction compatibility, independently protected custody, live filesystem identity/quota charging, power-loss durability and broader failure injection | Prototype is custody-dependent only; production-grade hostile-mutation containment and registry compatibility remain unaccepted |
+| Runtime workspace source and rootfs identity | Descriptor/allocation checks and unconditional refusal | Option B approved for offline design only. Candidate: Podman copy-in to a non-running container's fixed `/workspace`, no host project bind or managed workspace volume, followed by descriptor-pinned verification of the actual rootfs/workspace before start; copy-out only after exact termination. Podman copy semantics, runtime pre-start hook/order, and rootfs identity continuity through start are not yet source-verified or implemented. See [workspace design](phase-13f-a5-workspace-architecture-decision.md) | Exact pinned-version import/exposure lifecycle; independent rootfs/workspace mount identity before execution and continuity through start; complete upper/work and writable-domain attribution | Existing launch refusal remains; any unverified mount/path handoff is NO-GO |
+| Podman storage | Strict TOML/digests/environment/report/layer/path policy | Existing parsers/rejections reused; offline design requires per-task graph/run roots or equivalently proved isolation, project quota ID/inheritance, and accounting for every writable path. No runtime invocation or storage reconfiguration authorized | Version-qualified graph/run/overlay/layer/scratch/tmpfs/log/config observer; actual filesystem UUID/mount/project-ID/inheritance and byte/inode quota enforcement | runtime_storage_acceptance_pending; shared/unattributed writable storage is NO-GO |
 | Aggregate storage | Unique domain accounting, remaining entitlement, watchdog reserves | Existing exact-threshold/domain/remaining-entitlement tests reused unchanged | Continuous observed capacity under complete workload and metadata pressure | Trusted live capacity/enforcement missing |
 | Exact containment | Exact record/ID/image/labels; inspect/stop/kill/inspect/absence; single-flight | Existing event-order/failed persistence/single-flight/recovery tests reused unchanged | Independently verified exact-ID stop/absence and preserved state on failure | Runtime unavailable; unresolved is not stopped |
-| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | Broker child cleanup now refuses handles not in its exact owned-child set. Deterministic tests include a real unprivileged child timeout/kill/reap. Native `WorkerLease` remains a test-only model; no separate supervisor or restart-durable ownership exists | Independent supervisor, exact process identity across restart, physical completion/reaping/cleanup and retained ownership across Broker failure; ordinary child reaping does not prove uninterruptible-work completion | Adapter completion promise and crash-surviving ownership not qualified |
+| Supervisor / crash recovery | Native retained leases/terminal latch; Broker owned threads/children/reconciliation | Broker child cleanup refuses handles outside its owned-child set; ordinary child kill/reap, foreign handle and same-PID/different-instance refusal, unknown child after supervisor-instance restart, late spawn and interrupted cleanup are exercised. Native `WorkerLease` remains a test-only model; no restart-durable ownership exists | Independent supervisor, exact process identity across restart/reboot, physical completion/reaping/cleanup and retained ownership across Broker failure; ordinary child reaping does not prove uninterruptible-work completion | Adapter completion promise and crash-surviving ownership not qualified |
 | Privilege/confinement | Broker zero-effective-capability/identity checks, restricted arguments | MODEL_ONLY: untrusted effective-capability/identity/groups/no-new-privileges/seccomp/LSM requirements and negative checks | Dedicated identities; reviewed helper permissions, seccomp/LSM and deployed effective state | Helper/deployment confinement unaccepted |
 | Broker authorization/readiness | Claims/leases/fencing/replay, registry/seals/quarantine/watchdog | Existing F1-F5/R1-R6/C1-1 reused; no production Broker code or gate changes | All preceding gates plus independent security acceptance | All existing refusals preserved |
 
@@ -75,7 +88,7 @@ acceptance:
   package state only. The docs describe pathname bind sources and FD passthrough
   into the workload; `crun` is absent. This does not establish descriptor-bound
   mount source resolution, so the runtime branch remains blocked, fail-closed.
-- SQLite evidence: CPython 3.12.11 reports SQLite 3.46.1; `_sqlite3` has ELF NEEDED
+- Initial SQLite investigation: CPython 3.12.11 reports SQLite 3.46.1; `_sqlite3` has ELF NEEDED
   `libsqlite3.so.0`. The resolved system library is 3.46.1-9ubuntu0.3, SHA-256
   `4633a4be13fdf05cb0f859e04fb06077a1fe30a90e405721a23873bd1f3d88a8`; current
   `_sqlite3` extension SHA-256 is
@@ -86,9 +99,10 @@ acceptance:
   fetchone/fetchall, rowcount; `sqlite3.Row` name/index behavior; and sqlite3
   exception subclasses. Existing durability uses WAL, synchronous=FULL,
   `wal_checkpoint(TRUNCATE)`, sidecar identity checks, sealing and a dirty marker.
-  No VFS implementation exists to demonstrate that the complete callback set,
-  WAL/SHM locking/mapping, Python API, transaction or crash-durability semantics
-  are preserved. Therefore the Python registry adapter was **not changed**.
+  At that investigation point, no VFS implementation demonstrated the complete
+  callback set or WAL/SHM semantics. The later isolated prototype below now
+  demonstrates selected DB/WAL/SHM operations, but not the full registry contract
+  or durable behavior. Therefore the Python registry adapter was **not changed**.
 - An attempted standalone direct-child owner prototype was removed after review
   identified abandonment and stale-identity weaknesses. The existing tested
   sticky terminal latch and test-only ownership model remain; no unsafe or
@@ -103,73 +117,97 @@ acceptance:
   Broker/runtime source or behavior was changed. Historical suite results above
   remain historical.
 
-Category 1 has not achieved full Stage A: real trusted inventory acquisition,
-complete filesystem/project identity acquisition, physical supervisor across
-Broker/supervisor death, VFS implementation, and runtime storage/mount evidence
-remain blocked. A compiled low-level syscall transport alone grants no observation
-authority. All 13 acceptance rows and production refusals remain intact.
+Category 1 has not achieved full Stage A: deployment-qualified trusted inventory,
+complete filesystem/project identity acquisition, physical supervisor ownership
+across Broker/supervisor death, production-grade VFS authority, and runtime
+storage/mount evidence remain blocked. A compiled low-level syscall transport
+alone grants no observation authority. All 13 acceptance rows and production
+refusals remain intact.
 
 ## Category 1 continuation results
 
-This continuation made only the directly safe process-ownership correction:
-`ChildProcesses.cleanup` now rejects a foreign `asyncio.subprocess.Process`
-handle before signalling or waiting on it and makes the unresolved state sticky.
-Its tests prove both that an unowned live process is left running and that a real
-unprivileged child spawned by the owner is killed and reaped on timeout. These
-results cover ordinary child processes only; they do not establish PID/start-time
-acquisition for an external worker, descriptor-lease survival after Broker death,
-or completion of uninterruptible kernel work.
+The absolute `$HOME/.cargo/bin/cargo` and `rustc` tools were present and used.
+No toolchain or dependency was installed. Native test fixtures run only in
+disposable temporary roots; the production inventory source path remains fixed.
 
-Newly executed continuation checks: the focused `ProcessDeadlineTests` suite
-passed (18 tests); full Python discovery passed (749 tests, 4 skipped); Python
-compilation and `git diff --check` passed. The focused independent review found
-no significant issue in the ownership guard or real-child tests. Rust ABI/native/
-fixture builds, tests, formatting and Clippy were not rerun because neither
-`cargo` nor `rustc` is installed in this checkout environment; no toolchain or
-dependency was installed. Previous Rust results remain historical.
+### Native SQLite prototype
 
-The SQLite branch stopped before implementation. The registry uses CPython's
-`sqlite3.Connection`/`sqlite3.Row`, implicit connection context transactions,
-explicit `BEGIN IMMEDIATE`/commit/rollback, `executescript` schema creation and
-migrations, `rowcount`, `fetchone`, cursor iteration/tuple conversion, WAL,
-`synchronous=FULL`, `wal_checkpoint(TRUNCATE)`, foreign-key/integrity checks,
-and DB/WAL/SHM/journal identity/seal/dirty-marker handling. The public Python
-module provides no VFS registration function. A prototype would therefore need
-a same-engine native registration/adapter boundary plus a complete VFS: short
-I/O/error propagation, file-control and locking semantics, shared-memory
-mapping/locking, deletion/access, sync and checkpoint behavior, restricted
-temporary/URI/extension/attachment handling, and parity with the registry's
-Python API. Implementing only file-open callbacks or routing the existing
-registry through a second SQLite engine would violate the requirement. No adapter,
-schema, ledger, or production activation was changed. Process-crash tests, if
-later added, cannot establish power-loss durability.
+Added [the isolated dirfd VFS prototype](../../prototypes/sqlite-dirfd-vfs/).
+Loading its extension through CPython `sqlite3`, registering the named VFS
+through the extension API table, then opening a separate CPython connection with
+that VFS proves registration and SQL execute through the same engine; this is
+stronger than matching version strings. The prototype uses descriptor-relative
+database and rollback-journal open/create, initialized short reads, bounded
+pread/pwrite-style I/O, truncation, fsync, directory sync after creation,
+Linux OFD byte-range locks, and fail-closed path/file checks. Tests cover
+rollback/commit/reopen, multiple and cross-process connection lock exclusion,
+hot-journal process-crash recovery, truncation, directory replacement,
+symlink/hardlink/special-file rejection, URI/path rejection, unsupported
+extension/multi-database operations and descriptor cleanup. Process-crash
+recovery is not power-loss durability proof.
 
-Trusted acquisition is not solely a VM blocker. The native crate currently has
-untrusted inventory and identity candidates plus a sealed acquisition interface,
-but its only non-test backend refuses to attest, acquire a root, or return native
-filesystem evidence. No authenticated fixed source/root identity or production
-loader is selected. Broker `Directory` path checks do not automatically supply
-the native helper with the same authority, and promoting its candidate values
-would create a competing trust source. A safe offline implementation first needs
-the protected source contract and a native descriptor-relative acquisition
-adapter; actual project attributes, quota state, UUID/mount correspondence and
-live replacement/remount acceptance remain additional kernel/VM evidence.
+The current isolated prototype supports tested WAL/SHM operations, OFD locking,
+checkpoints, DB/journal/WAL/SHM replacement detection and cross-process crash
+recovery. Its registered methods and SQL operations use the same SQLite engine,
+established by loading the extension through CPython and then opening separate
+CPython connections with the registered VFS—not by matching version strings.
+The Python registry adapter, schema and durable ledger remain unchanged.
 
-The mounted-source feasibility decision remains **NO-GO for the present Podman
-interface**: `--preserve-fd` hands descriptors to a process in the container;
-`--mount type=bind,src=...` accepts a source specification. Passing an FD to
-Podman, or to `crun`, does not show that the runtime uses that FD as mount-source
-authority. No independently inspectable post-mount destination identity
-mechanism was established. Alternatives requiring a new decision are a reviewed
-OCI-runtime/helper extension that consumes an already-pinned descriptor and
-proves the mounted object, or avoiding a host project bind and staging bounded
-data through a separate runtime-owned channel with independently accepted
-storage accounting. Neither alternative is implemented or authorized here.
+This does **not** establish race-free containment against malicious same-UID
+mutation. Name checks and descriptor-relative `openat`/`unlinkat` are not atomic;
+a same-UID process can replace entries between checks or directly truncate a
+mapped SHM file (including causing `SIGBUS`). The prototype is custody-dependent
+test evidence, not production-grade authority. Readonly WAL, disk temporary
+files, multi-database super-journals, full Python registry compatibility,
+power-loss durability and exhaustive failure injection remain unqualified.
+See the prototype README for exact boundaries.
 
-Rust revalidation was unavailable in this continuation: `cargo` and `rustc` are
-not installed in the current environment. No toolchain or dependency was
-installed. This does not alter prior Rust results, but those historical results
-are not newly executed results for this continuation.
+### Protected inventory acquisition
+
+Added a fixed-path native loader using Rustix's safe `openat2` API and owned
+descriptors. It rejects symlinked ancestry/source, validates root-owned
+non-writable ancestry and exact configured root/file ownership and modes, checks
+regular-file/single-link/size bounds, reads via the pinned FD, compares
+before/after and path-reopened identity, checks request freshness, and parses
+the immutable policy candidate. A descriptor remains retained in the result.
+Only the unit-test build accepts a disposable root. `NativeInspector` now has a
+configured-source entry point but still routes through the existing sealed
+validator; the non-test backend remains unavailable, so the loader cannot
+produce a `TrustedInventory`, query quotas, or publish success. The source
+loader authenticates the inventory file only; it does not establish storage
+filesystem identity, namespace/mount correspondence or project attributes.
+
+### Physical supervision
+
+The Broker refuses cleanup requests for a process handle outside its current
+exact owned-child set. New real unprivileged tests verify that a timeout kills
+and reaps an owned child and that a newly constructed supervisor refuses an
+unknown child while the original owner retains it. A same-PID/different-process
+handle test also verifies identity-safe refusal. Existing adversarial tests cover
+late spawn, timeout, cancellation, unresolved cleanup and retained ownership.
+This remains ordinary child-process supervision only: memory is not
+restart-durable, and no test proves completion of uninterruptible kernel work.
+
+### Workspace decision and verification
+
+The single recommendation is **B, isolated task staging**, recorded in
+[the workspace architecture decision](phase-13f-a5-workspace-architecture-decision.md).
+The user approved it for offline design only, not implementation or execution.
+The approach preserves immutable snapshot provenance and avoids exposing a
+mutable client-project mount, but requires an independently verified per-task
+quota-controlled writable container rootfs/upper and complete Podman storage
+accounting. If that cannot be qualified, the design returns for a new decision;
+no weaker mount strategy is implied.
+
+Newly executed final checks: native debug tests (56 unit, 1
+production-unavailable integration, 8 compile-fail doctests), release build and
+release production-boundary test, formatting and warnings-denied Clippy passed.
+The final WAL/SHM-capable SQLite VFS suite passed 19 tests. Focused Python
+process-deadline tests passed 20 tests; full Python discovery passed 751 tests
+(4 skipped). Independent review found no significant inventory-loader issue; the
+SQLite review confirmed the documented same-UID namespace/SHM race limitation,
+which remains an explicit production blocker rather than being represented as
+solved. Final `py_compile` and diff checks passed.
 
 ## Remaining separately approved categories
 
@@ -210,14 +248,16 @@ usable-capacity evidence. Preparation approval does not authorize Categories 3-6
 | Check | Result |
 |---|---|
 | ABI units / compile-only C integration / compile-fail | 22 /1 /15 passed |
-| Native units / unavailable integration / compile-fail | 51 /1 /8 passed |
+| Native units / unavailable integration / compile-fail | 56 /1 /8 passed |
 | Fixture Rust | 21 passed; binary/docs0 tests |
 | Shared protocol | 0 standalone; unchanged goldens covered by Python compatibility |
 | Release native unavailable / ABI header | 1 /1 passed |
 | All four crate debug/release builds, fmt, Clippy -Dwarnings | Passed, locked/offline; no Rust warnings |
 | Focused external-storage/lifetime/safety Python suites | 115 passed in49.746s |
-| Final full Python discovery (includes Broker and v1 compatibility) | 747 run:743 passed,4 skipped,167.184s |
-| Python compilation | 71 files passed |
+| SQLite descriptor-relative VFS compatibility suite | 19 passed; includes WAL/SHM, locking, checkpoints and process-crash recovery |
+| Focused Broker process-deadline suite | 20 passed |
+| Final full Python discovery (includes Broker and v1 compatibility) | 751 run:747 passed,4 skipped,173.682s |
+| Python compilation | Modified Broker/test sources compiled |
 | Source/manifests/features/dependency closure and release symbols | No real quota invoker/activation or native fixture dependency |
 | Whitespace / source diagnostics | Passed; index unchanged |
 
@@ -246,9 +286,11 @@ diagnostics during full discovery. No ResourceWarning, RuntimeWarning, destroyed
 task or unretrieved-exception messages. Expected injected error diagnostics in
 negative tests are not unexplained runtime failures.
 
-Focused independent reviews of acquisition/authority/ownership contracts and the
-final VFS operation-binding delta reported no confirmed vulnerabilities. No review
-opinion substitutes for the executed tests or missing live evidence.
+Focused independent review found no significant inventory-loader issue. The
+SQLite review confirmed that descriptor-relative operations plus sequential
+identity checks do not prevent malicious same-UID name replacement or SHM
+truncation races. These remain explicit limitations; no review opinion substitutes
+for the executed tests or missing live evidence.
 
 New permanent tests cover raw/libc return conventions, malformed/failed output
 and command-buffer mismatches, borrowed-FD lifetime restrictions, acquisition

@@ -590,6 +590,40 @@ class ProcessDeadlineTests(unittest.IsolatedAsyncioTestCase):
                 foreign.kill()
             await asyncio.wait_for(foreign.wait(), timeout=1)
 
+    async def test_same_pid_different_process_instance_is_not_owned(self):
+        owned = FakeProcess()
+        foreign = FakeProcess()
+        owned.pid = foreign.pid = 424242
+        self.supervisor.children.add(owned)
+        result = await self.supervisor.cleanup(
+            foreign, asyncio.get_running_loop().time() + 0.1,
+        )
+        self.assertFalse(result)
+        self.assertFalse(foreign.kill_called.is_set())
+        self.assertIn(owned, self.supervisor.children)
+        self.assertTrue(self.supervisor.unresolved)
+
+    async def test_restarted_supervisor_cannot_claim_or_finalize_unknown_child(self):
+        child = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(30)",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        self.supervisor.children.add(child)
+        restarted = ChildProcesses(self.reasons.append)
+        try:
+            result = await restarted.cleanup(
+                child, asyncio.get_running_loop().time() + 0.1,
+            )
+            self.assertFalse(result)
+            self.assertIsNone(child.returncode)
+            self.assertIn(child, self.supervisor.children)
+            self.assertNotIn(child, restarted.children)
+            self.assertTrue(restarted.unresolved)
+        finally:
+            self.assertTrue(await self.supervisor.cleanup(
+                child, asyncio.get_running_loop().time() + 1,
+            ))
+
     async def test_real_child_timeout_is_killed_and_reaped(self):
         spawned = []
         from synai.broker.runtime import _read_bounded
